@@ -83,10 +83,69 @@ _OPEN_BOUND = re.compile(
 # ----------------------------------------------------------------------------- helpers
 
 
-_TIME_OF_DAY = re.compile(
-    r"(?:\s+(?:at|@))?(?:\s+(?:approximately|approx\.?|about|around))?\s*\b\d{1,2}:\d{2}(?::\d{2})?(?:\s*[ap]\.?m\b\.?)?"
-    r"(?:\s*[+-]\d{4}\b|\s+(?:utc|gmt|[ecmp][sd]t)\b)?"
+# Clock times, zones and day parts are dropped before a date is parsed: they say when in the
+# day, not which day ("Mon, 25 Mar 2024 09:14:00 -0400", "at 1700 hours", "the morning of").
+_TZ = r"(?:\s*(?:[+-]\d{2}:?\d{2}|z\b|(?:utc|gmt|[ecmp][sd]t)\b(?:\s*[+-]\d{1,2}(?::?\d{2})?)?))?"
+_TIME_QUAL = (
+    r"(?:(?:approximately|approx\.?|about|around|roughly|circa|ca\.|shortly before"
+    r"|shortly after|just before|just after)\s+)?"
 )
+# Spelled-out zones ("central daylight time") and "local"/"lcl", as in incident reports.
+_TZ_WORDS = (
+    r"(?:(?:eastern|central|mountain|pacific|alaska|hawaii|atlantic)\s+(?:standard|daylight)"
+    r"(?:\s+(?:saving\s+)?time)?|local(?:\s+time)?|lcl|[ecmp][sd]t|utc|gmt|zulu|z)\b"
+)
+_HHMM = r"(?:[01]\d|2[0-3])[0-5]\d"  # 24-hour clock without a colon ("1816")
+_CLOCK = (
+    rf"(?:{_HHMM}:[0-5]\d(?:\.\d+)?{_TZ}"  # "1810:33" (HHMM:SS, recorder transcripts)
+    rf"|\d{{1,2}}:\d{{2}}(?::\d{{2}}(?:\.\d+)?)?(?:\s*[ap]\.?\s?m\b\.?)?{_TZ}"
+    rf"|\d{{1,2}}\s*[ap]\.?\s?m\b\.?{_TZ}|[0-2]\d[0-5]\d\s*(?:hours|hrs\.?|h\b)(?:\s+local)?{_TZ}"
+    rf"|{_HHMM}\s*{_TZ_WORDS}"  # "1829 eastern daylight time", "1342 cdt"
+    rf"|noon|midnight)"
+)
+_TIME_OF_DAY = re.compile(
+    rf"(?:,\s*|\s+|^)(?:at\s+|@\s*|by\s+)?{_TIME_QUAL}{_CLOCK}"
+    rf"(?:\s+(?:hours|hrs\.?|local(?:\s+time)?))?"
+)
+# A bare 24-hour time is only a time (not a year) when introduced by "at" ("at 1729",
+# "at about 0930"), or when qualified as approximate and too early to be a plausible year
+# ("about 1815"). "About 2005" and "in 1999" stay years.
+_BARE_HHMM = re.compile(
+    rf"(?:,\s*|\s+|^)(?:(?P<at>at\s+(?:(?:approximately|approx\.?|about|around)\s+)?)"
+    rf"|(?:approximately|approx\.?|about|around)\s+)(?P<hhmm>{_HHMM})\b"
+    rf"(?!\s*(?:[-/.,]\s*)?\d|\s+(?:{_MONTH}))"
+)
+_DAY_PART = r"(?:early\s+|late\s+|mid-?)?(?:morning|afternoon|evening|night|day)"
+_DAY_PART_PREFIX = re.compile(rf"^(?:in\s+|during\s+|on\s+)?the\s+{_DAY_PART}\s+of\s+")
+_DAY_PART_SUFFIX = re.compile(rf",?\s+(?:in|during)\s+the\s+{_DAY_PART}$")
+_LEADING_APPROX = re.compile(r"^(?:approximately|approx\.?|about|around|roughly|circa)\s+")
+
+
+def _drop_bare_hhmm(m: re.Match[str]) -> str:
+    return m.group(0) if not m.group("at") and int(m.group("hhmm")) >= 1900 else " "
+
+
+def _strip_time(s: str) -> str:
+    """Drop clock times, time zones and day parts from lowercased text.
+
+    A time's own qualifier goes with it ("March 14, 2024 at approximately 5:40 PM" is still
+    an exact date), but a qualifier that opens the whole phrase ("around 3pm on March 3,
+    2024") is kept, so the date stays approximate. Text that is only a time becomes "".
+    """
+    s = re.sub(r"(\d)t(?=\d{1,2}:\d{2})", r"\1 ", s)  # ISO 8601 "2021-06-05T09:30"
+    lead = _LEADING_APPROX.match(s)
+    out = _BARE_HHMM.sub(_drop_bare_hhmm, _TIME_OF_DAY.sub(" ", s))
+    if re.search(r"\d", out):  # never reduce "this morning" to "this"
+        out = _DAY_PART_PREFIX.sub("", out.strip())
+        out = _DAY_PART_SUFFIX.sub("", out)
+    if out == s:
+        return s
+    out = re.sub(r"\b(?:between|from) (?:and|to|until|-) ", "", re.sub(r"\s+", " ", out))
+    out = out.strip(" ,;:-")
+    out = re.sub(r"(?:^|\s+)(?:on|at|of)$", "", out).strip()
+    if out and lead and not _LEADING_APPROX.match(out):
+        out = lead.group(0) + out
+    return out
 
 
 def _clean(text: str) -> str:
@@ -94,8 +153,8 @@ def _clean(text: str) -> str:
     s = re.sub(r"\s*[–—]\s*", " - ", s)
     s = re.sub(r"\(\s*\d+\s*\)", " ", s)  # "thirty (30) days"
     s = re.sub(r"\([^)]*\)", " ", s)
-    s = _TIME_OF_DAY.sub(" ", s)  # "09:14:00 -0400", "at 4:02 pm": a date, not a range
     s = re.sub(r"\s+", " ", s).strip()
+    s = _strip_time(s)  # "09:14:00 -0400", "at 4:02 pm", "at 1729": a day, not a range/year
     return s.strip(" .,;:\"'")
 
 
@@ -139,9 +198,23 @@ def parse_absolute(text: str, ref: date | None = None) -> tuple[Span, Certainty]
     if not s:
         return None
     try:
-        return _parse_range(s, ref) or _parse_point(s, ref)
+        found = _parse_range(s, ref) or _parse_point(s, ref)
     except (ValueError, OverflowError):  # e.g. year 0000, Feb 30
         return None
+    if found is None:
+        # "March 3, 2024, after the meeting", "March 3, 2024 between 2 and 3": keep the
+        # leading part up to the first year, else the longest leading comma-part that parses.
+        heads = []
+        if (m := re.match(r"^(.*?\b\d{4})\b(?!\s*[-/]\s*\d)", s)) and m.group(1) != s:
+            heads.append(m.group(1))
+        parts = s.split(",")
+        heads += [",".join(parts[:k]).strip() for k in range(len(parts) - 1, 0, -1)]
+        for head in heads:
+            if head and re.search(r"\d|" + _MONTH, head):
+                found = parse_absolute(head, ref)
+                if found is not None:
+                    break
+    return found
 
 
 def _parse_point(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
@@ -494,8 +567,8 @@ def parse_relative(text: str) -> RelativeSpec | None:
 
     m = re.match(
         r"^(?P<the>the\s+)?(?P<which>next|following|previous|preceding|prior|last|this|that"
-        r"|same|very same|subsequent)\s+(?P<unit>day|date|morning|afternoon|evening|night|week"
-        r"|weekend|month|year)$",
+        r"|same|very same|that same|subsequent)\s+(?P<unit>day|date|morning|afternoon|evening"
+        r"|night|week|weekend|month|year)$",
         s,
     )
     if m:
@@ -508,10 +581,21 @@ def parse_relative(text: str) -> RelativeSpec | None:
         return RelativeSpec(lambda a, _e, n=n, u=unit: _period(a, u, n), deictic=deictic)
 
     m = re.match(
-        r"^(?:later|earlier) (?:that|the same) (?:day|morning|afternoon|evening|night)$", s
+        r"^(?:later|earlier) (?:that|the same|that same) (?:day|morning|afternoon|evening|night)$",
+        s,
     )
     if m:
         return RelativeSpec(lambda a, _e: a)
+
+    # "earlier in the week", "later that month", "that same year": the anchor's period.
+    m = re.match(
+        r"^(?:(?P<le>later|earlier)\s+(?P<w>that|the same|that same|in the|in that|this)"
+        r"|(?:that|the same|that same))\s+(?P<unit>week|weekend|month|year)$",
+        s,
+    )
+    if m:
+        unit = m.group("unit")
+        return RelativeSpec(lambda a, _e, u=unit: _period(a, u, 0), deictic=m.group("w") == "this")
 
     m = re.match(
         rf"^(?:the\s+)?(?:(?P<which>next|following|last|previous|preceding|this|that|coming)\s+)?"
@@ -636,6 +720,24 @@ def _pos(d: DraftFact, i: int) -> int:
     return min(s.char_start for s in d.spans) if d.spans else i
 
 
+_PERIOD_WORD = r"(?:day|date|morning|afternoon|evening|night|week|weekend|month|year)s?\b"
+_BOUND_TEXT = re.compile(
+    r"^(?:sometime |some time |well )?"
+    r"(?:before|after|prior to|since|until|till|following|preceding|up to|subsequent to|by"
+    r"|no later than|not later than|on or before|on or after|no earlier than|not earlier than)"
+    rf"(?:\s+(?!{_PERIOD_WORD})\S|$)"
+)
+
+
+def is_open_bound(date_text: str | None) -> bool:
+    """The date only bounds the event ("before March 3", "since 2006", "by May 6").
+
+    Its resolved day is a limit, not when the event happened, so it is never an anchor for a
+    relative date and never the context year for a later month/day without a year.
+    """
+    return bool(date_text) and bool(_BOUND_TEXT.match(_clean(date_text or "")))
+
+
 def _draft_anchor(d: DraftFact, pos: int) -> _Anchor:
     assert d.date_start is not None
     return _Anchor(
@@ -653,10 +755,12 @@ def resolve_drafts(
     """Fill date_start/date_end/date_certainty (and anchors for relative dates).
 
     ``drafts`` all come from one document and are walked in text order (first span).
-    Absolute dates are resolved first; relative ones then anchor to the draft or existing
-    fact they name, else the most recent prior dated draft, else ``doc_date`` ("yesterday"
-    and "3 days ago" prefer ``doc_date``). Drafts that already carry a date_start are left
-    untouched. Input order is preserved.
+    Absolute dates are resolved first; a month/day without a year takes the year nearest the
+    most recent prior dated draft (else ``doc_date``). Relative ones then anchor to the draft
+    or existing fact they name, else the most recent prior dated draft, else ``doc_date``
+    ("yesterday" and "3 days ago" prefer ``doc_date``). Open-ended bounds ("before X",
+    "since 2006", "by May 6") are never anchors or year context. Drafts that already carry a
+    date_start are left untouched. Input order is preserved.
     """
     if not drafts:
         return []
@@ -671,7 +775,7 @@ def resolve_drafts(
             fact_id=f.fact_id,
         )
         for f in (existing_facts or [])
-        if f.date_start is not None and f.review != "rejected"
+        if f.date_start is not None and f.review != "rejected" and not is_open_bound(f.date_text)
     ]
     pending: list[tuple[int, RelativeSpec]] = []
     last_dated: date | None = None
@@ -679,7 +783,8 @@ def resolve_drafts(
     for i in order:
         d = out[i]
         if d.date_start is not None:
-            last_dated = d.date_start
+            if not is_open_bound(d.date_text):
+                last_dated = d.date_start
             continue
         text = (d.date_text or "").strip()
         undated = {"date_start": None, "date_end": None, "date_certainty": "unknown"}
@@ -690,7 +795,8 @@ def resolve_drafts(
         if absolute is not None:
             (lo, hi), cert = absolute
             out[i] = d.model_copy(update={"date_start": lo, "date_end": hi, "date_certainty": cert})
-            last_dated = lo
+            if not is_open_bound(text):
+                last_dated = lo  # year context for a later "March 3" / "mid-March"
             continue
         spec = parse_relative(text)
         if spec is not None:
@@ -698,13 +804,14 @@ def resolve_drafts(
         else:
             out[i] = d.model_copy(update=undated)
 
+    bound = {i: is_open_bound(out[i].date_text) for i in order}
     for final in (False, True):
         still: list[tuple[int, RelativeSpec]] = []
         for i, spec in pending:
             candidates = [
                 _draft_anchor(out[j], pos_of[j])
                 for j in order
-                if j != i and out[j].date_start is not None
+                if j != i and out[j].date_start is not None and not bound[j]
             ]
             resolved = _resolve_relative(
                 out[i], pos_of[i], spec, candidates, facts, doc_date, final

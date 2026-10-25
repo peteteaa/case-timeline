@@ -1,20 +1,17 @@
 {% extends "base.html" %}
 {% block title %}Ask{% endblock %}
+{% block page_class %} chat-page{% endblock %}
+{% block ask %}{% endblock %}
 {% block content %}
-<section class="page-head"><h1>Ask about the case</h1></section>
-<section class="card">
-  <form method="post" action="/cases/{{ quote(case_id) }}/chat" class="chat-form"
-        hx-post="/cases/{{ quote(case_id) }}/chat" hx-target="#answer" hx-swap="innerHTML" hx-disabled-elt="find button">
-    <label for="question">Question</label>
-    <textarea id="question" name="question" rows="3" maxlength="4000" required placeholder="e.g. When did the parties first discuss the termination?"></textarea>
-    <div class="row">
-      <button class="btn primary">Ask</button>
-      <span class="htmx-indicator muted">Thinking… (answers can take a minute)</span>
-    </div>
-  </form>
-  <p class="muted small">Questions go to the local agent, which answers from this case’s facts and cites fact IDs. Nothing leaves this machine.</p>
-</section>
-<section id="answer" aria-live="polite">
-  {% if result %}{% include "_chat_answer.html" %}{% endif %}
-</section>
+<div class="titlebar">
+  <div><span class="eyebrow">{{ case_id }}</span><h1>Ask about the case</h1></div>
+</div>
+<div class="ask-log" id="answer" aria-live="polite">
+  {% if result %}{% include "_chat_answer.html" %}{% else %}<div class="ask-intro"><strong>What do you want to know?</strong>The local agent answers from this case’s facts and cites fact IDs. Nothing leaves this machine.</div>{% endif %}
+</div>
+<form method="post" action="/cases/{{ quote(case_id) }}/chat" class="ask-form">
+  <label for="question" class="sr-only">Question</label>
+  <textarea id="question" name="question" rows="2" maxlength="4000" required placeholder="e.g. When did the parties first discuss the termination?"></textarea>
+  <button class="btn primary" style="width: auto; padding: 0 16px">Ask</button>
+</form>
 {% endblock %}

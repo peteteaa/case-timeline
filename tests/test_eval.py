@@ -280,6 +280,28 @@ def test_contradiction_side_matches_through_event_key_and_needs_same_field() -> 
     assert not ev.contradiction_matches([f1, f2], g, events, "actor")
 
 
+def test_contradiction_recall_counts_planted_and_precision_any(store: Store) -> None:
+    a = store.add_fact("demo", "A", by=AGENT)
+    b = store.add_fact("demo", "B", by=AGENT)
+    c = store.add_fact("demo", "C", by=AGENT)
+    store.add_contradiction("demo", [a.fact_id, b.fact_id], "date", "derived one")
+    dismissed, _ = store.add_contradiction("demo", [a.fact_id, c.fact_id], "date", "noise")
+    store.review_contradiction(dismissed.contradiction_id, "dismiss", reviewer="qa")
+    planted = ev.GoldDispute(id="P", sides=(("x.txt", "q"), ("y.txt", "r")), field="date")
+    derived = ev.GoldDispute(
+        id="D", sides=(("x.txt", "q"), ("y.txt", "r")), field="date", planted=False
+    )
+    by_id = {
+        a.fact_id: _pred(a.fact_id, "x.txt", "q"),
+        b.fact_id: _pred(b.fact_id, "y.txt", "r"),
+        c.fact_id: _pred(c.fact_id, "y.txt", "r"),
+    }
+    res = ev.score_contradictions(store, "demo", [derived], by_id)
+    assert res["n_pred"] == 1 and res["precision"] == 1.0  # the dismissed one doesn't count
+    res = ev.score_contradictions(store, "demo", [planted, derived], by_id)
+    assert res["n_gold"] == 1 and res["recall"] == 1.0
+
+
 def test_throughput_from_job_times() -> None:
     t0 = datetime(2024, 1, 1, tzinfo=UTC)
 
@@ -329,7 +351,8 @@ def test_demo_gold_files_are_well_formed() -> None:
     disputes = ev.load_disputes(ev.GOLD_DIR / "demo_disputes.json")
     assert len(gold) == 29 and all(g.title and g.doc and g.event_key for g in gold)
     assert len({g.id for g in gold}) == len(gold)
-    assert len(disputes) == 5 and all(len(d.sides) >= 2 for d in disputes)
+    assert len(disputes) == 6 and all(len(d.sides) >= 2 for d in disputes)
+    assert [d.id for d in disputes if d.planted] == ["C1", "C2", "C3"]
     for name in ("gold_timeline.json", "gold_disputes.json"):  # public set: hand-made later
         assert json.loads((ev.EVAL_DIR / name).read_text()) == []
 

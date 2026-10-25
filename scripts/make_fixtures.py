@@ -543,6 +543,7 @@ CONTRADICTIONS = [
         "sides": [
             {"doc": DOCX_NAME, "quote": "took place on March 11, 2024"},
             {"doc": PDF_NAME, "quote": "on March 12, 2024, during a meeting in Mr. Ellison's"},
+            {"doc": EML_NAME, "quote": "On March 12, 2024 he called me into his office"},
             {"doc": TXT_NAME, "quote": "A. March 12, 2024. In the afternoon, I believe."},
             {"doc": MD_NAME, "quote": "On March 12, 2024, I attended a meeting"},
         ],
@@ -605,6 +606,25 @@ CONTRADICTIONS = [
         "sides": [
             {"doc": PDF_NAME, "quote": "had heard raised voices from Mr. Ellison's office"},
             {"doc": DOCX_NAME, "quote": "I was in the room for the whole meeting"},
+        ],
+    },
+    {
+        "id": "C6",
+        "field": "fact",
+        "event_key": "office_meeting",
+        "planted": False,
+        "derived": True,
+        "explanation": "What the meeting was about: Rivera (email, and her account to police) "
+        "and Becker say Ellison told her to stop filing safety reports; Ellison told police, and "
+        "Nand's memo records, that it concerned attendance, and Ellison denied any threat.",
+        "sides": [
+            {"doc": EML_NAME, "quote": "told me to stop filing safety reports"},
+            {"doc": DOCX_NAME, "quote": "if she kept filing safety reports she would be"},
+            {
+                "doc": PDF_NAME,
+                "quote": "the March 12, 2024 meeting concerned Ms. Rivera's attendance",
+            },
+            {"doc": MD_NAME, "quote": "regarding attendance concerns"},
         ],
     },
 ]

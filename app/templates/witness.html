@@ -1,73 +1,82 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m with context %}
 {% block title %}{{ w.name }}{% endblock %}
+{% block page_class %} narrow{% endblock %}
 {% block content %}
 {% set base = '/cases/' ~ quote(case_id) %}
 {% set wurl = '/witnesses/' ~ quote(w.witness_id) %}
-<p class="crumbs"><a href="{{ base }}/witnesses">← Witnesses</a></p>
-<section class="page-head">
-  <div>
-    <h1>{{ w.name }} {% if w.flagged %}<span class="badge flagged">Flagged</span>{% endif %}{% if not w.confirmed %}<span class="badge draft">Suggested by AI</span>{% endif %}</h1>
-    <p class="muted">{{ w.role or 'No role recorded' }}{% if w.aliases %} · also known as {{ w.aliases | join(', ') }}{% endif %}</p>
+<p class="crumbs"><a href="{{ base }}/witnesses">{{ m.icon('left') }} Witnesses</a></p>
+<div class="titlebar">
+  <div class="person">
+    {{ m.avatar(w, 'lg') }}
+    <div>
+      <h1>{{ w.name }}{% if w.flagged %}<span class="pill flagged">{{ m.icon('bell') }}Flagged</span>{% endif %}{% if not w.confirmed %}<span class="mk ai">Suggested by AI</span>{% endif %}</h1>
+      <p class="sub">{{ w.role or 'No role recorded' }}{% if w.aliases %} · also known as {{ w.aliases | join(', ') }}{% endif %}</p>
+    </div>
   </div>
-  <div class="head-actions">
+  <div class="actions">
+    {% if facts %}<a class="btn" href="{{ base }}/facts?witness={{ quote(w.witness_id) }}">Show on timeline</a>{% endif %}
     <form method="post" action="{{ wurl }}" class="inline">
       <input type="hidden" name="has" value="flagged">
       {% if not w.flagged %}<input type="hidden" name="flagged" value="1">{% endif %}
-      <button class="btn small">{{ 'Unflag' if w.flagged else 'Flag for alerts' }}</button>
+      <button class="btn">{{ m.icon('bell') }}{{ 'Unflag' if w.flagged else 'Flag for alerts' }}</button>
     </form>
     {% if not w.confirmed %}
-    <form method="post" action="{{ wurl }}" class="inline"><button class="btn small ok" name="action" value="confirm">Confirm witness</button></form>
+    <form method="post" action="{{ wurl }}" class="inline"><button class="btn ok" name="action" value="confirm">{{ m.icon('check') }}Confirm witness</button></form>
     {% endif %}
   </div>
-</section>
+</div>
 
-<div class="fact-grid">
-<div class="fact-main">
+<div class="split">
+<div class="col">
   <section class="card">
-    <h2>Facts <span class="muted">({{ facts | length }}, in date order)</span></h2>
+    <h2>Facts <span class="n">{{ facts | length }}, in date order</span></h2>
     {% if facts %}
-    <ul class="plain fact-list">
+    <ul class="mini-facts">
       {% for x in facts %}
-      <li><span class="date nowrap">{{ fact_date(x) or 'Undated' }}</span>
-        <a href="{{ fact_url(x.fact_id) }}">{{ x.title }}</a> <span class="muted small">{{ x.fact_id }}</span>
-        {{ m.badges(x, alleged, conflicts) }}</li>
+      <li>
+        <span class="d{% if not x.date_start %} undated{% endif %}" {% if x.date_start %}title="{{ fact_date(x) }}"{% endif %}>{{ nice_date(x) or 'Undated' }}</span>
+        <div>
+          <a class="t" href="{{ fact_url(x.fact_id) }}">{{ x.title }}</a>
+          <div class="fmeta"><span class="fid">{{ x.fact_id }}</span>{% for s in x.statuses %}{{ m.status_pill(s) }}{% endfor %}{{ m.marks(x, x.fact_id in alleged, x.fact_id in conflicts) }}</div>
+        </div>
+      </li>
       {% endfor %}
     </ul>
     {% else %}<p class="muted">No facts linked to this witness.</p>{% endif %}
   </section>
   <section class="card">
-    <h2>Documents that mention them <span class="muted">({{ documents | length }})</span></h2>
+    <h2>Documents that mention them <span class="n">{{ documents | length }}</span></h2>
     {% if documents %}
-    <ul class="plain">{% for d in documents %}<li><a href="{{ doc_view_url(d.doc_id) }}">{{ d.filename }}</a> <span class="muted small">{{ d.kind }}</span></li>{% endfor %}</ul>
+    <ul class="mini-docs">{% for d in documents %}<li><a class="ev" href="{{ doc_view_url(d.doc_id) }}">{{ m.kind_icon(d.kind) }}<span>{{ d.filename }}</span></a></li>{% endfor %}</ul>
     {% else %}<p class="muted">None found.</p>{% endif %}
   </section>
 </div>
-<aside class="fact-side">
+<aside class="col">
   <section class="card">
     <h2>Profile</h2>
-    <form method="post" action="{{ wurl }}" class="stack">
+    <form method="post" action="{{ wurl }}" class="form">
       <input type="hidden" name="has" value="flagged">
       <label>Name<input name="name" required maxlength="200" value="{{ w.name }}"></label>
-      <label>Aliases <span class="muted small">(comma-separated)</span><input name="aliases" value="{{ w.aliases | join(', ') }}"></label>
+      <label>Aliases<input name="aliases" value="{{ w.aliases | join(', ') }}"><span class="help">Comma-separated</span></label>
       <label>Role<input name="role" value="{{ w.role or '' }}"></label>
       <label>Notes<textarea name="notes" rows="4">{{ w.notes or '' }}</textarea></label>
       <label class="check"><input type="checkbox" name="flagged" value="1" {% if w.flagged %}checked{% endif %}> Alert when a new document mentions them</label>
-      <div><button class="btn primary">Save profile</button></div>
+      <div class="form-actions"><button class="btn primary">Save profile</button></div>
     </form>
   </section>
   {% if others %}
   <section class="card">
-    <h2>Merge</h2>
+    <h2>Merge or remove</h2>
     <p class="muted small">Fold this record into another witness: this name becomes an alias there and the facts move over.</p>
     <form method="post" action="{{ wurl }}" class="inline-form" data-confirm="Merge {{ w.name }} into the selected witness?">
       <input type="hidden" name="action" value="merge">
-      <select name="into" aria-label="Merge into">{% for o in others %}<option value="{{ o.witness_id }}">{{ o.name }}{% if not o.confirmed %} (suggested){% endif %}</option>{% endfor %}</select>
-      <button class="btn small">Merge</button>
+      <select name="into" aria-label="Merge into" class="grow">{% for o in others %}<option value="{{ o.witness_id }}">{{ o.name }}{% if not o.confirmed %} (suggested){% endif %}</option>{% endfor %}</select>
+      <button class="btn">Merge</button>
     </form>
-    <form method="post" action="{{ wurl }}" class="inline-form" data-confirm="Delete {{ w.name }}? It is unlinked from its facts.">
+    <form method="post" action="{{ wurl }}" class="inline-form" style="margin-top: 12px" data-confirm="Delete {{ w.name }}? It is unlinked from its facts.">
       <input type="hidden" name="action" value="dismiss">
-      <button class="btn small danger">{{ 'Dismiss suggestion' if not w.confirmed else 'Delete witness' }}</button>
+      <button class="btn danger">{{ m.icon('trash') }}{{ 'Dismiss suggestion' if not w.confirmed else 'Delete witness' }}</button>
     </form>
   </section>
   {% endif %}

@@ -168,12 +168,16 @@ Status as of this writing: every stage module below is implemented except
 
 `create_app(settings=None, *, store=None) -> FastAPI` starts one `jobs.Worker` when
 `settings.run_worker` is set. `python -m app` (`make app`) serves on `ui_host:ui_port` and
-refuses non-loopback hosts. Its routes follow SPEC §5.2: `/cases/{id}` (dashboard),
-`/cases/{id}/facts`, `/cases/{id}/review`, `/facts/{id}` (card, `PATCH`, `/review`,
-`/evidence`, `/notes`), `/documents/{id}/view?evidence=`, `/cases/{id}/documents` (upload to
-the inbox), `/cases/{id}/process`, `/jobs/{id}`, `/cases/{id}/witnesses`, `/witnesses/{id}`,
-`/cases/{id}/tags`, `/cases/{id}/contradictions`, `/contradictions/{id}`, `/cases/{id}/alerts`,
-`/cases/{id}/export?format=xlsx|csv|svg|png`, and `/cases/{id}/chat`.
+refuses non-loopback hosts. Its routes follow SPEC §5.2: `/cases/{id}` (Today: dashboard and
+alerts), `/cases/{id}/facts` (timeline; `review=draft` is the review queue, `flag=conflict|alleged`
+filter computed marks), `POST /cases/{id}/review` (bulk review), `/facts/{id}` (card,
+`?partial=1` for the drawer, `PATCH`, `/review`, `/evidence`, `/notes`),
+`/documents/{id}/view?evidence=`, `/cases/{id}/documents` (upload to the inbox),
+`/cases/{id}/process`, `/jobs/{id}`, `/cases/{id}/witnesses`, `/witnesses/{id}`,
+`/cases/{id}/contradictions`, `/contradictions/{id}`,
+`/cases/{id}/export?format=xlsx|csv|svg|png`, and `/cases/{id}/chat` (the Ask panel posts
+here). `GET /cases/{id}/review` and `/cases/{id}/alerts` redirect to the timeline's draft filter
+and to Today. Tags have no UI pages; they remain in the store, exports and MCP tools.
 
 ## `mcp_server/server.py`: agent tools (SPEC §8.2), stdio
 

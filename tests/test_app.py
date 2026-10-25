@@ -204,8 +204,8 @@ def test_writes_require_display_name(env: Env) -> None:
 
 def test_set_display_name_cookie(env: Env) -> None:
     anon = env.new_client()
-    r = anon.post("/name", data={"name": "  Jane   Doe ", "next": "/cases/demo/tags"})
-    assert r.status_code == 303 and r.headers["location"] == "/cases/demo/tags"
+    r = anon.post("/name", data={"name": "  Jane   Doe ", "next": "/cases/demo/witnesses"})
+    assert r.status_code == 303 and r.headers["location"] == "/cases/demo/witnesses"
     cookie = r.headers["set-cookie"]
     assert "ct_user=Jane%20Doe" in cookie and "samesite=strict" in cookie.lower()
     assert "httponly" in cookie.lower()
@@ -225,17 +225,32 @@ def test_list_default_and_undated_group(env: Env) -> None:
     html = env.client.get("/cases/demo/facts").text
     ids = row_ids(html)
     assert ids == [env.f3.fact_id, env.f1.fact_id, env.f2.fact_id]  # undated last
-    assert html.index("Undated <span") < html.index(f'<tr id="{env.f2.fact_id}"')
-    assert html.index(f'<tr id="{env.f1.fact_id}"') < html.index("Undated <span")
-    # badges: alleged (pleading-only evidence), draft, key fact, tag chip
+    undated = html.index('<span class="gy">Undated</span>')
+    assert (
+        html.index(f'<tr id="{env.f1.fact_id}"')
+        < undated
+        < html.index(f'<tr id="{env.f2.fact_id}"')
+    )
+    # Year groups, with a rail tick per fact.
+    assert '<span class="gy">2024</span>' in html
+    assert html.count('class="tick') == 3 and f'data-jump="{env.f1.fact_id}"' in html
+    # Marks: alleged (pleading-only evidence), AI draft; the title opens the drawer.
     row1 = html[html.index(f'<tr id="{env.f1.fact_id}"') :]
     row1 = row1[: row1.index("</tr>")]
-    assert "Alleged" in row1 and "Draft" in row1
-    assert 'name="fact_ids"' in row1  # bulk checkbox on drafts
+    assert "Alleged" in row1 and "AI draft" in row1
+    assert f'data-open="{env.f1.fact_id}"' in row1 and "complaint.txt" in row1
+    assert "Mar 3, 2024" in row1
     row3 = html[html.index(f'<tr id="{env.f3.fact_id}"') :]
     row3 = row3[: row3.index("</tr>")]
-    assert "Key fact" in row3 and "Breach" in row3 and 'name="fact_ids"' not in row3
-    assert "~2024-01-01 – 2024-12-31" in row3
+    assert "Key fact" in row3 and "AI draft" not in row3
+    assert "Breach" not in row3  # tags are not shown
+    assert '<span class="d1">2024</span>' in row3 and "Approximate" in row3
+    assert 'title="~2024-01-01 – 2024-12-31"' in row3
+    assert "J. Smith" in row3 and f"witness={env.witness.witness_id}" in row3
+    # Quick filters carry counts over every fact.
+    assert 'Key facts <span class="qn">1</span>' in html
+    assert 'AI drafts <span class="qn">2</span>' in html
+    assert 'Alleged <span class="qn">1</span>' in html
 
 
 def test_list_filters_and_sort(env: Env) -> None:
@@ -248,6 +263,9 @@ def test_list_filters_and_sort(env: Env) -> None:
     assert get("kind=pleading") == [env.f1.fact_id]
     assert get("origin=user") == [env.f3.fact_id]
     assert get("review=accepted") == [env.f3.fact_id]
+    assert get("review=draft") == [env.f1.fact_id, env.f2.fact_id]
+    assert get("flag=alleged") == [env.f1.fact_id]
+    assert get("flag=conflict") == []
     assert get("date_from=2024-03-01&date_to=2024-03-31") == [env.f3.fact_id, env.f1.fact_id]
     # Title sort, then descending; undated facts still grouped at the end.
     assert get("sort=title&dir=desc") == [env.f1.fact_id, env.f3.fact_id, env.f2.fact_id]
@@ -385,15 +403,18 @@ def test_review_accept_reject_with_reason(env: Env) -> None:
     assert env.store.list_review_events("demo")[-1].reason == "typo"
 
 
-def test_needs_review_page_and_bulk(env: Env) -> None:
-    html = env.client.get("/cases/demo/review").text
-    assert html.index(env.f2.fact_id) < html.index(env.f1.fact_id)  # lowest confidence first
-    assert env.f3.fact_id not in html
-    assert f"/documents/{env.doc.doc_id}/view?evidence=" in html and QUOTE in html
-    high = env.client.get("/cases/demo/review?order=high").text
-    assert high.index(env.f1.fact_id) < high.index(env.f2.fact_id)
-    by_doc = env.client.get(f"/cases/demo/review?doc={env.email.doc_id}").text
-    assert env.f2.fact_id in by_doc and f'id="{env.f1.fact_id}"' not in by_doc
+def test_review_queue_is_the_drafts_filter_and_bulk(env: Env) -> None:
+    r = env.client.get("/cases/demo/review")
+    assert r.status_code == 303 and r.headers["location"] == "/cases/demo/facts?review=draft"
+    r = env.client.get(f"/cases/demo/review?doc={env.email.doc_id}")
+    assert r.headers["location"] == f"/cases/demo/facts?review=draft&doc={env.email.doc_id}"
+    html = env.client.get("/cases/demo/facts?review=draft").text
+    assert row_ids(html) == [env.f1.fact_id, env.f2.fact_id]
+    assert 'class="qf draft" href="/cases/demo/facts?" aria-current="true"' in html
+    # The drawer partial carries the accept/reject controls and the quote.
+    card = env.client.get(f"/facts/{env.f1.fact_id}?partial=1").text
+    assert f'id="rv-{env.f1.fact_id}"' in card and 'value="accept"' in card and QUOTE in card
+    assert f"/documents/{env.doc.doc_id}/view?evidence=" in card
     r = env.client.post(
         "/cases/demo/review",
         data={
@@ -564,25 +585,17 @@ def test_witnesses(env: Env) -> None:
     assert env.client.post("/cases/demo/witnesses", data={"name": ""}).status_code == 422
 
 
-def test_tags(env: Env) -> None:
-    r = env.client.post("/cases/demo/tags", data={"name": "Damages", "color": "#00ff00"})
-    assert r.status_code == 303
-    tag = next(t for t in env.store.list_tags("demo") if t.name == "Damages")
-    assert tag.color == "#00ff00"
-    env.client.post(
-        "/cases/demo/tags",
-        data={"action": "update", "tag_id": tag.tag_id, "name": "Harm", "color": "#112233"},
-    )
-    tag = env.store.get_tag(tag.tag_id)
-    assert (tag.name, tag.color) == ("Harm", "#112233")
-    bad = env.client.post("/cases/demo/tags", data={"name": "X", "color": "red;}body{x"})
-    assert bad.status_code == 422
-    page = env.client.get("/cases/demo/tags").text
-    assert "Harm" in page and "Breach" in page
-    env.client.post("/cases/demo/tags", data={"action": "delete", "tag_id": tag.tag_id})
-    assert env.store.get_tag(tag.tag_id) is None
-    r = env.client.post("/cases/demo/tags", data={"action": "delete", "tag_id": "T-9999"})
-    assert r.status_code == 404
+def test_tags_are_not_in_the_ui(env: Env) -> None:
+    assert env.client.get("/cases/demo/tags").status_code == 404
+    html = env.client.get("/cases/demo/facts").text
+    nav = html[html.index("<nav") : html.index("</nav>")]
+    assert "Tags" not in nav and "Breach" not in html
+    # Old tag links still filter.
+    assert row_ids(env.client.get(f"/cases/demo/facts?tag={env.tag.tag_id}").text) == [
+        env.f3.fact_id
+    ]
+    card = env.client.get(f"/facts/{env.f3.fact_id}").text
+    assert 'name="tag_ids"' not in card and 'value="tag_ids"' not in card
 
 
 # --------------------------------------------------------------------------- contradictions, alerts
@@ -610,14 +623,16 @@ def test_contradiction_confirm_marks_disputed(env: Env) -> None:
     assert bad.status_code == 422
 
 
-def test_alerts_page(env: Env) -> None:
+def test_alerts_on_today(env: Env) -> None:
     s = env.store
     a1 = s.add_alert(
         "demo", "possible_deadline", fact_ids=[env.f1.fact_id], doc_ids=[env.doc.doc_id]
     )
     a2 = s.add_alert("demo", "flagged_witness", doc_ids=[env.email.doc_id])
     s.mark_alerts_delivered([a2.alert_id])
-    html = env.client.get("/cases/demo/alerts").text
+    r = env.client.get("/cases/demo/alerts")
+    assert r.status_code == 303 and r.headers["location"] == "/cases/demo#alerts"
+    html = env.client.get("/cases/demo").text
     assert html.index(a2.alert_id) < html.index(a1.alert_id)  # newest first
     block = html[html.index(f'id="{a1.alert_id}"') :]
     block = block[: block.index("</article>")]
@@ -626,7 +641,9 @@ def test_alerts_page(env: Env) -> None:
     block2 = html[html.index(f'id="{a2.alert_id}"') :]
     assert "delivered" in block2[: block2.index("</article>")]
     r = env.client.get(f"/cases/demo/alerts/{a1.alert_id}")
-    assert r.status_code == 303 and r.headers["location"].endswith(f"#{a1.alert_id}")
+    assert r.status_code == 303 and r.headers["location"] == f"/cases/demo#{a1.alert_id}"
+    nav = html[html.index("<nav") : html.index("</nav>")]
+    assert 'Today <span class="count warn" title="Undelivered alerts">1</span>' in nav
 
 
 # --------------------------------------------------------------------------- documents, jobs
@@ -810,15 +827,13 @@ def test_case_content_is_escaped_everywhere(env: Env, monkeypatch: pytest.Monkey
     pages = [
         client.get("/cases/demo/facts"),
         client.get("/cases/demo/facts?q=x"),
-        client.get("/cases/demo/review"),
+        client.get("/cases/demo"),
         client.get(f"/facts/{bad.fact_id}"),
         client.get(f"/facts/{bad.fact_id}?partial=1"),
         client.get(f"/documents/{env.doc.doc_id}/view?evidence={env.f1.evidence[0].evidence_id}"),
         client.get("/cases/demo/witnesses"),
         client.get(f"/witnesses/{w.witness_id}"),
-        client.get("/cases/demo/tags"),
         client.get("/cases/demo/contradictions"),
-        client.get("/cases/demo/alerts"),
         client.post("/cases/demo/chat", data={"question": XSS}),
         client.post("/cases/demo/chat", data={"question": XSS}, headers=HX),
     ]
@@ -903,7 +918,7 @@ def test_today_panel(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
     )
     html = env.client.get("/cases/demo").text
     assert f'href="/facts/{env.f1.fact_id}"' in html and XSS not in html
-    assert "Drafts to review" in html and "Process now" in html
+    assert "AI drafts to check" in html and "Process now" in html
 
     def broken(*a: Any, **k: Any) -> dict:
         raise NotImplementedError
@@ -913,12 +928,17 @@ def test_today_panel(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
     assert r.status_code == 200 and "not available yet" in r.text
 
 
-def test_nav_counts(env: Env) -> None:
-    html = env.client.get("/cases/demo/tags").text
+def test_nav_and_ask_button(env: Env) -> None:
+    env.store.add_contradiction("demo", [env.f1.fact_id, env.f3.fact_id], "date", "Disagree")
+    html = env.client.get("/cases/demo/witnesses").text
     nav = html[html.index("<nav") : html.index("</nav>")]
-    assert 'Needs review <span class="count">2</span>' in nav
-    for label in ("Timeline", "Documents", "Witnesses", "Tags", "Contradictions", "Alerts", "Ask"):
+    assert 'Contradictions <span class="count warn">1</span>' in nav
+    for label in ("Today", "Timeline", "Documents", "Witnesses", "Contradictions"):
         assert label in nav
+    for gone in ("Needs review", "Tags", "Alerts", "Ask"):
+        assert gone not in nav
+    # Ask is a floating chat button with its panel on every page.
+    assert 'id="ask-open"' in html and 'hx-post="/cases/demo/chat"' in html
 
 
 def test_real_search_and_digest(env: Env) -> None:

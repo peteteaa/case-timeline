@@ -1,18 +1,22 @@
-<div class="card answer">
-  <div class="q"><span class="muted small">You asked</span><p>{{ result.question }}</p></div>
-  {% if result.notice %}<p class="notice">{{ result.notice }}</p>{% endif %}
-  {% if result.answer_html %}<div class="a">{{ result.answer_html }}</div>{% endif %}
-  <p class="muted small">Answered by {{ 'the OpenClaw agent' if result.backend == 'openclaw' else 'the local model over matching facts' }}. Check every cited fact against its source.</p>
+<div class="msg me"><div class="bubble">{{ result.question }}</div></div>
+<div class="msg bot">
+  <div class="bubble">
+    {%- if result.notice %}<p class="notice">{{ result.notice }}</p>{% endif -%}
+    {%- if result.answer_html %}{{ result.answer_html }}{% elif not result.notice %}<span class="muted">No answer.</span>{% endif -%}
+  </div>
   {% if result.facts %}
-  <h3>Facts {{ 'cited' if result.backend == 'openclaw' else 'consulted' }}</h3>
-  <ol class="cites">
-    {% for x in result.facts %}
-    <li><a href="{{ fact_url(x.fact_id) }}">{{ x.fact_id }}</a> {{ x.title }}
-      <span class="muted small">{{ fact_date(x) or 'Undated' }}{% if x.review == 'draft' %} · unreviewed draft{% endif %}{% if 'disputed' in x.statuses %} · disputed{% endif %}</span>
-      {% set q = x.evidence | selectattr('kind', 'equalto', 'span') | first %}
-      {% if q %}<blockquote><a href="{{ doc_view_url(q.doc_id, q.evidence_id) }}">“{{ q.quote }}”</a></blockquote>{% endif %}
-    </li>
-    {% endfor %}
-  </ol>
+  <details class="cites-wrap">
+    <summary class="msg-meta">{{ result.facts | length }} fact{{ '' if result.facts | length == 1 else 's' }} {{ 'cited' if result.backend == 'openclaw' else 'consulted' }}</summary>
+    <ol class="cites">
+      {% for x in result.facts %}
+      <li><a href="{{ fact_url(x.fact_id) }}">{{ x.fact_id }}</a> {{ x.title }}
+        <span class="muted">· {{ nice_date(x) or 'Undated' }}{% if x.review == 'draft' %} · unreviewed draft{% endif %}{% if 'disputed' in x.statuses %} · disputed{% endif %}</span>
+        {% set q = x.evidence | selectattr('kind', 'equalto', 'span') | first %}
+        {% if q %}<blockquote><a href="{{ doc_view_url(q.doc_id, q.evidence_id) }}">“{{ q.quote }}”</a></blockquote>{% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+  </details>
   {% endif %}
+  <span class="msg-meta">Answered by {{ 'the OpenClaw agent' if result.backend == 'openclaw' else 'the local model over matching facts' }}. Check every cited fact against its source.</span>
 </div>

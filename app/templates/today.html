@@ -1,42 +1,85 @@
 {% extends "base.html" %}
+{% import "_macros.html" as m with context %}
 {% block title %}Today{% endblock %}
 {% block content %}
 {% set base = '/cases/' ~ quote(case_id) %}
-<section class="page-head">
-  <h1>Today</h1>
-  <form method="post" action="{{ base }}/process" hx-post="{{ base }}/process" hx-target="#job-status" hx-swap="outerHTML">
-    <button class="btn primary" hx-disabled-elt="this">Process now</button>
-  </form>
+<div class="titlebar">
+  <div>
+    <span class="eyebrow">{{ case_id }}</span>
+    <h1>Today</h1>
+  </div>
+  <div class="actions">{{ m.job_button(base) }}</div>
+</div>
+
+<section class="stats" aria-label="Case at a glance">
+  <a class="stat{% if counts.draft %} warn{% else %} zero{% endif %}" href="{{ base }}/facts?review=draft"><span class="v">{{ counts.draft }}</span><span class="l">AI drafts to check</span></a>
+  <a class="stat" href="{{ base }}/facts?review=accepted"><span class="v">{{ counts.accepted }}</span><span class="l">Accepted facts</span></a>
+  <a class="stat{% if open_conflicts %} danger{% else %} zero{% endif %}" href="{{ base }}/contradictions"><span class="v">{{ open_conflicts }}</span><span class="l">Open contradictions</span></a>
+  <a class="stat{% if pending_alerts %} warn{% else %} zero{% endif %}" href="#alerts"><span class="v">{{ pending_alerts }}</span><span class="l">New alerts</span></a>
+  <a class="stat" href="{{ base }}/documents"><span class="v">{{ documents }}</span><span class="l">Documents</span></a>
 </section>
 
-<section class="stats">
-  <a class="stat warn" href="{{ base }}/review"><span class="num">{{ counts.draft }}</span><span class="lbl">Drafts to review</span></a>
-  <a class="stat" href="{{ base }}/facts?review=accepted"><span class="num">{{ counts.accepted }}</span><span class="lbl">Accepted facts</span></a>
-  <a class="stat" href="{{ base }}/facts?review=rejected"><span class="num">{{ counts.rejected }}</span><span class="lbl">Rejected drafts</span></a>
-  <a class="stat danger" href="{{ base }}/contradictions"><span class="num">{{ open_conflicts }}</span><span class="lbl">Open contradictions</span></a>
-  <a class="stat warn" href="{{ base }}/alerts"><span class="num">{{ pending_alerts }}</span><span class="lbl">Undelivered alerts</span></a>
-  <a class="stat" href="{{ base }}/documents"><span class="num">{{ documents }}</span><span class="lbl">Documents</span></a>
-</section>
+<div class="today-grid">
+  <div class="col">
+    <section class="card" id="alerts" aria-labelledby="alerts-h">
+      <div class="card-head">
+        <h2 id="alerts-h">Alerts <span class="n">{{ alerts | length }}</span></h2>
+        <span class="muted small">Newest first · computed after every processing job</span>
+      </div>
+      {% if alerts %}
+      <div class="alerts">
+        {% for a in alerts %}
+        <article class="alert alert-{{ a.type }}" id="{{ a.alert_id }}">
+          <span class="alert-ic">{% if a.type == 'possible_deadline' %}{{ m.icon('clock') }}{% elif a.type == 'flagged_witness' %}{{ m.icon('user') }}{% else %}{{ m.icon('split') }}{% endif %}</span>
+          <div>
+            <div class="alert-head">
+              <strong>{{ ALERT_LABELS.get(a.type, a.type) }}</strong>
+              {% if a.type == 'possible_deadline' %}<span class="pill deadline">Needs attorney review</span>{% endif %}
+              {% if a.delivered_at %}<span class="state state-done" title="Announced {{ fmt_dt(a.delivered_at) }}">delivered</span>{% else %}<span class="state state-pending">pending</span>{% endif %}
+              <span class="when">{{ a.alert_id }} · {{ fmt_dt(a.created_at) }}</span>
+            </div>
+            {% if a.fact_ids %}
+            <ul class="alert-facts">
+              {% for fid in a.fact_ids %}{% set x = alert_facts.get(fid) %}
+              <li>{% if x %}<a class="t" href="{{ fact_url(fid) }}">{{ x.title }}</a> <span class="fid">{{ fid }} · {{ nice_date(x) or 'Undated' }}{% if x.review != 'accepted' %} · {{ 'AI draft' if x.review == 'draft' else x.review }}{% endif %}</span>{% else %}<a href="{{ fact_url(fid) }}">{{ fid }}</a>{% endif %}</li>
+              {% endfor %}
+            </ul>
+            {% endif %}
+            {% if a.doc_ids %}
+            <p class="alert-docs">In {% for did in a.doc_ids %}<a href="{{ doc_view_url(did) }}">{{ doc_map[did].filename if doc_map.get(did) else did }}</a>{% if not loop.last %}, {% endif %}{% endfor %}</p>
+            {% endif %}
+            {% if a.type == 'contradiction' %}<a class="alert-link" href="{{ base }}/contradictions">Review contradictions →</a>{% endif %}
+          </div>
+        </article>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty"><strong>No alerts</strong>Possible deadlines, conflicts and flagged witnesses show up here after processing.</div>
+      {% endif %}
+      <p class="muted small" style="margin-top: 12px">“Delivered” means the agent announced the alert on a configured channel (without case content). Pending alerts are shown here either way.</p>
+    </section>
+  </div>
 
-<div class="two-col">
-<section class="card">
-  <h2>Last 24 hours</h2>
-  {% if digest_html %}
-  <div class="digest">{{ digest_html }}</div>
-  {% if digest.counts %}<p class="muted small">{% for k, v in digest.counts.items() %}{{ k | replace('_', ' ') }}: {{ v }}{% if not loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
-  {% else %}
-  <p class="muted">The daily digest is not available yet.</p>
-  {% endif %}
-</section>
-<section class="card">
-  <h2>Processing</h2>
-  {% include "_job.html" %}
-  {% if jobs | length > 1 %}
-  <h3>Recent jobs</h3>
-  <ul class="plain small">
-    {% for j in jobs[1:] %}<li><a href="/jobs/{{ quote(j.job_id) }}">{{ j.job_id }}</a> <span class="state state-{{ j.status }}">{{ j.status }}</span> {{ j.trigger }} · {{ fmt_dt(j.queued_at) }}{% if j.counts.get('facts_created') %} · {{ j.counts.facts_created }} new facts{% endif %}</li>{% endfor %}
-  </ul>
-  {% endif %}
-</section>
+  <div class="col">
+    <section class="card">
+      <h2>Last 24 hours</h2>
+      {% if digest_html %}
+      <div class="digest">{{ digest_html }}</div>
+      {% if digest.counts %}<div class="digest-meta">{% for k, v in digest.counts.items() %}<span class="pill">{{ k | replace('_', ' ') | capitalize }}: {{ v }}</span>{% endfor %}</div>{% endif %}
+      {% else %}
+      <p class="muted">The daily digest is not available yet.</p>
+      {% endif %}
+    </section>
+    <section class="card">
+      <h2>Processing</h2>
+      {% include "_job.html" %}
+      {% if jobs | length > 1 %}
+      <h3>Recent jobs</h3>
+      <ul class="recent-jobs">
+        {% for j in jobs[1:] %}<li><a href="/jobs/{{ quote(j.job_id) }}">{{ j.job_id }}</a><span class="state state-{{ j.status }}">{{ j.status }}</span><span class="muted">{{ j.trigger }}{% if j.counts.get('facts_created') %} · {{ j.counts.facts_created }} new facts{% endif %}</span><span class="when">{{ fmt_dt(j.queued_at) }}</span></li>{% endfor %}
+      </ul>
+      {% endif %}
+    </section>
+  </div>
 </div>
 {% endblock %}

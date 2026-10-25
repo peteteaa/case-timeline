@@ -1,6 +1,6 @@
 // Visual view: renders the JSON from /cases/{id}/facts?format=json with vis-timeline.
 // Points for single dates, bars for ranges, key facts highlighted, undated facts in their own
-// lane. Clicking a fact loads its card into the side panel. Text is set with textContent only.
+// lane. Clicking a fact opens it in the fact drawer. Text is set with textContent only.
 (function () {
   "use strict";
   var el = document.getElementById("timeline");
@@ -8,12 +8,7 @@
   if (!el) return;
 
   function openFact(item) {
-    var url = item.url + "?partial=1";
-    if (window.htmx) {
-      window.htmx.ajax("GET", url, { target: "#fact-panel", swap: "innerHTML" });
-    } else {
-      window.location.href = item.url;
-    }
+    if (!(window.ctOpenFact && window.ctOpenFact(item.id))) window.location.href = item.url;
   }
 
   function label(item) {
@@ -31,7 +26,7 @@
     title.textContent = item.title;
     box.appendChild(title);
     var flags = [];
-    if (item.review === "draft") flags.push("Draft (AI suggestion)");
+    if (item.review === "draft") flags.push("AI draft");
     if (item.key_fact) flags.push("Key fact");
     if (item.statuses.indexOf("disputed") >= 0) flags.push("Disputed");
     if (item.conflict) flags.push("Possible conflict");

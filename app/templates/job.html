@@ -1,7 +1,16 @@
 {% extends "base.html" %}
+{% import "_macros.html" as m with context %}
 {% block title %}Job {{ job.job_id }}{% endblock %}
+{% block page_class %} narrow{% endblock %}
 {% block content %}
-<section class="page-head"><h1>Processing job {{ job.job_id }}</h1></section>
+{% set base = '/cases/' ~ quote(case_id) %}
+<p class="crumbs"><a href="{{ base }}">{{ m.icon('left') }} Today</a></p>
+<div class="titlebar">
+  <div><span class="eyebrow">{{ case_id }}</span><h1>Processing job {{ job.job_id }}</h1></div>
+  <div class="actions">
+    <a class="btn" href="{{ base }}/documents">Documents</a>
+    <a class="btn" href="{{ base }}/facts?review=draft">AI drafts</a>
+  </div>
+</div>
 <section class="card">{% include "_job.html" %}</section>
-<p><a href="/cases/{{ quote(case_id) }}/documents">Documents</a> · <a href="/cases/{{ quote(case_id) }}/review">Needs review</a></p>
 {% endblock %}

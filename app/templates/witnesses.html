@@ -1,71 +1,86 @@
 {% extends "base.html" %}
+{% import "_macros.html" as m with context %}
 {% block title %}Witnesses{% endblock %}
+{% block page_class %} narrow{% endblock %}
 {% block content %}
 {% set base = '/cases/' ~ quote(case_id) %}
-<section class="page-head">
-  <h1>Witnesses <span class="muted">({{ confirmed | length }})</span></h1>
-  <details class="popover">
-    <summary class="btn primary">Add witness</summary>
-    <form method="post" action="{{ base }}/witnesses" class="stack popover-body">
-      <label>Name<input name="name" required maxlength="200"></label>
-      <label>Aliases <span class="muted small">(comma-separated)</span><input name="aliases" placeholder="J. Smith, Mr. Smith"></label>
-      <label>Role<input name="role" placeholder="e.g. CFO of defendant"></label>
-      <label class="check"><input type="checkbox" name="flagged" value="1"> Alert me when a new document mentions this person</label>
-      <div><button class="btn primary">Add witness</button></div>
-    </form>
-  </details>
-</section>
+<div class="titlebar">
+  <div>
+    <span class="eyebrow">{{ case_id }}</span>
+    <h1>Witnesses<span class="n">{{ confirmed | length }} confirmed</span></h1>
+  </div>
+  <div class="actions">
+    <details class="menu">
+      <summary class="btn primary">{{ m.icon('plus') }}Add witness</summary>
+      <form method="post" action="{{ base }}/witnesses" class="panel right form-panel form">
+        <label>Name<input name="name" required maxlength="200"></label>
+        <label>Aliases<input name="aliases" placeholder="J. Smith, Mr. Smith"><span class="help">Comma-separated</span></label>
+        <label>Role<input name="role" placeholder="e.g. CFO of defendant"></label>
+        <label class="check"><input type="checkbox" name="flagged" value="1"> Alert me when a new document mentions this person</label>
+        <div class="form-actions"><button class="btn primary">Add witness</button></div>
+      </form>
+    </details>
+  </div>
+</div>
 
 {% if suggested %}
-<section class="card suggested">
-  <h2>Suggested by AI <span class="muted">({{ suggested | length }})</span></h2>
+<section class="card" style="margin-bottom: 16px">
+  <div class="card-head">
+    <h2>Suggested by AI <span class="n">{{ suggested | length }}</span></h2>
+  </div>
   <p class="muted small">Names the AI found in documents that match no confirmed witness. Confirm them, merge them into an existing witness (the name becomes an alias), or dismiss them.</p>
-  <table class="facts">
-    <thead><tr><th>Name</th><th class="num">Facts</th><th>Actions</th></tr></thead>
+  <div class="table-wrap">
+  <table class="data">
+    <thead><tr><th>Name</th><th class="num">Facts</th><th class="num">Actions</th></tr></thead>
     <tbody>
     {% for w in suggested %}
       <tr id="{{ w.witness_id }}">
-        <td><a href="/witnesses/{{ quote(w.witness_id) }}">{{ w.name }}</a>{% if w.aliases %} <span class="muted small">aka {{ w.aliases | join(', ') }}</span>{% endif %}</td>
+        <td><div class="cell-main">{{ m.avatar(w, 'md') }}<span><a class="t" href="/witnesses/{{ quote(w.witness_id) }}">{{ w.name }}</a>{% if w.aliases %}<span class="s">aka {{ w.aliases | join(', ') }}</span>{% endif %}</span></div></td>
         <td class="num">{{ fact_counts[w.witness_id] }}</td>
-        <td class="actions">
-          <form method="post" action="/witnesses/{{ quote(w.witness_id) }}" class="inline">
-            <input type="hidden" name="next" value="{{ here }}">
-            <button class="btn small ok" name="action" value="confirm">Confirm</button>
-          </form>
-          {% if confirmed %}
-          <form method="post" action="/witnesses/{{ quote(w.witness_id) }}" class="inline">
-            <input type="hidden" name="action" value="merge">
-            <select name="into" aria-label="Merge {{ w.name }} into">{% for c in confirmed %}<option value="{{ c.witness_id }}">{{ c.name }}</option>{% endfor %}</select>
-            <button class="btn small">Merge into</button>
-          </form>
-          {% endif %}
-          <form method="post" action="/witnesses/{{ quote(w.witness_id) }}" class="inline" data-confirm="Dismiss this suggested witness? It is unlinked from its facts.">
-            <input type="hidden" name="action" value="dismiss">
-            <button class="btn small danger">Dismiss</button>
-          </form>
+        <td>
+          <div class="row-actions">
+            <form method="post" action="/witnesses/{{ quote(w.witness_id) }}" class="inline">
+              <input type="hidden" name="next" value="{{ here }}">
+              <button class="btn small ok" name="action" value="confirm">{{ m.icon('check') }}Confirm</button>
+            </form>
+            {% if confirmed %}
+            <form method="post" action="/witnesses/{{ quote(w.witness_id) }}" class="inline">
+              <input type="hidden" name="action" value="merge">
+              <select name="into" aria-label="Merge {{ w.name }} into">{% for c in confirmed %}<option value="{{ c.witness_id }}">{{ c.name }}</option>{% endfor %}</select>
+              <button class="btn small">Merge</button>
+            </form>
+            {% endif %}
+            <form method="post" action="/witnesses/{{ quote(w.witness_id) }}" class="inline" data-confirm="Dismiss this suggested witness? It is unlinked from its facts.">
+              <input type="hidden" name="action" value="dismiss">
+              <button class="btn small danger">Dismiss</button>
+            </form>
+          </div>
         </td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
+  </div>
 </section>
 {% endif %}
 
-<section class="card">
+<div class="sheet">
   {% if confirmed %}
-  <table class="facts">
+  <div class="table-wrap">
+  <table class="data">
     <thead><tr><th>Name</th><th>Role</th><th class="num">Facts</th><th>Alerts</th></tr></thead>
     <tbody>
     {% for w in confirmed %}
       <tr id="{{ w.witness_id }}">
-        <td><a href="/witnesses/{{ quote(w.witness_id) }}">{{ w.name }}</a>{% if w.aliases %} <span class="muted small">aka {{ w.aliases | join(', ') }}</span>{% endif %}</td>
-        <td>{{ w.role or '' }}</td>
-        <td class="num"><a href="{{ base }}/facts?witness={{ quote(w.witness_id) }}">{{ fact_counts[w.witness_id] }}</a></td>
-        <td>{% if w.flagged %}<span class="badge flagged">Flagged</span>{% endif %}</td>
+        <td><div class="cell-main">{{ m.avatar(w, 'md') }}<span><a class="t" href="/witnesses/{{ quote(w.witness_id) }}">{{ w.name }}</a>{% if w.aliases %}<span class="s">aka {{ w.aliases | join(', ') }}</span>{% endif %}</span></div></td>
+        <td class="muted">{{ w.role or '' }}</td>
+        <td class="num">{% if fact_counts[w.witness_id] %}<a href="{{ base }}/facts?witness={{ quote(w.witness_id) }}">{{ fact_counts[w.witness_id] }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+        <td>{% if w.flagged %}<span class="pill flagged">{{ m.icon('bell') }}Flagged</span>{% endif %}</td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
-  {% else %}<p class="muted">No confirmed witnesses yet.</p>{% endif %}
-</section>
+  </div>
+  {% else %}<div class="empty"><strong>No confirmed witnesses yet</strong>Add one, or confirm a suggestion from the AI.</div>{% endif %}
+</div>
 {% endblock %}

@@ -1,15 +1,18 @@
 {% extends "base.html" %}
 {% block title %}Your name{% endblock %}
+{% block page_class %} tiny{% endblock %}
+{% block ask %}{% endblock %}
 {% block content %}
-<section class="card narrow">
-  <h1>Who is reviewing?</h1>
+<section class="card">
+  <div class="titlebar" style="margin-bottom: 10px"><h1>Who is reviewing?</h1></div>
   <p class="muted">There are no accounts. Your display name is kept in a cookie on this browser and recorded as the author of every fact, note and review you make.</p>
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
-  <form method="post" action="/name" class="stack">
-    <label for="name">Display name</label>
-    <input id="name" name="name" maxlength="60" required autofocus autocomplete="name" value="{{ user or '' }}">
+  <form method="post" action="/name" class="form" style="margin-top: 14px">
+    <label for="name">Display name
+      <input id="name" name="name" maxlength="60" required autofocus autocomplete="name" value="{{ user or '' }}" placeholder="Jane Doe">
+    </label>
     <input type="hidden" name="next" value="{{ next }}">
-    <div><button class="btn primary">Save name</button></div>
+    <div class="form-actions"><button class="btn primary">Save name</button></div>
   </form>
 </section>
 {% endblock %}

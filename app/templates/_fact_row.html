@@ -1,20 +1,37 @@
 {% set c = counts.get(x.fact_id, {}) %}
-<tr id="{{ x.fact_id }}" class="review-{{ x.review }}{% if 'key_fact' in x.statuses %} key-fact{% endif %}">
-  <td class="sel">{% if x.review == 'draft' %}<input type="checkbox" name="fact_ids" value="{{ x.fact_id }}" form="bulk-form" aria-label="Select {{ x.fact_id }}">{% endif %}</td>
-  <td class="date nowrap">
-    {% if x.date_start %}{{ fact_date(x) }}{% else %}<span class="muted">—</span>{% endif %}
-    {% if x.date_text %}<div class="muted small" title="As written in the source">{{ x.date_text }}</div>{% endif %}
+{% set ev_list = x.evidence | rejectattr('review', 'equalto', 'rejected') | list %}
+<tr id="{{ x.fact_id }}" class="fact{% if x.review == 'rejected' %} is-rejected{% endif %}">
+  <td class="c-date"{% if x.date_start %} title="{{ fact_date(x) }}"{% endif %}>
+    {%- if x.date_start %}<span class="d1">{{ nice_date(x) }}</span>{% if CERTAINTY_NOTES.get(x.date_certainty) %}<span class="d2">{{ CERTAINTY_NOTES[x.date_certainty] }}</span>{% endif %}
+    {%- else %}<span class="d1 undated">Undated</span>{% endif %}
+    {%- if x.date_text %}<span class="d3" title="As written in the source">“{{ x.date_text }}”</span>{% endif -%}
   </td>
-  <td class="title">
-    <a href="{{ fact_url(x.fact_id) }}">{{ x.title }}</a>
-    <span class="muted small">{{ x.fact_id }}</span>
-    {{ m.badges(x, alleged, conflicts, show_statuses=False) }}
-    {% if x.tag_ids %}<div class="chips">{% for tid in x.tag_ids %}{% if tag_map.get(tid) %}{{ m.tag_chip(tag_map[tid]) }}{% endif %}{% endfor %}</div>{% endif %}
+  <td class="c-fact">
+    <a class="ftitle" href="{{ fact_url(x.fact_id) }}" data-open="{{ x.fact_id }}">{{ x.title }}</a>
+    <div class="fmeta"><span class="fid">{{ x.fact_id }}</span>{{ m.marks(x, x.fact_id in alleged, x.fact_id in conflicts, drawer_link=True) }}{% if c.notes %}<span class="fid">· {{ c.notes }} note{{ '' if c.notes == 1 else 's' }}</span>{% endif %}</div>
+    {% if x.details %}<p class="fdetails">{{ x.details }}</p>{% endif %}
   </td>
-  <td>{% for s in x.statuses %}<span class="badge st-{{ s }}">{{ STATUS_LABELS[s] }}</span>{% endfor %}</td>
-  <td class="num">{{ c.evidence or 0 }}</td>
-  <td class="num">{{ c.tags or 0 }}</td>
-  <td class="num">{{ c.witnesses or 0 }}</td>
-  <td class="num">{{ c.notes or 0 }}</td>
-  <td class="review nowrap">{{ m.review_controls(x, here ~ '#' ~ x.fact_id) }}</td>
+  {% if ev_list %}
+  <td class="c-ev" data-label="Evidence"><ul class="stack">
+    {%- for ev in ev_list[:3] %}{% set d = doc_map.get(ev.doc_id) if ev.doc_id else None %}
+    {%- set label = (d.filename if d else ev.doc_id) if ev.kind != 'external' else ev.reference %}
+    <li><a class="ev" href="{{ doc_view_url(ev.doc_id, ev.evidence_id if ev.kind == 'span' else None) if ev.kind != 'external' else fact_url(x.fact_id) ~ '#evidence' }}" data-open="{{ x.fact_id }}" data-ev="{{ ev.evidence_id }}" title="{{ label }}{% if ev.kind == 'span' and evidence_cite(ev) %}, {{ evidence_cite(ev) }}{% endif %}">
+      {%- if ev.kind == 'external' %}{{ m.icon('link') }}{% else %}{{ m.kind_icon(d.kind if d else 'other') }}{% endif %}<span>{{ label }}</span></a></li>
+    {%- endfor %}
+    {%- if ev_list | length > 3 %}<li><a class="ev more" href="{{ fact_url(x.fact_id) }}#evidence" data-open="{{ x.fact_id }}">+{{ ev_list | length - 3 }} more</a></li>{% endif %}
+  </ul></td>
+  {% else %}<td class="c-ev is-empty"><span class="sr-only">No evidence</span></td>{% endif %}
+  {% if x.statuses %}
+  <td class="c-st" data-label="Status"><ul class="stack">
+    {%- for s in x.statuses %}<li class="st {{ {'key_fact': 'key', 'case_impact': 'impact', 'disputed': 'disputed'}[s] }}">{{ m.status_icon(s) }}<span>{{ STATUS_LABELS[s] }}</span></li>{% endfor -%}
+  </ul></td>
+  {% else %}<td class="c-st is-empty"><span class="sr-only">None</span></td>{% endif %}
+  {% set wl = [] %}{% for wid in x.witness_ids if witness_map.get(wid) %}{% set _ = wl.append(witness_map[wid]) %}{% endfor %}
+  {% if wl %}
+  <td class="c-wit" data-label="Witnesses"><ul class="stack">
+    {%- for w in wl %}
+    <li><a class="wit" href="?{{ toggle('witness', w.witness_id) }}" {% if w.witness_id in f.witness %}aria-current="true"{% endif %} title="{{ w.name }}{% if w.role %}, {{ w.role }}{% endif %}{% if not w.confirmed %} (suggested){% endif %}">{{ m.avatar(w) }}<span class="wn" aria-hidden="true">{{ short_name(w.name) }}</span><span class="sr-only">Filter by {{ w.name }}</span></a></li>
+    {%- endfor %}
+  </ul></td>
+  {% else %}<td class="c-wit is-empty"><span class="sr-only">None</span></td>{% endif %}
 </tr>

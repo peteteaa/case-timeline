@@ -19,8 +19,10 @@ logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 6000
 CHUNK_OVERLAP = 500
+HEAD_CHARS = 600  # start of the document shown as context for later chunks
 MAX_QUOTES = 4
 MAX_TITLE_CHARS = 200
+UNCOPIED_DATE_PENALTY = 0.8  # date_text not found in the document (the model computed it)
 
 _WS = re.compile(r"\s+")
 _PRONOUNS = frozenset(
@@ -37,9 +39,15 @@ _ORG_HINT = re.compile(
 class ExtractedFact(BaseModel):
     """One fact as returned by the model (offsets are computed later, not by the LLM)."""
 
-    title: str = Field(description="Short, neutral headline for the fact.")
+    title: str = Field(
+        description="Short neutral headline: who did what to whom (no date), 6 to 14 words."
+    )
     details: str = Field(default="", description="One or two neutral sentences, or empty.")
-    date_text: str = Field(default="", description="The date exactly as written, or empty.")
+    date_text: str = Field(
+        default="",
+        description="This fact's time reference copied verbatim from the excerpt (never "
+        "computed), e.g. 'June 5, 2021' or 'three weeks later'; empty if none.",
+    )
     people: list[str] = Field(default_factory=list, description="Person names only.")
     quotes: list[str] = Field(
         default_factory=list, description="Verbatim sentences or clauses copied from the excerpt."
@@ -123,10 +131,35 @@ def clean_people(names: list[str]) -> list[str]:
     return out
 
 
-def _to_draft(parsed: ParsedDocument, item: ExtractedFact) -> DraftFact | None:
+def _squash(s: str) -> str:
+    """Lowercase, unify quotes/dashes and drop whitespace for lenient containment checks."""
+    s = s.casefold().translate(str.maketrans("\u2018\u2019\u201c\u201d\u2013\u2014", "''\"\"--"))
+    return _WS.sub("", s)
+
+
+def head_context(text: str, chunk_start: int, limit: int = HEAD_CHARS) -> str:
+    """The document's opening (title, date, parties) for chunks that do not include it."""
+    if chunk_start <= 0:
+        return ""
+    end = min(limit, chunk_start, len(text))
+    cut = text.rfind("\n", 0, end)
+    return text[: cut if cut > limit // 2 else end]
+
+
+def _to_draft(
+    parsed: ParsedDocument, item: ExtractedFact, squashed_text: str | None = None
+) -> DraftFact | None:
     title = _norm(item.title)[:MAX_TITLE_CHARS].strip()
     if not title:
         return None
+    date_text = _norm(item.date_text)
+    confidence = min(1.0, max(0.0, item.confidence))
+    squashed = squashed_text if squashed_text is not None else _squash(parsed.text)
+    if date_text and _squash(date_text) not in squashed:
+        # The model computed or reworded the date instead of copying it; keep the fact (the
+        # date is often right) but don't let it look as solid as a copied one.
+        logger.debug("date_text %r not found verbatim in %s", date_text, parsed.doc.doc_id)
+        confidence *= UNCOPIED_DATE_PENALTY
     quotes: list[str] = []
     for q in item.quotes:
         q = q.strip()
@@ -137,10 +170,10 @@ def _to_draft(parsed: ParsedDocument, item: ExtractedFact) -> DraftFact | None:
         key=draft_key(parsed.doc.doc_id, quotes[0] if quotes else "", title),
         title=title,
         details=_norm(item.details) or None,
-        date_text=_norm(item.date_text) or None,
+        date_text=date_text or None,
         people=clean_people(item.people),
         quotes=quotes,
-        confidence=min(1.0, max(0.0, item.confidence)),
+        confidence=confidence,
         deadline_language=item.deadline_language,
     )
 
@@ -177,13 +210,20 @@ def draft_facts(parsed: ParsedDocument) -> list[DraftFact]:
     from pipeline import llm
 
     spans = chunk_text(parsed.text, CHUNK_SIZE, CHUNK_OVERLAP)
+    squashed = _squash(parsed.text)
     drafts: dict[str, DraftFact] = {}
     chunk_of: dict[str, int] = {}
     by_sighting: dict[tuple[str, str], str] = {}
     failures = 0
     last_error: Exception | None = None
     for i, (start, end) in enumerate(spans, start=1):
-        user = prompts.extraction_user(parsed.doc.filename, parsed.text[start:end], i, len(spans))
+        user = prompts.extraction_user(
+            parsed.doc.filename,
+            parsed.text[start:end],
+            i,
+            len(spans),
+            head=head_context(parsed.text, start),
+        )
         try:
             result = llm.chat_json(prompts.EXTRACTION_SYSTEM, user, ExtractionResult)
         except Exception as exc:  # one bad chunk must not sink the whole document
@@ -196,7 +236,7 @@ def draft_facts(parsed: ParsedDocument) -> list[DraftFact]:
         if not isinstance(result, ExtractionResult):
             result = ExtractionResult.model_validate(result, from_attributes=True)
         for item in result.facts:
-            d = _to_draft(parsed, item)
+            d = _to_draft(parsed, item, squashed)
             if d is None:
                 continue
             sig = _sighting(d)

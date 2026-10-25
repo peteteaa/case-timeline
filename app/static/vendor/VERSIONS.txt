@@ -6,3 +6,8 @@ vis-timeline@7.7.3    https://cdn.jsdelivr.net/npm/vis-timeline@7.7.3/standalone
   sha256 55f5627557103696a538c5e662cab07d554fafc545882a082dfb5e2b5dea65d6  vis-timeline-graph2d.min.js
                       https://cdn.jsdelivr.net/npm/vis-timeline@7.7.3/styles/vis-timeline-graph2d.min.css
   sha256 b2fccd6ac3e0d7247982f11a45e8b68e0fa7e0f737b15c8c516792eb144087a5  vis-timeline-graph2d.min.css
+@fontsource-variable/public-sans@5.1.1     https://cdn.jsdelivr.net/npm/@fontsource-variable/public-sans@5.1.1/files/public-sans-latin-wght-normal.woff2
+@fontsource-variable/source-serif-4@5.1.1  https://cdn.jsdelivr.net/npm/@fontsource-variable/source-serif-4@5.1.1/files/source-serif-4-latin-wght-normal.woff2
+  (fonts/; SIL Open Font License 1.1)
+  sha256 5ed4d31c988e73b258894244f209069ebe77dc7e564861954b21198b6de90d68  public-sans-latin-wght-normal.woff2
+  sha256 42c9a2125f752f225d8aa7b1d95075c4c6a7f91e78d521a50ae318b9ab15bd04  source-serif-4-latin-wght-normal.woff2

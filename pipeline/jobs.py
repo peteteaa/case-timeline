@@ -122,7 +122,9 @@ def _store_drafts(store: Store, parsed: ParsedDocument, drafts: list[DraftFact],
     # Witnesses first (SPEC §6.1 step 3): merge needs them to tell whether people agree.
     people = {d.key: witnesses.match_people(store, case_id, d.people) for d in drafts}
     existing = store.list_facts(case_id)
-    plan = merge.plan(drafts, existing, witness_ids=people)  # draft key -> fact id, or None
+    names = {w.witness_id: [w.name, *w.aliases] for w in store.list_witnesses(case_id)}
+    # draft key -> fact id, or None
+    plan = merge.plan(drafts, existing, witness_ids=people, witness_names=names)
     key_to_fact: dict[str, str] = {}
     created: set[str] = set()
     for draft in drafts:

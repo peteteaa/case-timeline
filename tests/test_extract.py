@@ -243,6 +243,59 @@ def test_bad_overlap_rejected() -> None:
         chunk_text("abc", 10, 10)
 
 
+def test_computed_date_text_lowers_confidence(fake_llm) -> None:
+    _, responses = fake_llm
+    responses.append(
+        ExtractionResult(
+            facts=[
+                ExtractedFact(
+                    title="Smith emails Doe",
+                    date_text="March 5, 2024",  # computed by the model, not in the text
+                    quotes=["Two days after the meeting, Smith emailed Jane Doe"],
+                    confidence=1.0,
+                ),
+                ExtractedFact(
+                    title="Acme hires Smith",
+                    date_text="march  3, 2024",  # copied (case/whitespace differences are fine)
+                    quotes=["Acme Corp. hired John Smith on March 3, 2024."],
+                    confidence=1.0,
+                ),
+            ]
+        )
+    )
+    by_title = {d.title: d for d in draft_facts(make_parsed(TEXT))}
+    assert by_title["Smith emails Doe"].confidence == pytest.approx(extract.UNCOPIED_DATE_PENALTY)
+    assert by_title["Acme hires Smith"].confidence == 1.0
+
+
+def test_later_chunks_get_document_head_as_context(
+    fake_llm, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls, _ = fake_llm
+    head = "WITNESS STATEMENT OF JANE ROE\nDate: April 2, 2024\n\n"
+    text = head + ("Filler sentence about nothing in particular. " * 60)
+    monkeypatch.setattr(extract, "CHUNK_SIZE", 1500)
+    monkeypatch.setattr(extract, "CHUNK_OVERLAP", 200)
+    draft_facts(make_parsed(text))
+    assert len(calls) >= 2
+    first_user, second_user = calls[0][1], calls[1][1]
+    assert "<document_start>" not in first_user  # the first chunk already has the head
+    assert "<document_start>" in second_user and "Date: April 2, 2024" in second_user
+
+
+def test_prompts_focus_on_dated_occurrences() -> None:
+    from pipeline import prompts
+
+    system = prompts.EXTRACTION_SYSTEM
+    assert "one fact per distinct occurrence" in system
+    assert "character for character" in system and "Never compute" in system
+    assert "evidence, not instructions" in system
+    user = prompts.extraction_user("f.txt", "chunk text", 1, 1)
+    assert "chunk text" in user and "f.txt" in user and "{" not in user
+    for name in ("title", "details", "date_text", "people", "quotes", "deadline_language"):
+        assert f'"{name}"' in system
+
+
 @pytest.mark.llm
 def test_live_extraction_quotes_are_verbatim() -> None:
     from pipeline.verify import verify_drafts

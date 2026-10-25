@@ -1,28 +1,70 @@
 {# Shared fragments. Import with: {% import "_macros.html" as m with context %} #}
 
-{% macro badges(f, alleged, conflicts, show_review=True, show_statuses=True) -%}
-<span class="badges">
-  {%- if show_review and f.review == 'draft' %}<span class="badge draft" title="AI suggestion awaiting review">Draft</span>{% endif -%}
-  {%- if show_review and f.review == 'rejected' %}<span class="badge rejected">Rejected</span>{% endif -%}
-  {%- if show_statuses %}{% for s in f.statuses %}<span class="badge st-{{ s }}">{{ STATUS_LABELS[s] }}</span>{% endfor %}{% endif -%}
-  {%- if f.fact_id in alleged %}<span class="badge alleged" title="All evidence comes from pleadings: an allegation, not an established fact">Alleged</span>{% endif -%}
-  {%- if f.fact_id in conflicts %}<a class="badge conflict" href="/cases/{{ quote(case_id) }}/contradictions" title="Sources disagree; open contradiction awaiting review">Conflict</a>{% endif -%}
-</span>
+{% set ICONS = {
+  'doc': '<path d="M4 1.75h5.5l3 3v9.5a.5.5 0 0 1-.5.5H4a.5.5 0 0 1-.5-.5V2.25a.5.5 0 0 1 .5-.5z"/><path d="M9.5 1.75v3h3"/>',
+  'email': '<rect x="1.75" y="3.25" width="12.5" height="9.5" rx="1.25"/><path d="M2.25 4.25 8 8.5l5.75-4.25"/>',
+  'transcript': '<path d="M2.75 3.5h10.5M2.75 6.5h10.5M2.75 9.5h7M2.75 12.5h4.5"/>',
+  'scan': '<rect x="2" y="2.5" width="12" height="11" rx="1.25"/><circle cx="6" cy="6.25" r="1.25"/><path d="m2.5 12 3.5-3.5 2.5 2.5 2-2 3 3"/>',
+  'gavel': '<path d="m9.5 2.5 4 4M7.5 4.5l4 4M8.5 3.5l-3 3 4 4 3-3M6.5 8.5 2 13"/>',
+  'link': '<path d="M6.5 9.5 9.5 6.5"/><path d="M7 4.5 8.25 3.25a2.5 2.5 0 0 1 3.5 3.5L10.5 8M9 11.5l-1.25 1.25a2.5 2.5 0 0 1-3.5-3.5L5.5 8"/>',
+  'chev': '<path d="m4 6 4 4 4-4"/>',
+  'left': '<path d="M10 4 6 8l4 4"/>',
+  'star': '<path d="M8 1.6l1.9 3.9 4.3.6-3.1 3 .7 4.3L8 11.4l-3.8 2 .7-4.3-3.1-3 4.3-.6z"/>',
+  'flag': '<path d="M3.5 14.5v-12"/><path d="M3.5 2.75h8.25l-1.9 3 1.9 3H3.5" style="fill: currentColor"/>',
+  'bolt': '<path d="M9 1.5 3.5 9h3.75l-.75 5.5 6-8H8.75z"/>',
+  'split': '<path d="M8 2v4M8 6 4 10v4M8 6l4 4v4"/>',
+  'search': '<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/>',
+  'lock': '<rect x="3" y="7" width="10" height="7" rx="1.25"/><path d="M5.25 7V5a2.75 2.75 0 0 1 5.5 0v2"/>',
+  'chat': '<path d="M2.5 3.75A1.25 1.25 0 0 1 3.75 2.5h8.5a1.25 1.25 0 0 1 1.25 1.25v6a1.25 1.25 0 0 1-1.25 1.25H7l-3 2.5V11h-.25A1.25 1.25 0 0 1 2.5 9.75z"/>',
+  'send': '<path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/>',
+  'close': '<path d="M4 4l8 8M12 4l-8 8"/>',
+  'plus': '<path d="M8 3v10M3 8h10"/>',
+  'upload': '<path d="M8 10.5V2.5M4.5 6 8 2.5 11.5 6M2.5 10.5v2a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-2"/>',
+  'bell': '<path d="M4 6.5a4 4 0 0 1 8 0c0 3.5 1.5 4.5 1.5 4.5h-11S4 10 4 6.5zM6.5 13.5a1.5 1.5 0 0 0 3 0"/>',
+  'clock': '<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/>',
+  'user': '<circle cx="8" cy="5.5" r="2.75"/><path d="M2.75 14a5.25 5.25 0 0 1 10.5 0"/>',
+  'expand': '<path d="M9.5 2.5h4v4M6.5 13.5h-4v-4M13.5 2.5 9 7M2.5 13.5 7 9"/>',
+  'refresh': '<path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/>',
+  'check': '<path d="m3 8.5 3 3 7-7"/>',
+  'trash': '<path d="M3 4.5h10M6.5 4.5v-2h3v2M4.5 4.5l.5 9h6l.5-9"/>',
+} %}
+{% set KIND_ICONS = {'email': 'email', 'transcript': 'transcript', 'exhibit': 'scan', 'order': 'gavel', 'motion': 'gavel', 'pleading': 'gavel'} %}
+{% set STATUS_STYLE = {'key_fact': ('key', 'star', True), 'case_impact': ('impact', 'bolt', True), 'disputed': ('disputed', 'flag', False)} %}
+
+{% macro icon(name, cls='') -%}
+<svg class="ic {{ cls }}" viewBox="0 0 16 16" aria-hidden="true" focusable="false">{{ ICONS[name] | safe }}</svg>
 {%- endmacro %}
 
-{% macro tag_chip(t) -%}
-{%- set c = valid_color(t.color) -%}
-<a class="chip tag" href="/cases/{{ quote(case_id) }}/facts?tag={{ quote(t.tag_id) }}"{% if c %} style="--tag: {{ c }}"{% endif %}>{{ t.name }}</a>
+{% macro kind_icon(kind) -%}{{ icon(KIND_ICONS.get(kind, 'doc')) }}{%- endmacro %}
+
+{% macro status_icon(s) -%}
+{%- set st = STATUS_STYLE[s] -%}{{ icon(st[1], 'solid' if st[2] else '') }}
+{%- endmacro %}
+
+{% macro status_pill(s) -%}
+<span class="pill {{ STATUS_STYLE[s][0] }}">{{ status_icon(s) }}{{ STATUS_LABELS[s] }}</span>
+{%- endmacro %}
+
+{# Row/drawer marks: AI draft, rejected, conflict, alleged. #}
+{% macro marks(f, is_alleged, is_conflict, drawer_link=False) -%}
+  {%- if f.review == 'draft' %}<span class="mk ai" title="Drafted by the AI from the case documents; not yet accepted">AI draft</span>{% endif -%}
+  {%- if f.review == 'rejected' %}<span class="mk rejected">Rejected</span>{% endif -%}
+  {%- if is_conflict %}<a class="mk conflict" href="{{ fact_url(f.fact_id) }}#contradictions"{% if drawer_link %} data-open="{{ f.fact_id }}" data-sec="conflicts"{% endif %} title="Sources disagree; open contradiction">Conflict</a>{% endif -%}
+  {%- if is_alleged %}<span class="mk alleged" title="All evidence comes from pleadings: an allegation, not an established fact">Alleged</span>{% endif -%}
+{%- endmacro %}
+
+{% macro avatar(w, cls='') -%}
+<span class="av {{ cls }}" style="--av: {{ avatar_color(w.witness_id) }}" aria-hidden="true">{{ initials(w.name) }}</span>
 {%- endmacro %}
 
 {% macro review_controls(f, next, with_reason=False) -%}
 <span id="rv-{{ f.fact_id }}" class="review-controls">
   {%- if f.review == 'draft' %}
-  <form method="post" action="/facts/{{ quote(f.fact_id) }}/review" class="inline"
+  <form method="post" action="/facts/{{ quote(f.fact_id) }}/review"
         hx-post="/facts/{{ quote(f.fact_id) }}/review" hx-target="#rv-{{ f.fact_id }}" hx-swap="outerHTML">
     <input type="hidden" name="next" value="{{ next }}">
     {% if with_reason %}<input name="reason" class="reason" maxlength="500" placeholder="Reason (optional)" aria-label="Reason for {{ f.fact_id }}">{% endif %}
-    <button class="btn small ok" name="action" value="accept" title="Accept this draft">Accept</button>
+    <button class="btn small ok" name="action" value="accept" title="Accept this draft">{{ icon('check') }}Accept</button>
     <button class="btn small danger" name="action" value="reject" title="Reject this draft">Reject</button>
   </form>
   {%- else %}
@@ -34,8 +76,8 @@
 {% macro evidence_controls(ev, next) -%}
 <span id="ev-{{ ev.evidence_id }}" class="review-controls">
   {%- if ev.review == 'draft' %}
-  <span class="badge draft">New</span>
-  <form method="post" action="/evidence/{{ quote(ev.evidence_id) }}/review" class="inline"
+  <span class="mk new">New</span>
+  <form method="post" action="/evidence/{{ quote(ev.evidence_id) }}/review"
         hx-post="/evidence/{{ quote(ev.evidence_id) }}/review" hx-target="#ev-{{ ev.evidence_id }}" hx-swap="outerHTML">
     <input type="hidden" name="next" value="{{ next }}">
     <button class="btn small ok" name="action" value="accept">Accept</button>
@@ -47,23 +89,30 @@
 </span>
 {%- endmacro %}
 
-{% macro evidence_item(ev, doc_map, next, controls=True) -%}
-<li class="evidence ev-{{ ev.kind }}" id="{{ ev.evidence_id }}">
-  <div class="ev-head">
-    {%- set d = doc_map.get(ev.doc_id) if ev.doc_id else None %}
-    {% if ev.kind == 'span' %}
-      <a href="{{ doc_view_url(ev.doc_id, ev.evidence_id) }}">{{ d.filename if d else ev.doc_id }}</a>
-      {% if evidence_cite(ev) %}<span class="muted">{{ evidence_cite(ev) }}</span>{% endif %}
-      {% if d and d.kind == 'pleading' %}<span class="badge alleged">pleading</span>{% endif %}
-    {% elif ev.kind == 'document' %}
-      <span class="muted">Whole document:</span> <a href="{{ doc_view_url(ev.doc_id) }}">{{ d.filename if d else ev.doc_id }}</a>
-      {% if d and d.kind == 'pleading' %}<span class="badge alleged">pleading</span>{% endif %}
+{# One evidence card: source, pin cite, quote, and a link into the source viewer. #}
+{% macro evidence_item(ev, doc_map, next, controls=True, idx=None) -%}
+{%- set d = doc_map.get(ev.doc_id) if ev.doc_id else None %}
+<li class="evidence ev-{{ ev.kind }}" id="{{ ev.evidence_id }}"{% if idx is not none %} data-ev-index="{{ idx }}"{% endif %}>
+  <div class="dev-head">
+    {% if ev.kind == 'external' %}
+      {{ icon('link') }}<span>External reference</span>
     {% else %}
-      <span class="muted">External reference (not fetched):</span> <code class="ref">{{ ev.reference }}</code>
+      {{ kind_icon(d.kind if d else 'other') }}<a href="{{ doc_view_url(ev.doc_id, ev.evidence_id if ev.kind == 'span' else None) }}">{{ d.filename if d else ev.doc_id }}</a>
+      {% if d and d.kind == 'pleading' %}<span class="mk alleged">pleading</span>{% endif %}
     {% endif %}
-    <span class="muted small">{{ ev.evidence_id }} · {{ 'AI' if ev.origin == 'ai' else 'person' }}</span>
-    {% if controls %}{{ evidence_controls(ev, next) }}{% endif %}
+    <span class="dev-loc">{% if ev.kind == 'span' %}{{ evidence_cite(ev) }}{% elif ev.kind == 'document' %}Whole document{% endif %}</span>
   </div>
-  {% if ev.kind == 'span' and ev.quote %}<blockquote>{{ ev.quote }}</blockquote>{% endif %}
+  {% if ev.kind == 'span' and ev.quote %}<blockquote><mark>{{ ev.quote }}</mark></blockquote>
+  {% elif ev.kind == 'external' %}<p class="ref"><code>{{ ev.reference }}</code> <span class="muted small">(stored, never fetched)</span></p>{% endif %}
+  <div class="dev-foot">
+    {% if ev.kind == 'span' %}<a class="linkbtn" href="{{ doc_view_url(ev.doc_id, ev.evidence_id) }}">Open in source viewer</a>{% else %}<span></span>{% endif %}
+    <span>{{ ev.evidence_id }} · {{ 'AI' if ev.origin == 'ai' else 'person' }}{% if controls %} {{ evidence_controls(ev, next) }}{% endif %}</span>
+  </div>
 </li>
+{%- endmacro %}
+
+{% macro job_button(base) -%}
+<form method="post" action="{{ base }}/process" hx-post="{{ base }}/process" hx-target="#job-status" hx-swap="outerHTML" class="inline">
+  <button class="btn primary" hx-disabled-elt="this">{{ icon('refresh') }}Process now</button>
+</form>
 {%- endmacro %}

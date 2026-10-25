@@ -39,6 +39,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.helpers import (
     ALERT_LABELS,
+    CERTAINTY_NOTES,
     FIELD_LABELS,
     LOOPBACK_HOSTS,
     SORT_KEYS,
@@ -46,6 +47,7 @@ from app.helpers import (
     STATUS_LABELS,
     USER_COOKIE,
     ParamGetter,
+    avatar_color,
     build_query,
     clean_display_name,
     decode_user_cookie,
@@ -53,6 +55,7 @@ from app.helpers import (
     evidence_cite,
     fact_changes,
     fact_date,
+    fact_groups,
     fact_ids_in,
     filter_pairs,
     filters_active,
@@ -61,14 +64,18 @@ from app.helpers import (
     history_value,
     host_is_loopback,
     hostname,
+    initials,
     linkify_fact_ids,
+    nice_date,
     parse_filters,
     parse_int,
     pct,
     query_string,
     safe_next,
     sanitize_filename,
+    short_name,
     source_segments,
+    toggle_query,
     valid_color,
 )
 from pipeline import digest as digest_mod
@@ -334,6 +341,11 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None) 
         doc_view_url=doc_view_url,
         fact_url=fact_url,
         fact_date=fact_date,
+        nice_date=nice_date,
+        CERTAINTY_NOTES=CERTAINTY_NOTES,
+        avatar_color=avatar_color,
+        initials=initials,
+        short_name=short_name,
         fmt_date=fmt_date,
         fmt_dt=fmt_dt,
         pct=pct,
@@ -550,9 +562,14 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None) 
             digest_html = linkify_fact_ids(str(digest.get("text") or ""), known_fact(store))
         except Exception as exc:  # noqa: BLE001 - the panel degrades, the page still works
             log.warning("daily digest unavailable: %s", exc)
+        alerts = store.list_alerts(case)
+        alert_fact_ids = list(dict.fromkeys(fid for a in alerts for fid in a.fact_ids))
         return render(
             request,
             "today.html",
+            alerts=alerts,
+            alert_facts={f.fact_id: f for f in store.get_facts(alert_fact_ids)},
+            doc_map={d.doc_id: d for d in store.list_documents(case)},
             counts=store.review_counts(case),
             open_conflicts=len(store.list_contradictions(case, "open")),
             pending_alerts=len(store.list_alerts(case, pending_only=True)),
@@ -590,7 +607,53 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None) 
                 return [], f"Search not understood: {exc}"
             except NotImplementedError:
                 return [], "Search is not available yet."
+        for flag in f["flag"]:
+            flagged = (
+                store.conflicted_fact_ids(case)
+                if flag == "conflict"
+                else store.alleged_fact_ids(case)
+            )
+            fact_ids = [x for x in fact_ids if x in flagged] if fact_ids is not None else [*flagged]
         return store.list_facts(case, build_query(f, fact_ids)), None
+
+    QUICK_FILTERS = (  # (key, label, filter param, value)
+        ("key", "Key facts", "status", "key_fact"),
+        ("disputed", "Disputed", "status", "disputed"),
+        ("conflict", "Conflicts", "flag", "conflict"),
+        ("draft", "AI drafts", "review", "draft"),
+        ("alleged", "Alleged", "flag", "alleged"),
+    )
+
+    def quick_filters(
+        f: dict[str, Any], everything: list[Fact], alleged: set[str], conflicts: set[str]
+    ) -> list[dict[str, Any]]:
+        """The quick-filter chips: each one's count over all facts and its toggle link."""
+        tests = {
+            "key": lambda x: "key_fact" in x.statuses,
+            "disputed": lambda x: "disputed" in x.statuses,
+            "conflict": lambda x: x.fact_id in conflicts,
+            "draft": lambda x: x.review == "draft",
+            "alleged": lambda x: x.fact_id in alleged,
+        }
+        chips = []
+        for key, label, param, value in QUICK_FILTERS:
+            if param == "review":
+                pressed = f["review"] == ["draft"]
+                toggled = dict(f, review=["draft", "accepted"] if pressed else ["draft"])
+                href = query_string(filter_pairs(toggled))
+            else:
+                pressed = value in f[param]
+                href = toggle_query(f, param, value)
+            chips.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "pressed": pressed,
+                    "count": sum(1 for x in everything if tests[key](x)),
+                    "href": href,
+                }
+            )
+        return chips
 
     def visual_item(f: Fact, alleged: set[str], conflicts: set[str]) -> dict[str, Any]:
         end = None
@@ -639,6 +702,7 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None) 
                 }
             )
         pairs = filter_pairs(f)
+        everything = store.list_facts(case)
         return render(
             request,
             "timeline.html",
@@ -646,9 +710,12 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None) 
             errors=errors,
             search_error=search_error,
             syntax_help=search_mod.SYNTAX_HELP,
-            dated=[x for x in facts if x.date_start is not None],
-            undated=[x for x in facts if x.date_start is None],
+            groups=fact_groups(facts, by_year=f["sort"] == "date"),
+            by_year=f["sort"] == "date",
+            toggle=lambda key, value: toggle_query(f, key, value),
             total=len(facts),
+            grand_total=len(everything),
+            quick=quick_filters(f, everything, alleged, conflicts),
             counts=store.fact_counts([x.fact_id for x in facts]),
             alleged=alleged,
             conflicts=conflicts,
@@ -692,27 +759,12 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None) 
 
     # ------------------------------------------------------------------ needs review / bulk
 
-    @app.get("/cases/{case_id}/review", response_class=HTMLResponse)
-    def needs_review(
-        request: Request, case_id: str, order: str = "low", doc: str | None = None
-    ) -> HTMLResponse:
+    @app.get("/cases/{case_id}/review", include_in_schema=False)
+    def needs_review(case_id: str, doc: str | None = None) -> RedirectResponse:
+        """Old review-queue links land on the timeline filtered to AI drafts."""
         check_case(case_id)
-        store = _store(request)
-        high = order == "high"
-        query = FactQuery(
-            reviews=["draft"], sort="confidence", descending=high, doc_ids=[doc] if doc else []
-        )
-        facts = store.list_facts(case, query)
-        return render(
-            request,
-            "review.html",
-            facts=facts,
-            order="high" if high else "low",
-            doc_filter=doc,
-            alleged=store.alleged_fact_ids(case),
-            conflicts=store.conflicted_fact_ids(case),
-            **lookups(store),
-        )
+        pairs = [("review", "draft")] + ([("doc", doc)] if doc else [])
+        return _redirect(f"/cases/{quote(case, safe='')}/facts?{query_string(pairs)}")
 
     @app.post("/cases/{case_id}/review", response_model=None)
     async def bulk_review(request: Request, case_id: str) -> Response:
@@ -742,11 +794,17 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None) 
         store = _store(request)
         fact = get_fact_or_404(store, fact_id)
         lk = lookups(store)
+        contradictions = []
+        for c in store.list_contradictions(case, fact_id=fact_id):
+            others = [x for x in store.get_facts(c.fact_ids) if x.fact_id != fact_id]
+            contradictions.append({"c": c, "others": others})
+        contradictions.sort(key=lambda v: v["c"].status != "open")
         ctx: dict[str, Any] = {
             "fact": fact,
             "alleged": fact.fact_id in store.alleged_fact_ids(case),
             "conflict": fact.fact_id in store.conflicted_fact_ids(case),
             "notes": store.list_notes(fact_id),
+            "contradictions": contradictions,
             **lk,
         }
         if partial:
@@ -761,17 +819,11 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None) 
             }
             for h in store.fact_history(fact_id)
         ]
-        contradictions = []
-        for c in store.list_contradictions(case, fact_id=fact_id):
-            others = [x for x in store.get_facts(c.fact_ids) if x.fact_id != fact_id]
-            contradictions.append({"c": c, "others": others})
-        contradictions.sort(key=lambda v: v["c"].status != "open")
         anchor = store.get_fact(fact.anchor_fact_id) if fact.anchor_fact_id else None
         return render(
             request,
             "fact.html",
             history=history,
-            contradictions=contradictions,
             anchor=anchor,
             witness_choices=[
                 w for w in lk["witnesses"] if w.confirmed or w.witness_id in fact.witness_ids
@@ -1128,45 +1180,6 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None) 
 
     # ------------------------------------------------------------------ tags
 
-    @app.get("/cases/{case_id}/tags", response_class=HTMLResponse)
-    def tags(request: Request, case_id: str) -> HTMLResponse:
-        check_case(case_id)
-        store = _store(request)
-        counts: Counter[str] = Counter()
-        for fact in store.list_facts(case):
-            counts.update(fact.tag_ids)
-        return render(request, "tags.html", tags=store.list_tags(case), tag_counts=counts)
-
-    @app.post("/cases/{case_id}/tags", response_model=None)
-    async def change_tags(request: Request, case_id: str) -> Response:
-        check_case(case_id)
-        user = require_user(request)
-        store = _store(request)
-        params = await _params(request)
-        action = params.get("action") or "create"
-        color_raw = params.get("color")
-        color = valid_color(color_raw)
-        if color_raw and color is None:
-            raise HTTPException(422, "color must look like #1a2b3c")
-        result: Any = None
-        with store_errors():
-            if action == "create":
-                result = store.add_tag(case, params.get("name") or "", by=user, color=color)
-            else:
-                tag_id = params.get("tag_id") or ""
-                tag = store.get_tag(tag_id)
-                if tag is None or tag.case_id != case:
-                    raise HTTPException(404, "tag not found")
-                if action == "update":
-                    result = store.update_tag(tag_id, by=user, name=params.get("name"), color=color)
-                elif action == "delete":
-                    store.delete_tag(tag_id, by=user)
-                else:
-                    raise HTTPException(422, "unknown tag action")
-        if _wants_json(request):
-            return JSONResponse(result.model_dump(mode="json") if result else {"deleted": True})
-        return _redirect(safe_next(params.get("next"), f"/cases/{case}/tags"))
-
     # ------------------------------------------------------------------ contradictions / alerts
 
     @app.get("/cases/{case_id}/contradictions", response_class=HTMLResponse)
@@ -1201,26 +1214,17 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None) 
             )
         )
 
-    @app.get("/cases/{case_id}/alerts", response_class=HTMLResponse)
-    def alerts(request: Request, case_id: str) -> HTMLResponse:
+    @app.get("/cases/{case_id}/alerts", include_in_schema=False)
+    def alerts(case_id: str) -> RedirectResponse:
+        """Alerts live on the Today page."""
         check_case(case_id)
-        store = _store(request)
-        items = store.list_alerts(case)
-        fact_ids = list(dict.fromkeys(fid for a in items for fid in a.fact_ids))
-        facts = {f.fact_id: f for f in store.get_facts(fact_ids)}
-        return render(
-            request,
-            "alerts.html",
-            alerts=items,
-            facts=facts,
-            doc_map={d.doc_id: d for d in store.list_documents(case)},
-        )
+        return _redirect(f"/cases/{quote(case, safe='')}#alerts")
 
     @app.get("/cases/{case_id}/alerts/{alert_id}", include_in_schema=False)
     def alert_link(case_id: str, alert_id: str) -> RedirectResponse:
         """Content-free link target for alerts announced outside the UI."""
         check_case(case_id)
-        return _redirect(f"/cases/{quote(case, safe='')}/alerts#{quote(alert_id, safe='')}")
+        return _redirect(f"/cases/{quote(case, safe='')}#{quote(alert_id, safe='')}")
 
     # ------------------------------------------------------------------ export
 

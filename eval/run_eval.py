@@ -18,7 +18,10 @@ store, so they reflect exactly what the pipeline wrote:
   the conflicting field agrees (if both name one) and two of its facts match two different
   sides of it. A fact matches a side when it quotes the side's text, or when it is the fact
   matched to the gold timeline entry for the dispute's ``event_key`` in the side's document
-  (the model may quote a different sentence about the same event).
+  (the model may quote a different sentence about the same event). Recall counts the
+  ``planted`` disputes (all of them if none is marked); precision credits a match to any gold
+  dispute, planted or derived. Dismissed contradictions are not predictions. Text matching
+  ignores case and punctuation.
 - **Review acceptance rate.** (accept + edit) / all fact-level review events.
 - **Throughput.** Documents parsed per hour of job run time.
 
@@ -43,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from rapidfuzz import fuzz
+from rapidfuzz.utils import default_process
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +87,7 @@ class GoldDispute:
     sides: tuple[tuple[str, str], ...]  # (doc, quote)
     field: str = ""
     event_key: str = ""
+    planted: bool = True  # recall counts planted disputes; derived ones only credit precision
 
 
 @dataclass
@@ -177,6 +182,7 @@ def load_disputes(path: Path) -> list[GoldDispute]:
                     sides=sides,
                     field=str(item.get("field") or ""),
                     event_key=str(item.get("event_key") or ""),
+                    planted=bool(item.get("planted", True)),
                 )
             )
     return out
@@ -239,14 +245,14 @@ def text_score(g: GoldFact, p: Pred) -> float:
     best = 0.0
     for gold_text in filter(None, (g.title, g.details)):
         for pred_text in filter(None, (p.title, p.details)):
-            best = max(best, fuzz.token_set_ratio(gold_text, pred_text))
+            best = max(best, fuzz.token_set_ratio(gold_text, pred_text, processor=default_process))
     if best < TEXT_THRESHOLD:
         best = 0.0
     if g.quote:
         doc = _norm_doc(g.doc)
         for d, q in p.quotes:
             if q and (not doc or _norm_doc(d) == doc):
-                if fuzz.partial_ratio(g.quote, q) >= QUOTE_THRESHOLD:
+                if fuzz.partial_ratio(g.quote, q, processor=default_process) >= QUOTE_THRESHOLD:
                     best = max(best, 100.0)
     return best
 
@@ -295,7 +301,9 @@ def side_matches(
     for d, q in p.quotes:
         if doc and _norm_doc(d) != doc:
             continue
-        if not quote or (q and fuzz.partial_ratio(quote, q) >= SIDE_THRESHOLD):
+        if not quote or (
+            q and fuzz.partial_ratio(quote, q, processor=default_process) >= SIDE_THRESHOLD
+        ):
             return True
     return False
 
@@ -416,7 +424,8 @@ def score_contradictions(
     by_id: dict[str, Pred],
     events: EventFacts | None = None,
 ) -> dict[str, Any]:
-    predicted = store.list_contradictions(case_id)
+    predicted = [c for c in store.list_contradictions(case_id) if c.status != "dismissed"]
+    scored = [g for g in disputes if g.planted] or list(disputes)
     pred_hits: dict[str, list[str]] = {}
     gold_hit: set[str] = set()
     for c in predicted:
@@ -425,15 +434,17 @@ def score_contradictions(
         pred_hits[c.contradiction_id] = hits
         gold_hit.update(hits)
     p = _ratio(sum(1 for h in pred_hits.values() if h), len(predicted))
-    r = _ratio(len(gold_hit), len(disputes))
+    r = _ratio(sum(1 for g in scored if g.id in gold_hit), len(scored))
     return {
-        "n_gold": len(disputes),
+        "n_gold": len(scored),
+        "n_gold_all": len(disputes),
         "n_pred": len(predicted),
         "precision": p,
         "recall": r,
         "f1": _f1(p, r),
         "matched": pred_hits,
-        "missed": [g.id for g in disputes if g.id not in gold_hit],
+        "missed": [g.id for g in scored if g.id not in gold_hit],
+        "false_positives": [cid for cid, h in pred_hits.items() if not h],
     }
 
 

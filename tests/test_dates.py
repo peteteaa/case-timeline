@@ -2,7 +2,7 @@ from datetime import date
 
 import pytest
 
-from pipeline.dates import parse_absolute, parse_relative, resolve_drafts
+from pipeline.dates import is_open_bound, parse_absolute, parse_relative, resolve_drafts
 from pipeline.schema import DraftFact, SpanIn
 from tests.pipeline_helpers import make_fact
 
@@ -361,3 +361,205 @@ def test_empty() -> None:
 @pytest.mark.parametrize("text", ["0000", "February 30, 2024", "Q2 0000", "the 0000s"])
 def test_invalid_calendar_values_are_unknown(text: str) -> None:
     assert one(text).date_certainty == UNKNOWN
+
+
+# ------------------------------------------------------------ times of day, year carry-over
+
+
+@pytest.mark.parametrize(
+    ("text", "start", "certainty"),
+    [
+        ("March 14, 2024 at 5:40 PM", date(2024, 3, 14), EXACT),
+        # The qualifier belongs to the time; the day itself is stated exactly.
+        ("March 14, 2024 at approximately 5:40 PM", date(2024, 3, 14), EXACT),
+        ("Wednesday, March 20, 2024 4:02 PM", date(2024, 3, 20), EXACT),
+        ("Mon, 25 Mar 2024 09:14:00 -0400", date(2024, 3, 25), EXACT),
+        ("2024-03-14T17:40:00", date(2024, 3, 14), EXACT),
+        ("10/14/2010 13:42 CDT", date(2010, 10, 14), EXACT),
+        ("May 6, 2024 at 1700 hours", date(2024, 5, 6), EXACT),
+        ("at noon on June 1, 2024", date(2024, 6, 1), EXACT),
+        ("the morning of March 3, 2024", date(2024, 3, 3), EXACT),
+        ("March 3, 2024, in the afternoon", date(2024, 3, 3), EXACT),
+        ("March 3, 2024, after the meeting", date(2024, 3, 3), EXACT),
+        ("June 5, 2021, about 1816 central daylight time", date(2021, 6, 5), EXACT),
+        ("On June 5, 2021 at 1729", date(2021, 6, 5), EXACT),
+        ("around 3pm on March 3, 2024", date(2024, 3, 3), APPROXIMATE),
+    ],
+)
+def test_time_of_day_is_dropped(text: str, start: date, certainty: str) -> None:
+    assert parse_absolute(text, None) == ((start, start), certainty)
+    out = one(text)
+    assert (out.date_start, out.date_end, out.date_certainty) == (start, start, certainty)
+
+
+@pytest.mark.parametrize(
+    ("text", "start", "end"),
+    [
+        ("mid-March", date(2024, 3, 11), date(2024, 3, 20)),
+        ("early March", date(2024, 3, 1), date(2024, 3, 10)),
+        ("Sometime in mid-March, after that meeting", date(2024, 3, 11), date(2024, 3, 20)),
+        ("March", date(2024, 3, 1), date(2024, 3, 31)),
+        ("late December", date(2023, 12, 21), date(2023, 12, 31)),
+    ],
+)
+def test_month_without_year_carries_year_over(text: str, start: date, end: date) -> None:
+    assert parse_absolute(text, date(2024, 3, 12)) == ((start, end), APPROXIMATE)
+
+
+def test_month_without_year_and_no_reference_is_unknown() -> None:
+    assert parse_absolute("mid-March", None) is None
+    assert one("mid-March", doc_date=None).date_certainty == UNKNOWN
+
+
+def test_month_without_year_uses_prior_dated_draft() -> None:
+    drafts = [ev("a", "March 12, 2024", 0), ev("b", "sometime in mid-March", 50)]
+    out = resolve(drafts, date(2025, 9, 10))[1]  # the doc date alone would say 2025
+    assert (out.date_start, out.date_end) == (date(2024, 3, 11), date(2024, 3, 20))
+    assert out.date_certainty == APPROXIMATE
+
+
+def test_month_day_without_year_takes_year_from_prior_draft() -> None:
+    drafts = [ev("a", "April 2, 2023", 0), ev("b", "April 9", 50)]
+    out = resolve(drafts, date(2024, 6, 1))[1]
+    assert out.date_start == date(2023, 4, 9) and out.date_certainty == APPROXIMATE
+
+
+def test_open_bound_is_not_year_context() -> None:
+    # "since 2006" is background; "March 3" belongs to the document's own time.
+    drafts = [ev("a", "since 2006", 0), ev("b", "March 3", 50)]
+    out = resolve(drafts, date(2024, 6, 1))
+    assert out[0].date_start == date(2006, 1, 1)
+    assert out[1].date_start == date(2024, 3, 3)
+
+
+@pytest.mark.parametrize(
+    ("text", "start", "end"),
+    [
+        ("earlier in the week", date(2024, 3, 11), date(2024, 3, 17)),
+        ("later that month", date(2024, 3, 1), date(2024, 3, 31)),
+        ("that same year", date(2024, 1, 1), date(2024, 12, 31)),
+        ("that same day", date(2024, 3, 12), date(2024, 3, 12)),
+        ("later that same evening", date(2024, 3, 12), date(2024, 3, 12)),
+        ("Two days later at 3 PM", date(2024, 3, 14), date(2024, 3, 14)),
+    ],
+)
+def test_more_relative_phrases(text: str, start: date, end: date) -> None:
+    spec = parse_relative(text)
+    assert spec is not None and not spec.deictic
+    anchor = date(2024, 3, 12)
+    assert spec.apply((anchor, anchor), True) == (start, end)
+
+
+def test_earlier_this_week_is_relative_to_the_document_date() -> None:
+    a = ev("a", "January 2, 2024", 0)
+    b = ev("b", "earlier this week", 50)
+    out = resolve([a, b], DOC_DATE)[1]  # Saturday, June 15, 2024
+    assert (out.date_start, out.date_end) == (date(2024, 6, 10), date(2024, 6, 16))
+    assert out.anchor_key is None
+
+
+def test_earlier_in_the_week_anchors_to_prior_draft() -> None:
+    a = ev("a", "March 15, 2024", 0, "Officer Ortiz interviewed Becker by phone.")
+    b = ev("b", "earlier in the week", 80, "Becker heard raised voices.")
+    out = resolve([a, b], date(2024, 3, 18))[1]
+    assert (out.date_start, out.date_end) == (date(2024, 3, 11), date(2024, 3, 17))
+    assert out.anchor_key == "a" and out.date_certainty == RELATIVE
+
+
+def test_earlier_that_day_anchors_to_prior_draft() -> None:
+    a = ev("a", "March 14, 2024 at 5:40 PM", 0, "officer responded")
+    b = ev("b", "earlier that day", 80, "she was sent home")
+    out = resolve([a, b], date(2024, 3, 18))[1]
+    assert out.date_start == date(2024, 3, 14) and out.anchor_key == "a"
+
+
+# --------------------------------------------------------------- open-ended bounds
+
+
+@pytest.mark.parametrize(
+    "bound", ["before March 10, 2024", "after March 10, 2024", "by March 10, 2024", "since 2006"]
+)
+def test_open_bound_is_never_an_anchor(bound: str) -> None:
+    a = ev("a", "March 4, 2024", 0)
+    b = ev("b", bound, 50)
+    c = ev("c", "two days later", 100)
+    out = resolve([a, b, c], DOC_DATE)
+    assert out[2].anchor_key == "a"
+    assert out[2].date_start == date(2024, 3, 6)
+
+
+def test_open_bound_is_never_a_named_anchor() -> None:
+    bound = ev("b", "before March 10, 2024", 0, "The inspection happened before the audit.")
+    audit = ev("a", "March 20, 2024", 50, "The audit of the warehouse was completed.")
+    rel = ev("r", "two days after the inspection", 100, "The report was filed.")
+    out = resolve([bound, audit, rel], DOC_DATE)[2]
+    assert out.anchor_key != "b"
+
+
+def test_open_bound_fact_is_never_an_anchor() -> None:
+    fact = make_fact("F-0001", "Court holds hearing", date(2024, 5, 10)).model_copy(
+        update={"date_text": "after May 10, 2024"}
+    )
+    rel = ev("r", "two days after the hearing", 0, "Counsel files a reply.")
+    out = resolve([rel], None, [fact])[0]
+    assert out.date_start is None and out.anchor_fact_id is None
+
+
+@pytest.mark.parametrize(
+    ("text", "bound"),
+    [
+        ("before March 3, 2024", True),
+        ("shortly after March 3, 2024", False),  # a near window, not open-ended
+        ("since 2006", True),
+        ("no later than April 1, 2024", True),
+        ("the following week", False),
+        ("following the meeting", True),
+        ("March 3, 2024", False),
+        (None, False),
+    ],
+)
+def test_is_open_bound(text: str | None, bound: bool) -> None:
+    assert is_open_bound(text) is bound
+
+
+# --------------------------------------------------------------- 24-hour clock times
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1810:33",
+        "At 1816:19",
+        "about 1816:45",
+        "1829 Eastern daylight time",
+        "1342 cdt",
+        "at 1729",
+        "at about 0930",
+        "about 1815",
+        "at 1200 hours",
+        "approximately 6:15 PM",
+    ],
+)
+def test_time_only_is_not_a_year_and_stays_undated(text: str) -> None:
+    assert parse_absolute(text) is None
+    assert parse_relative(text) is None
+    out = one(text)
+    assert out.date_start is None and out.date_certainty == UNKNOWN
+
+
+@pytest.mark.parametrize("text", ["about 2005", "in 1999", "2010"])
+def test_plausible_years_stay_years(text: str) -> None:
+    found = parse_absolute(text)
+    assert found is not None and found[0][0].month == 1 and found[0][1].month == 12
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "March 3, 2024 between 2 and 3 pm",
+        "between 9 am and 5 pm on March 3, 2024",
+        "from 9:00 to 11:30 on March 3, 2024",
+    ],
+)
+def test_time_ranges_within_a_day(text: str) -> None:
+    assert parse_absolute(text, None) == ((date(2024, 3, 3), date(2024, 3, 3)), EXACT)

@@ -1,9 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Error {{ code }}{% endblock %}
+{% block page_class %} tiny{% endblock %}
 {% block content %}
-<section class="card narrow">
-  <h1>{% if code == 404 %}Not found{% elif code == 422 %}That didn’t work{% elif code == 403 %}Not allowed{% else %}Something went wrong{% endif %}</h1>
+<section class="card">
+  <span class="eyebrow">Error {{ code }}</span>
+  <div class="titlebar" style="margin-bottom: 10px"><h1>{% if code == 404 %}Not found{% elif code == 422 %}That didn’t work{% elif code == 403 %}Not allowed{% else %}Something went wrong{% endif %}</h1></div>
   <p>{{ detail }}</p>
-  <p><a href="/cases/{{ quote(case_id) }}/facts">Back to the timeline</a></p>
+  <p style="margin-top: 14px"><a class="btn" href="/cases/{{ quote(case_id) }}/facts">Back to the timeline</a></p>
 </section>
 {% endblock %}

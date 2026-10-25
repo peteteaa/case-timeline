@@ -1,45 +1,51 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m with context %}
 {% block title %}Contradictions{% endblock %}
+{% block page_class %} narrow{% endblock %}
 {% block content %}
-<section class="page-head">
-  <h1>Contradictions <span class="muted">({{ items | selectattr('c.status', 'equalto', 'open') | list | length }} open)</span></h1>
-</section>
-<p class="muted">The system flags places where sources disagree about a date, the people involved, or what happened. Open items are only <em>possible</em> conflicts. <strong>Confirming</strong> one marks every linked fact as <em>disputed</em>; dismissing it removes the conflict badge. Confirming does not accept linked drafts; review them separately.</p>
+{% set open_n = items | selectattr('c.status', 'equalto', 'open') | list | length %}
+<div class="titlebar">
+  <div>
+    <span class="eyebrow">{{ case_id }}</span>
+    <h1>Contradictions<span class="n">{{ open_n }} open</span></h1>
+  </div>
+</div>
+<p class="lede">Places where sources disagree about a date, the people involved, or what happened. Open items are only <em>possible</em> conflicts. <strong>Confirming</strong> one marks every linked fact as disputed; dismissing it removes the conflict mark. Confirming doesn’t accept linked AI drafts.</p>
+
 {% for item in items %}
 {% set c = item.c %}
-<article class="card contradiction status-{{ c.status }}" id="{{ c.contradiction_id }}">
-  <div class="c-head">
-    <div>
+<article class="card cx status-{{ c.status }}" id="{{ c.contradiction_id }}">
+  <div class="cx-head">
+    <div class="l">
       <span class="state state-{{ c.status }}">{{ c.status }}</span>
-      <strong>{{ FIELD_LABELS[c.field] }}</strong> <span class="muted small">{{ c.contradiction_id }}</span>
+      <strong>{{ FIELD_LABELS[c.field] }}</strong>
+      <span class="fid">{{ c.contradiction_id }}</span>
     </div>
     <form method="post" action="/contradictions/{{ quote(c.contradiction_id) }}" class="inline">
       <input type="hidden" name="next" value="{{ here }}#{{ c.contradiction_id }}">
       {% if c.status == 'open' %}
-      <button class="btn small danger" name="action" value="confirm" title="Mark the linked facts disputed">Confirm dispute</button>
+      <button class="btn small danger" name="action" value="confirm" title="Mark the linked facts disputed">{{ m.icon('flag') }}Confirm dispute</button>
       <button class="btn small" name="action" value="dismiss">Dismiss</button>
       {% else %}
       <button class="btn small" name="action" value="reopen">Reopen</button>
       {% endif %}
     </form>
   </div>
-  <p>{{ c.explanation }}</p>
-  <div class="pair">
+  <p class="cx-why">{{ c.explanation }}</p>
+  <div class="cx-pair">
     {% for x in item.facts %}
-    <div class="side">
-      <h3><a href="{{ fact_url(x.fact_id) }}">{{ x.title }}</a> <span class="muted small">{{ x.fact_id }}</span></h3>
-      <p class="small">{% if x.date_start %}{{ fact_date(x) }}{% else %}Undated{% endif %}{% if x.date_text %} <span class="muted">“{{ x.date_text }}”</span>{% endif %}
-        · <span class="state state-{{ x.review }}">{{ x.review }}</span></p>
-      {{ m.badges(x, [], [], show_review=False) }}
-      <ul class="plain evidence-list">
-        {% for ev in x.evidence %}{{ m.evidence_item(ev, doc_map, here, controls=False) }}{% endfor %}
-      </ul>
+    <div class="cx-side">
+      <h3><a href="{{ fact_url(x.fact_id) }}">{{ x.title }}</a></h3>
+      <p class="meta"><strong {% if x.date_start %}title="{{ fact_date(x) }}"{% endif %}>{{ nice_date(x) or 'Undated' }}</strong>{% if x.date_text %} <span>“{{ x.date_text }}”</span>{% endif %}
+        <span class="fid">· {{ x.fact_id }}</span>
+        {% for s in x.statuses %}{{ m.status_pill(s) }}{% endfor %}
+        {% if x.review == 'draft' %}<span class="mk ai">AI draft</span>{% elif x.review == 'rejected' %}<span class="mk rejected">Rejected</span>{% endif %}</p>
+      {% if x.evidence %}<ul class="d-ev">{% for ev in x.evidence %}{{ m.evidence_item(ev, doc_map, here, controls=False) }}{% endfor %}</ul>{% endif %}
     </div>
     {% endfor %}
   </div>
 </article>
 {% else %}
-<section class="card"><p class="muted">No contradictions detected.</p></section>
+<div class="sheet"><div class="empty"><strong>No contradictions detected</strong>When sources disagree, the conflict shows up here for review.</div></div>
 {% endfor %}
 {% endblock %}

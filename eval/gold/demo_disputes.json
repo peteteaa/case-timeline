@@ -1,7 +1,6 @@
 [
   {
     "id": "C1",
-    "label": "disputed",
     "field": "date",
     "event_key": "office_meeting",
     "planted": true,
@@ -16,6 +15,10 @@
         "quote": "on March 12, 2024, during a meeting in Mr. Ellison's"
       },
       {
+        "doc": "email_thread.eml",
+        "quote": "On March 12, 2024 he called me into his office"
+      },
+      {
         "doc": "deposition_excerpt_ellison.txt",
         "quote": "A. March 12, 2024. In the afternoon, I believe."
       },
@@ -23,11 +26,11 @@
         "doc": "hr_memo.md",
         "quote": "On March 12, 2024, I attended a meeting"
       }
-    ]
+    ],
+    "label": "disputed"
   },
   {
     "id": "C2",
-    "label": "disputed",
     "field": "actor",
     "event_key": "office_meeting",
     "planted": true,
@@ -49,11 +52,11 @@
         "doc": "hr_memo.md",
         "quote": "I attended a meeting between Mark Ellison and Dana Rivera"
       }
-    ]
+    ],
+    "label": "disputed"
   },
   {
     "id": "C3",
-    "label": "disputed",
     "field": "fact",
     "event_key": "ellison_learns_brakes",
     "planted": true,
@@ -71,14 +74,15 @@
         "doc": "witness_statement_becker.docx",
         "quote": "she had reported it to Mark Ellison"
       }
-    ]
+    ],
+    "label": "disputed"
   },
   {
     "id": "C4",
-    "label": "disputed",
     "field": "date",
     "event_key": "unpaid_leave",
     "planted": false,
+    "derived": true,
     "explanation": "Becker's 'two days after the meeting' resolves to March 13, 2024 using his own meeting date (March 11); the police report, Rivera's email and the HR memo put the unpaid leave on March 14, 2024. A consequence of C1.",
     "sides": [
       {
@@ -90,14 +94,14 @@
         "quote": "placed on unpaid administrative leave on March 14, 2024"
       }
     ],
-    "derived": true
+    "label": "disputed"
   },
   {
     "id": "C5",
-    "label": "disputed",
     "field": "fact",
     "event_key": "office_meeting",
     "planted": false,
+    "derived": true,
     "explanation": "Becker told police on March 15 that he heard raised voices from Ellison's office (implying he was outside), but his statement says he was in the room for the whole meeting.",
     "sides": [
       {
@@ -109,6 +113,33 @@
         "quote": "I was in the room for the whole meeting"
       }
     ],
-    "derived": true
+    "label": "disputed"
+  },
+  {
+    "id": "C6",
+    "field": "fact",
+    "event_key": "office_meeting",
+    "planted": false,
+    "derived": true,
+    "explanation": "What the meeting was about: Rivera (email, and her account to police) and Becker say Ellison told her to stop filing safety reports; Ellison told police, and Nand's memo records, that it concerned attendance, and Ellison denied any threat.",
+    "sides": [
+      {
+        "doc": "email_thread.eml",
+        "quote": "told me to stop filing safety reports"
+      },
+      {
+        "doc": "witness_statement_becker.docx",
+        "quote": "if she kept filing safety reports she would be"
+      },
+      {
+        "doc": "incident_report.pdf",
+        "quote": "the March 12, 2024 meeting concerned Ms. Rivera's attendance"
+      },
+      {
+        "doc": "hr_memo.md",
+        "quote": "regarding attendance concerns"
+      }
+    ],
+    "label": "disputed"
   }
 ]

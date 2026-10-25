@@ -6,6 +6,7 @@ import hashlib
 from datetime import date
 from email.message import EmailMessage
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -366,3 +367,270 @@ def test_doc_date_fixtures(name: str, expected: date) -> None:
 def test_doc_date_none(tmp_path: Path) -> None:
     (tmp_path / "x.txt").write_text("No dates here.\nJust words.")
     assert doc_date(_parse(tmp_path / "x.txt")) is None
+
+
+# --------------------------------------------------------------------------- real-world PDFs
+# Synthetic PDFs built on the fly: layouts seen in real case files (court-reporter
+# transcripts, forms, running headers, scans), with no case-specific content.
+
+
+def _pdf(tmp_path: Path, pages: list[list[tuple[float, float, str]]], name: str = "x.pdf") -> Path:
+    """Write a PDF whose pages hold (x, y, text) snippets; returns its path."""
+    import pymupdf
+
+    pdf = pymupdf.open()
+    for snippets in pages:
+        page = pdf.new_page(width=612, height=792)
+        for x, y, text in snippets:
+            page.insert_text((x, y), text, fontsize=11)
+    path = tmp_path / name
+    pdf.save(path)
+    pdf.close()
+    return path
+
+
+def _image_pdf(tmp_path: Path, n_pages: int, text_pages: dict[int, str] | None = None) -> Path:
+    """Pages that carry only an image (a "scan"); ``text_pages`` adds real text to some."""
+    import pymupdf
+
+    pdf = pymupdf.open()
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 40, 40), 0)
+    pix.clear_with(200)
+    for i in range(n_pages):
+        page = pdf.new_page(width=612, height=792)
+        page.insert_image(pymupdf.Rect(50, 50, 550, 700), pixmap=pix)
+        page.insert_text((300, 760), "(R)", fontsize=8)  # stamp, as on redacted scans
+        for j, line in enumerate((text_pages or {}).get(i, "").split("\n")):
+            if line:
+                page.insert_text((72, 100 + 14 * j), line, fontsize=11)
+    path = tmp_path / "scan.pdf"
+    pdf.save(path)
+    pdf.close()
+    return path
+
+
+def _transcript_page(page_no: int, lines: list[str]) -> list[tuple[float, float, str]]:
+    """Court-reporter layout: margin line numbers, a Q/A column, then the text column."""
+    out: list[tuple[float, float, str]] = [(540, 40, str(page_no))]
+    for i, line in enumerate(lines, start=1):
+        y = 80 + 24 * i
+        out.append((80, y, str(i)))
+        if line[:2] in {"Q.", "A."}:
+            out.append((120, y, line[:2]))
+            out.append((160, y, line[3:]))
+        else:
+            out.append((160, y, line))
+    out.append((200, 740, "Example Court Reporting, Inc."))
+    return out
+
+
+_TRANSCRIPT_BODY = [
+    "Q. Where were you on the morning in question?",
+    "A. I was at the warehouse, near the north loading",
+    "dock, from about eight o'clock.",
+    "Q. Who else was there?",
+    "A. Two drivers and the shift supervisor.",
+    "Q. Did you speak with the supervisor?",
+    "A. Only briefly, before the delivery arrived.",
+    "Q. What did the supervisor say?",
+    "A. That the truck was running late.",
+    "Q. Anything else?",
+]
+
+
+def test_transcript_rows_rejoined_and_line_numbers_kept(tmp_path: Path) -> None:
+    pages = [_transcript_page(n, _TRANSCRIPT_BODY) for n in (5, 6, 7)]
+    parsed = _parse(_pdf(tmp_path, pages))
+    text = parsed.text
+    # Margin numbers, the Q/A column and the text column end up on one line.
+    assert "1 Q. Where were you on the morning in question?" in text
+    assert "2 A. I was at the warehouse, near the north loading\n3 dock, from about" in text
+    assert text.count("Example Court Reporting, Inc.") == 1  # running footer kept once
+    assert not any(ln.strip() in {"5", "6", "7"} for ln in text.split("\n"))  # page numbers
+    # Identical numbered lines at the top of every page are testimony, not a running header.
+    assert text.count("Q. Where were you on the morning in question?") == 3
+    by_ref = {(ln.page, ln.number): text[ln.char_start : ln.char_end] for ln in parsed.lines}
+    assert len(by_ref) == 30
+    assert by_ref[(2, 3)] == "3 dock, from about eight o'clock."
+    assert by_ref[(3, 10)] == "10 Q. Anything else?"
+    for page in parsed.pages:  # offsets still index the cleaned text
+        assert text[page.char_start : page.char_end].strip()
+    assert parsed.pages[-1].char_end == len(text)
+
+
+def test_form_labels_joined_with_values(tmp_path: Path) -> None:
+    parsed = _parse(
+        _pdf(tmp_path, [[(72, 100, "Date of Report:"), (250, 100, "June 3, 2021"), (72, 130, "x")]])
+    )
+    assert "Date of Report: June 3, 2021" in parsed.text
+    assert doc_date(parsed) == date(2021, 6, 3)
+
+
+def test_two_column_prose_not_merged(tmp_path: Path) -> None:
+    import pymupdf
+
+    left = "The left column discusses the first topic in some detail here. " * 6
+    right = "The right column covers an unrelated second subject entirely. " * 6
+    pdf = pymupdf.open()
+    page = pdf.new_page(width=612, height=792)
+    page.insert_textbox(pymupdf.Rect(40, 60, 296, 400), left, fontsize=10)
+    page.insert_textbox(pymupdf.Rect(316, 60, 572, 400), right, fontsize=10)
+    path = tmp_path / "cols.pdf"
+    pdf.save(path)
+    pdf.close()
+    text = _parse(path).text
+    assert "first topic in some detail here." in text.replace("\n", " ")
+    first_right = text.index("The right column")
+    assert "left column" not in text[first_right:]  # columns read one after the other
+
+
+def test_running_header_footer_and_page_numbers(tmp_path: Path) -> None:
+    body = [
+        "Officers arrived at the gate.",
+        "Records were requested from the clinic.",
+        "A neighbour gave a short statement.",
+        "No further action was taken that week.",
+    ]
+    pages = []
+    for n in range(1, 5):
+        pages.append(
+            [
+                (72, 40, "COUNTY OFFICE OF EXAMPLE - CONFIDENTIAL"),
+                (72, 56, f"Report No. 21-{n}004"),
+                (72, 120, body[n - 1]),
+                (72, 740, f"Page {n} of 4"),
+            ]
+        )
+    parsed = _parse(_pdf(tmp_path, pages))
+    text = parsed.text
+    assert text.count("COUNTY OFFICE OF EXAMPLE - CONFIDENTIAL") == 1
+    assert text.startswith("COUNTY OFFICE OF EXAMPLE - CONFIDENTIAL\nReport No. 21-1004\n")
+    assert "Report No. 21-3004" not in text
+    assert "Page 2 of 4" not in text and "Page 1 of 4" not in text
+    assert len(parsed.pages) == 4
+    for n in range(1, 5):
+        page = parsed.pages[n - 1]
+        assert body[n - 1] in text[page.char_start : page.char_end]
+
+
+def test_torn_running_footer_fragments_removed(tmp_path: Path) -> None:
+    pages = []
+    for n in range(1, 9):
+        footer = "Acme Transcription Services, Inc." if n % 2 else "Inc."
+        body = ["Testimony resumed after a short recess.", "The witness was shown a map."]
+        pages.append([(72, 100, body[n % 2]), (72, 120, "x" * n), (200, 740, footer)])
+    text = _parse(_pdf(tmp_path, pages)).text
+    assert text.count("Acme Transcription Services, Inc.") == 1
+    assert "\nInc." not in text
+
+
+def test_short_documents_keep_repeated_lines(tmp_path: Path) -> None:
+    pages = [[(72, 100, "Signed: J. Doe")], [(72, 100, "Signed: J. Doe")]]
+    assert _parse(_pdf(tmp_path, pages)).text.count("Signed: J. Doe") == 2
+
+
+def test_vertical_margin_text_does_not_break_row_merge(tmp_path: Path) -> None:
+    import pymupdf
+
+    pdf = pymupdf.open()
+    page = pdf.new_page(width=612, height=792)
+    page.insert_text((72, 100), "Label:", fontsize=11)
+    page.insert_text((200, 100), "value one", fontsize=11)
+    page.insert_text((590, 600), "MARGIN STAMP 0001", fontsize=8, rotate=90)
+    path = tmp_path / "stamp.pdf"
+    pdf.save(path)
+    pdf.close()
+    text = _parse(path).text
+    assert text.startswith("Label: value one")
+    assert "MARGIN STAMP 0001" in text
+
+
+def test_docling_pages_get_the_same_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CT_DISABLE_DOCLING", raising=False)
+    bodies = ["Arrival noted.", "Second visit.\n\nNotes taken.", "Phone call.", "Exit."]
+    pages = [f"Header Of The Example Firm\n\n{b}\n\n{n}" for n, b in enumerate(bodies, 1)]
+    monkeypatch.setattr(parse_mod, "_parse_pdf_docling", lambda path: list(pages))
+    parsed = _fixture("incident_report.pdf")
+    assert parsed.text.count("Header Of The Example Firm") == 1
+    assert "Exit." in parsed.text and "\n4" not in parsed.text
+    assert len(parsed.pages) == 4 and parsed.lines == []
+
+
+# --------------------------------------------------------------------------- scans and OCR
+
+
+def test_scanned_pdf_without_ocr_raises_clear_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(parse_mod, "ocr_engine", lambda: None)
+    with pytest.raises(parse_mod.NeedsOCRError, match="needs OCR, no text layer: 3 of 3"):
+        _parse(_image_pdf(tmp_path, 3))
+
+
+def test_scanned_pdf_is_ocrd_when_engine_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def fake_ocr(png: bytes, engine: str) -> str:
+        calls.append(engine)
+        assert png.startswith(b"\x89PNG")
+        return f"Statement page {len(calls)}: the meeting happened on May 2, 2022."
+
+    monkeypatch.setattr(parse_mod, "ocr_engine", lambda: "tesseract")
+    monkeypatch.setattr(parse_mod, "_ocr_png", fake_ocr)
+    parsed = _parse(_image_pdf(tmp_path, 2))
+    assert calls == ["tesseract", "tesseract"]
+    assert "Statement page 2: the meeting happened on May 2, 2022." in parsed.text
+    assert len(parsed.pages) == 2
+
+
+def test_ocrd_transcript_keeps_printed_line_numbers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = "\n".join(f"{i} {'Q' if i % 2 else 'A'}. Scanned line {i}." for i in range(1, 9))
+    monkeypatch.setattr(parse_mod, "ocr_engine", lambda: "tesseract")
+    monkeypatch.setattr(parse_mod, "_ocr_png", lambda png, engine: page)
+    parsed = _parse(_image_pdf(tmp_path, 2))
+    refs = {(ln.page, ln.number): parsed.text[ln.char_start : ln.char_end] for ln in parsed.lines}
+    assert refs[(2, 7)] == "7 Q. Scanned line 7."
+    assert len(refs) == 16
+
+
+def test_partly_scanned_pdf_keeps_text_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(parse_mod, "ocr_engine", lambda: None)
+    text_page = "This page has a real text layer with plenty of words in it."
+    parsed = _parse(_image_pdf(tmp_path, 3, {1: text_page}))
+    assert text_page in parsed.text
+    assert "2 of 3 pages have no text layer" in caplog.text
+
+
+def test_tesseract_engine_invocation(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = {}
+
+    def fake_run(cmd: list[str], **kw: object) -> SimpleNamespace:
+        seen["cmd"], seen["input"] = cmd, kw["input"]
+        return SimpleNamespace(stdout=b"OCR text\n")
+
+    monkeypatch.setattr(parse_mod.subprocess, "run", fake_run)
+    assert parse_mod._ocr_png(b"PNG", "tesseract") == "OCR text\n"
+    assert seen["cmd"][:3] == ["tesseract", "stdin", "stdout"] and seen["input"] == b"PNG"
+
+
+def test_ocr_boxes_grouped_into_rows() -> None:
+    items = [
+        (300.0, 101.0, 10.0, "world"),
+        (10.0, 100.0, 10.0, "Hello"),
+        (10.0, 130.0, 10.0, "Next"),
+    ]
+    assert parse_mod._boxes_to_text(items) == "Hello world\nNext"
+
+
+def test_redaction_marks_normalized(tmp_path: Path) -> None:
+    f = tmp_path / "r.txt"
+    f.write_text("Phone: •••••  Address: ■■■ ■■ Main\nBullet • stays\nContents ······ 4")
+    assert _parse(f).text == (
+        "Phone: [REDACTED]  Address: [REDACTED] Main\nBullet • stays\nContents ······ 4"
+    )

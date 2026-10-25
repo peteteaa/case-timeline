@@ -4,17 +4,17 @@
      {% if active %}hx-get="/jobs/{{ quote(job.job_id) }}" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
   <div class="job-head">
     <span class="state state-{{ job.status }}">{{ job.status }}</span>
-    <a class="muted" href="/jobs/{{ quote(job.job_id) }}">Job {{ job.job_id }}</a>
-    <span class="muted small">({{ job.trigger }})</span>
+    <a href="/jobs/{{ quote(job.job_id) }}">Job {{ job.job_id }}</a>
+    <span class="muted small">started from {{ job.trigger }}</span>
   </div>
-  {% if active %}<div class="progress indeterminate" aria-label="processing"><div class="bar"></div></div>{% endif %}
+  {% if active %}<div class="progress" aria-label="processing"><div class="bar"></div></div>{% endif %}
   <dl class="job-stats">
     {% for key, label in COUNT_LABELS.items() %}{% if job.counts.get(key) %}<div><dt>{{ label }}</dt><dd>{{ job.counts[key] }}</dd></div>{% endif %}{% endfor %}
     <div><dt>Queued</dt><dd>{{ fmt_dt(job.queued_at) }}</dd></div>
     {% if job.finished_at %}<div><dt>Finished</dt><dd>{{ fmt_dt(job.finished_at) }}</dd></div>{% endif %}
   </dl>
-  {% if job.error %}<p class="error small">{{ job.error }}</p>{% endif %}
-  {% if job.status == 'done' and job.counts.get('facts_created') %}<p class="small"><a href="/cases/{{ quote(case_id) }}/review">Review the new drafts →</a></p>{% endif %}
+  {% if job.error %}<p class="error small" style="margin-top: 10px">{{ job.error }}</p>{% endif %}
+  {% if job.status == 'done' and job.counts.get('facts_created') %}<p class="small" style="margin-top: 10px"><a href="/cases/{{ quote(case_id) }}/facts?review=draft">Check the new AI drafts →</a></p>{% endif %}
 </div>
 {% else %}
 <div id="job-status" class="job muted">No processing job has run yet.</div>

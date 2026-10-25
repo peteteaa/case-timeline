@@ -1,3 +1,4 @@
+{% import "_macros.html" as m with context -%}
 <!doctype html>
 <html lang="en">
 <head>
@@ -5,6 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="htmx-config" content='{"allowEval": false, "includeIndicatorStyles": false, "selfRequestsOnly": true}'>
   <title>{% block title %}Case Timeline{% endblock %} · {{ case_id }}</title>
+  <link rel="preload" href="/static/vendor/fonts/public-sans-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/static/app.css">
   {% block head %}{% endblock %}
   <script src="/static/vendor/htmx.min.js" defer></script>
@@ -13,41 +15,90 @@
 <body>
   {% set base = '/cases/' ~ quote(case_id) %}
   {% set p = request.url.path %}
-  <header class="topbar">
-    <a class="brand" href="{{ base }}">Case Timeline</a>
-    <span class="case-pill" title="Case">{{ case_id }}</span>
-    <nav aria-label="Main">
-      <a href="{{ base }}" {% if p == base %}aria-current="page"{% endif %}>Today</a>
+  <header class="appbar">
+    <a class="brand" href="{{ base }}/facts">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 2.5v15M8.5 5.5h6M8.5 10h8.5M8.5 14.5h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      <span class="brand-name">Case Timeline</span>
+    </a>
+    <nav class="sections" aria-label="Case sections">
+      <a href="{{ base }}" {% if p == base %}aria-current="page"{% endif %}>Today{% if nav and nav.alerts %} <span class="count warn" title="Undelivered alerts">{{ nav.alerts }}</span>{% endif %}</a>
       <a href="{{ base }}/facts" {% if p == base ~ '/facts' or p.startswith('/facts/') %}aria-current="page"{% endif %}>Timeline</a>
-      <a href="{{ base }}/review" {% if p == base ~ '/review' %}aria-current="page"{% endif %}>Needs review{% if nav and nav.drafts %} <span class="count">{{ nav.drafts }}</span>{% endif %}</a>
       <a href="{{ base }}/documents" {% if p == base ~ '/documents' or p.startswith('/documents/') %}aria-current="page"{% endif %}>Documents</a>
       <a href="{{ base }}/witnesses" {% if p == base ~ '/witnesses' or p.startswith('/witnesses/') %}aria-current="page"{% endif %}>Witnesses</a>
-      <a href="{{ base }}/tags" {% if p == base ~ '/tags' %}aria-current="page"{% endif %}>Tags</a>
-      <a href="{{ base }}/contradictions" {% if p == base ~ '/contradictions' %}aria-current="page"{% endif %}>Contradictions{% if nav and nav.conflicts %} <span class="count danger">{{ nav.conflicts }}</span>{% endif %}</a>
-      <a href="{{ base }}/alerts" {% if p == base ~ '/alerts' %}aria-current="page"{% endif %}>Alerts{% if nav and nav.alerts %} <span class="count warn">{{ nav.alerts }}</span>{% endif %}</a>
-      <a href="{{ base }}/chat" {% if p == base ~ '/chat' %}aria-current="page"{% endif %}>Ask</a>
+      <a href="{{ base }}/contradictions" {% if p == base ~ '/contradictions' %}aria-current="page"{% endif %}>Contradictions{% if nav and nav.conflicts %} <span class="count warn">{{ nav.conflicts }}</span>{% endif %}</a>
     </nav>
-    <span class="user">
-      {% if user %}<span class="muted small">Signed in as</span> <strong>{{ user }}</strong> <a class="small" href="/name?next={{ quote(here) }}">change</a>
+    <div class="appbar-end">
+      <span class="local" title="Everything runs on this machine">{{ m.icon('lock') }}<span class="local-text">Local only</span></span>
+      {% if p != '/name' %}
+      <details class="menu" id="who">
+        <summary class="btn who-summary{% if not user %} needs-name{% endif %}" title="{{ 'Signed in as ' ~ user if user else 'Add your name to make changes' }}">
+          {% if user %}<span class="av me" aria-hidden="true">{{ initials(user) }}</span><span class="who-text">{{ user }}</span>
+          {% else %}<span class="av blank" aria-hidden="true">?</span><span class="who-text">Add your name</span>{% endif %}
+        </summary>
+        <form class="panel right whoform" method="post" action="/name">
+          <label for="who-name">{{ 'Your name on edits and notes' if user else 'To make changes, enter the name your edits and reviews are recorded under' }}</label>
+          <input id="who-name" name="name" maxlength="60" required autocomplete="name" placeholder="Jane Doe" value="{{ user or '' }}">
+          <input type="hidden" name="next" value="{{ here }}">
+          <button class="btn primary">Save name</button>
+        </form>
+      </details>
       {% endif %}
-    </span>
-    <span class="local-badge" title="All processing happens on this machine">Local only</span>
+    </div>
   </header>
-  {% if not user and p != '/name' %}
-  <div class="name-banner" role="note">
-    <form method="post" action="/name" class="inline-form">
-      <label for="banner-name">To make changes, enter the display name your edits and reviews will be recorded under:</label>
-      <input id="banner-name" name="name" maxlength="60" required autocomplete="name" placeholder="e.g. Jane Doe">
-      <input type="hidden" name="next" value="{{ here }}">
-      <button class="btn primary small">Continue</button>
-    </form>
-  </div>
-  {% endif %}
+
   <div id="toast" class="toast" role="alert" hidden></div>
-  <main>
+
+  <main class="page{% block page_class %}{% endblock %}">
     {% block content %}{% endblock %}
   </main>
-  <footer class="foot">Drafts are AI suggestions until a person accepts them. Always check the cited source before relying on a fact. Everything stays on this machine.</footer>
+
+  {% block drawer %}
+  <aside class="drawer" id="drawer" aria-labelledby="drawer-title" aria-hidden="true">
+    <div class="drawer-head">
+      <span class="fid" id="drawer-id"></span>
+      <div class="actions">
+        <a class="btn quiet icon-only" id="drawer-full" href="#" title="Open the full fact page" aria-label="Open the full fact page">{{ m.icon('expand') }}</a>
+        <button type="button" class="btn quiet icon-only" data-close-drawer aria-label="Close fact details">{{ m.icon('close') }}</button>
+      </div>
+    </div>
+    <div class="drawer-body" id="drawer-body" tabindex="-1"></div>
+  </aside>
+  {% endblock %}
+
+  {% block ask %}
+  <button type="button" class="ask-fab" id="ask-open" aria-controls="ask" aria-expanded="false">{{ m.icon('chat') }}Ask</button>
+  <section class="ask" id="ask" aria-labelledby="ask-title" aria-hidden="true">
+    <div class="ask-head">
+      <div>
+        <h2 id="ask-title">Ask about the case</h2>
+        <p>Answers cite fact IDs. Nothing leaves this machine.</p>
+      </div>
+      <div class="actions">
+        <button type="button" class="btn quiet small" data-ask-clear title="Clear the conversation">Clear</button>
+        <button type="button" class="btn quiet icon-only" data-ask-close aria-label="Close Ask">{{ m.icon('close') }}</button>
+      </div>
+    </div>
+    <div class="ask-log" id="ask-log" aria-live="polite">
+      <div class="ask-intro" id="ask-intro">
+        <strong>What do you want to know?</strong>
+        The local agent answers from this case’s facts and links every fact it relies on.
+        <div class="ask-examples">
+          <button type="button" data-ask-example>When was the first notice of the problem?</button>
+          <button type="button" data-ask-example>Which facts are disputed, and by whom?</button>
+          <button type="button" data-ask-example>Summarize what happened in the last month before termination.</button>
+        </div>
+      </div>
+    </div>
+    <form method="post" action="{{ base }}/chat" class="ask-form" id="ask-form"
+          hx-post="{{ base }}/chat" hx-target="#ask-log" hx-swap="beforeend" hx-indicator="#ask-thinking" hx-disabled-elt="find button">
+      <label for="ask-q" class="sr-only">Question</label>
+      <textarea id="ask-q" name="question" rows="1" maxlength="4000" required placeholder="Ask a question about the case…"></textarea>
+      <button class="btn primary" aria-label="Send question">{{ m.icon('send') }}</button>
+    </form>
+    <p class="ask-note"><span class="ask-thinking" id="ask-thinking"><span class="dots"><i></i><i></i><i></i></span>Thinking… answers can take a minute.</span></p>
+  </section>
+  {% endblock %}
+
   {% block scripts %}{% endblock %}
 </body>
 </html>

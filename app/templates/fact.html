@@ -1,92 +1,94 @@
 {% extends "base.html" %}
 {% import "_macros.html" as m with context %}
 {% block title %}{{ fact.fact_id }}{% endblock %}
+{% block page_class %} narrow fact-page{% endblock %}
 {% block content %}
 {% set furl = fact_url(fact.fact_id) %}
 {% set base = '/cases/' ~ quote(case_id) %}
-<p class="crumbs"><a href="{{ base }}/facts#{{ fact.fact_id }}">← Timeline</a></p>
-<section class="page-head fact-head">
+<p class="crumbs"><a href="{{ base }}/facts#{{ fact.fact_id }}">{{ m.icon('left') }} Timeline</a></p>
+<div class="titlebar">
   <div>
-    <p class="muted small">{{ fact.fact_id }} · {{ 'AI drafted' if fact.origin == 'ai' else 'Created by a person' }}{% if fact.confidence is not none %} · confidence {{ pct(fact.confidence) }}{% endif %}</p>
+    <span class="eyebrow">{{ fact.fact_id }} · {{ 'AI drafted' if fact.origin == 'ai' else 'Created by ' ~ fact.created_by }}{% if fact.confidence is not none %} · {{ pct(fact.confidence) }} confidence{% endif %}</span>
     <h1>{{ fact.title }}</h1>
-    <p class="fact-date">{% if fact.date_start %}{{ fact_date(fact) }} <span class="muted small">({{ fact.date_certainty }})</span>{% else %}<span class="muted">Undated</span>{% endif %}
-      {% if fact.date_text %}<span class="muted">· as written: “{{ fact.date_text }}”</span>{% endif %}
-      {% if anchor %}<span class="muted">· relative to <a href="{{ fact_url(anchor.fact_id) }}">{{ anchor.fact_id }}</a></span>{% endif %}
+    <p class="d-date">
+      {%- if fact.date_start %}<span title="{{ fact_date(fact) }}">{{ nice_date(fact) }}</span>{% if CERTAINTY_NOTES.get(fact.date_certainty) %}, {{ CERTAINTY_NOTES[fact.date_certainty] | lower }}{% endif %}{% else %}Undated{% endif %}
+      {%- if fact.date_text %}<span class="aw">As written: “{{ fact.date_text }}”{% if anchor %} · relative to <a href="{{ fact_url(anchor.fact_id) }}">{{ anchor.fact_id }}</a>{% endif %}</span>{% endif -%}
     </p>
-    {{ m.badges(fact, [fact.fact_id] if alleged else [], [fact.fact_id] if conflict else []) }}
-  </div>
-  <div class="review-box">
-    {% if fact.review == 'draft' %}
-    <p class="small muted">This is an AI suggestion. Check the quotes below against the source.</p>
-    {{ m.review_controls(fact, furl, with_reason=True) }}
-    {% else %}
-    <span class="state state-{{ fact.review }}">{{ fact.review }}</span>
-    {% if fact.review == 'rejected' %}<p class="small muted">Rejected facts are hidden from every view but kept for evaluation.</p>{% endif %}
+    {% if fact.statuses or fact.review != 'accepted' or alleged or conflict %}
+    <div class="d-pills">{% for s in fact.statuses %}{{ m.status_pill(s) }}{% endfor %}{{ m.marks(fact, alleged, conflict) }}</div>
     {% endif %}
   </div>
-</section>
+</div>
 
-<div class="fact-grid">
-<div class="fact-main">
-  {% if fact.details %}<section class="card"><h2>Details</h2><p class="details">{{ fact.details }}</p></section>{% endif %}
+<div class="split">
+<div class="col">
+  {% if fact.review == 'draft' %}
+  <section class="card d-review" style="margin-top: 0">
+    <p>This is an AI suggestion. Check the quotes below against the source, then accept or reject it. Saving an edit also accepts it.</p>
+    {{ m.review_controls(fact, furl, with_reason=True) }}
+  </section>
+  {% elif fact.review == 'rejected' %}
+  <p class="notice">This draft was rejected. Rejected facts are hidden from every view but kept for evaluation.</p>
+  {% endif %}
+
+  {% if fact.details %}<section class="card"><h2>Details</h2><p class="d-details" style="margin: 0">{{ fact.details }}</p></section>{% endif %}
 
   <section class="card" id="evidence">
-    <h2>Evidence <span class="muted">({{ fact.evidence | length }})</span></h2>
+    <h2>Evidence <span class="n">{{ fact.evidence | length }}</span></h2>
     {% if fact.evidence %}
-    <ul class="plain evidence-list">
-      {% for ev in fact.evidence %}{{ m.evidence_item(ev, doc_map, furl ~ '#evidence') }}{% endfor %}
-    </ul>
+    <ul class="d-ev">{% for ev in fact.evidence %}{{ m.evidence_item(ev, doc_map, furl ~ '#evidence') }}{% endfor %}</ul>
     {% else %}<p class="muted">No evidence linked yet.</p>{% endif %}
-    <details class="add-evidence">
-      <summary>Link evidence</summary>
+    <details class="more" style="margin-top: 14px">
+      <summary>Link more evidence</summary>
       <p class="muted small">To quote a passage, open a document in the source viewer, select the text and choose “Add as evidence”.</p>
       {% if docs %}
-      <form method="post" action="{{ furl }}/evidence" class="inline-form">
+      <form method="post" action="{{ furl }}/evidence" class="inline-form" style="margin-bottom: 10px">
         <input type="hidden" name="kind" value="document">
-        <label>Whole document
+        <label class="grow">Whole document
           <select name="doc_id" required>{% for d in docs %}<option value="{{ d.doc_id }}">{{ d.filename }} ({{ d.kind }})</option>{% endfor %}</select>
         </label>
-        <button class="btn small">Link document</button>
+        <button class="btn">Link document</button>
       </form>
       {% endif %}
       <form method="post" action="{{ furl }}/evidence" class="inline-form">
         <input type="hidden" name="kind" value="external">
-        <label class="grow">External reference <span class="muted small">(URL or citation; stored, never fetched)</span>
+        <label class="grow">External reference (URL or citation; stored, never fetched)
           <input name="reference" required maxlength="2000" placeholder="e.g. Smith Dep. 45:3-12, or https://…">
         </label>
-        <button class="btn small">Add reference</button>
+        <button class="btn">Add reference</button>
       </form>
     </details>
   </section>
 
-  <section class="card" id="notes">
-    <h2>Notes <span class="muted">({{ notes | length }})</span></h2>
-    {% for n in notes %}
-    <div class="note" id="{{ n.note_id }}">
-      <div class="muted small"><strong>{{ n.author }}</strong> · {{ fmt_dt(n.created_at) }}</div>
-      <p>{{ n.body }}</p>
-    </div>
-    {% else %}<p class="muted">No notes yet.</p>{% endfor %}
-    <form method="post" action="{{ furl }}/notes" class="stack">
-      <label for="note-body" class="sr-only">New note</label>
-      <textarea id="note-body" name="body" rows="3" required placeholder="Add a note…"></textarea>
-      <div><button class="btn small primary">Add note</button></div>
-    </form>
-  </section>
-
   {% if contradictions %}
   <section class="card" id="contradictions">
-    <h2>Contradictions</h2>
-    {% for item in contradictions %}
-    <div class="conflict-item status-{{ item.c.status }}">
-      <span class="state state-{{ item.c.status }}">{{ item.c.status }}</span>
-      <strong>{{ FIELD_LABELS[item.c.field] }}</strong>: {{ item.c.explanation }}
-      <div class="small">Conflicts with: {% for o in item.others %}<a href="{{ fact_url(o.fact_id) }}">{{ o.fact_id }} {{ o.title }}</a>{% if not loop.last %}; {% endif %}{% endfor %}
-        · <a href="{{ base }}/contradictions#{{ item.c.contradiction_id }}">review</a></div>
-    </div>
-    {% endfor %}
+    <h2>Conflicts</h2>
+    <ul class="d-conf">
+      {% for item in contradictions %}
+      <li class="conf status-{{ item.c.status }}">
+        <div class="conf-head"><span class="state state-{{ item.c.status }}">{{ item.c.status }}</span><strong>{{ FIELD_LABELS[item.c.field] }}</strong>
+          <a class="small" style="margin-left: auto" href="{{ base }}/contradictions#{{ item.c.contradiction_id }}">Review</a></div>
+        <span>{{ item.c.explanation }}</span>
+        <div class="conf-others">{% for o in item.others %}<a href="{{ fact_url(o.fact_id) }}"><span class="fid">{{ o.fact_id }}</span> · {{ o.title }}</a>{% endfor %}</div>
+      </li>
+      {% endfor %}
+    </ul>
   </section>
   {% endif %}
+
+  <section class="card" id="notes">
+    <h2>Notes <span class="n">{{ notes | length }}</span></h2>
+    {% if notes %}
+    <div class="notes">
+      {% for n in notes %}<div class="note" id="{{ n.note_id }}"><div class="note-head"><strong>{{ n.author }}</strong> · {{ fmt_dt(n.created_at) }}</div><p>{{ n.body }}</p></div>{% endfor %}
+    </div>
+    {% endif %}
+    <form method="post" action="{{ furl }}/notes" class="form">
+      <label for="note-body" class="sr-only">New note</label>
+      <textarea id="note-body" name="body" rows="3" required placeholder="Add a note for the case team…"></textarea>
+      <div class="form-actions"><button class="btn primary small">Add note</button></div>
+    </form>
+  </section>
 
   <section class="card" id="history">
     <h2>History</h2>
@@ -103,13 +105,12 @@
   </section>
 </div>
 
-<aside class="fact-side">
+<aside class="col">
   <section class="card" id="edit">
-    <h2>Edit</h2>
-    {% if fact.review == 'draft' %}<p class="small notice">Saving changes accepts this draft.</p>{% endif %}
-    <form method="post" action="{{ furl }}" class="stack">
+    <h2>Edit fact</h2>
+    {% if fact.review == 'draft' %}<p class="notice small">Saving changes accepts this draft.</p>{% endif %}
+    <form method="post" action="{{ furl }}" class="form" style="margin-top: 10px">
       <input type="hidden" name="has" value="statuses">
-      <input type="hidden" name="has" value="tag_ids">
       <input type="hidden" name="has" value="witness_ids">
       <label>Title<input name="title" required maxlength="500" value="{{ fact.title }}"></label>
       <label>Details<textarea name="details" rows="4">{{ fact.details or '' }}</textarea></label>
@@ -119,32 +120,22 @@
         <label>End<input type="date" name="date_end" value="{{ fmt_date(fact.date_end) }}"></label>
       </div>
       <label>Date certainty
-        <select name="date_certainty">{% for c in CERTAINTIES %}<option value="{{ c }}" {% if fact.date_certainty == c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select>
+        <select name="date_certainty">{% for c in CERTAINTIES %}<option value="{{ c }}" {% if fact.date_certainty == c %}selected{% endif %}>{{ c | capitalize }}</option>{% endfor %}</select>
       </label>
       <fieldset>
-        <legend>Statuses</legend>
+        <legend>Status</legend>
         {% for s in STATUSES %}<label class="check"><input type="checkbox" name="statuses" value="{{ s }}" {% if s in fact.statuses %}checked{% endif %}> {{ STATUS_LABELS[s] }}</label>{% endfor %}
       </fieldset>
-      <fieldset>
-        <legend>Issue tags</legend>
-        {% if tags %}<select name="tag_ids" multiple size="{{ [tags | length, 6] | min }}">
-          {% for t in tags %}<option value="{{ t.tag_id }}" {% if t.tag_id in fact.tag_ids %}selected{% endif %}>{{ t.name }}</option>{% endfor %}
-        </select>{% endif %}
-        <label class="small">New tag<input name="new_tag" maxlength="80" placeholder="Create and apply a tag"></label>
-      </fieldset>
-      <fieldset>
-        <legend>Witnesses</legend>
+      <label>Witnesses
         {% if witness_choices %}<select name="witness_ids" multiple size="{{ [witness_choices | length, 6] | min }}">
           {% for w in witness_choices %}<option value="{{ w.witness_id }}" {% if w.witness_id in fact.witness_ids %}selected{% endif %}>{{ w.name }}{% if not w.confirmed %} (suggested){% endif %}</option>{% endfor %}
-        </select>{% else %}<p class="muted small">No witnesses yet. <a href="{{ base }}/witnesses">Add one</a>.</p>{% endif %}
-      </fieldset>
-      <div><button class="btn primary">Save changes</button></div>
+        </select>{% else %}<span class="help">No witnesses yet. <a href="{{ base }}/witnesses">Add one</a>.</span>{% endif %}
+      </label>
+      <div class="form-actions"><button class="btn primary">Save changes</button></div>
     </form>
   </section>
-  <section class="card small muted">
-    <p>Created by {{ fact.created_by }} · {{ fmt_dt(fact.created_at) }}<br>
-       Last changed by {{ fact.updated_by }} · {{ fmt_dt(fact.updated_at) }}</p>
-  </section>
+  <p class="muted small" style="margin: 0 4px">Created by {{ fact.created_by }} · {{ fmt_dt(fact.created_at) }}<br>
+     Last changed by {{ fact.updated_by }} · {{ fmt_dt(fact.updated_at) }}</p>
 </aside>
 </div>
 {% endblock %}

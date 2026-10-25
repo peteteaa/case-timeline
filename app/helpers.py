@@ -50,6 +50,8 @@ ALERT_LABELS = {
 }
 FIELD_LABELS = {"date": "Date", "actor": "People involved", "fact": "What happened"}
 
+# Computed fact flags the list view can filter on (not stored on the fact itself).
+FLAGS = ("conflict", "alleged")
 _FACT_ID_RE = re.compile(r"\bF-\d{4,}\b")
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -200,7 +202,7 @@ def parse_filters(params: ParamGetter) -> tuple[dict[str, Any], list[str]]:
     """Normalized list-view filters from query params, plus friendly errors for bad values.
 
     Returns a dict with: date_from, date_to (date | None), status, tag, witness, doc, kind,
-    review (lists), origin, q, sort, dir, view.
+    review, flag (lists), origin, q, sort, dir, view.
     """
     errors: list[str] = []
     f: dict[str, Any] = {
@@ -212,6 +214,7 @@ def parse_filters(params: ParamGetter) -> tuple[dict[str, Any], list[str]]:
         "doc": params.getlist("doc"),
         "kind": [k for k in params.getlist("kind") if k in DOC_KINDS],
         "review": [r for r in params.getlist("review") if r in REVIEWS] or ["draft", "accepted"],
+        "flag": [x for x in params.getlist("flag") if x in FLAGS],
         "origin": params.get("origin") if params.get("origin") in ("ai", "user") else "",
         "q": (params.get("q") or "").strip()[:500],
         "sort": params.get("sort") if params.get("sort") in SORT_KEYS else "date",
@@ -245,7 +248,7 @@ def filter_pairs(f: Mapping[str, Any], *, skip: Iterable[str] = ()) -> list[tupl
     for key in ("date_from", "date_to"):
         if f.get(key) and key not in skip:
             pairs.append((key, f[key].isoformat()))
-    for key in ("status", "tag", "witness", "doc", "kind"):
+    for key in ("status", "tag", "witness", "doc", "kind", "flag"):
         if key not in skip:
             pairs += [(key, v) for v in f.get(key) or []]
     if "review" not in skip and list(f.get("review") or []) != ["draft", "accepted"]:
@@ -265,6 +268,13 @@ def filter_pairs(f: Mapping[str, Any], *, skip: Iterable[str] = ()) -> list[tupl
 def query_string(pairs: Sequence[tuple[str, str]], **extra: str) -> str:
     items = list(pairs) + [(k, v) for k, v in extra.items() if v is not None]
     return urlencode(items)
+
+
+def toggle_query(f: Mapping[str, Any], key: str, value: str) -> str:
+    """The query string for these filters with ``value`` toggled in the list filter ``key``."""
+    current = list(f.get(key) or [])
+    values = [v for v in current if v != value] if value in current else [*current, value]
+    return query_string(filter_pairs({**f, key: values}))
 
 
 def filters_active(f: Mapping[str, Any]) -> bool:
@@ -346,6 +356,110 @@ def fmt_dt(value: datetime | None) -> str:
 
 def pct(value: float | None) -> str:
     return "" if value is None else f"{round(value * 100)}%"
+
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _md(d: date) -> str:
+    return f"{_MONTHS[d.month - 1]} {d.day}"
+
+
+def _month_end(d: date) -> date:
+    nxt = date(d.year + (d.month == 12), d.month % 12 + 1, 1)
+    return date.fromordinal(nxt.toordinal() - 1)
+
+
+def nice_date(f: Fact) -> str:
+    """'Mar 4, 2024', 'Mar 11–20, 2024', 'Sep 2023' (a whole month), '2024', or ''."""
+    a, b = f.date_start, f.date_end
+    if a is None:
+        return ""
+    if b is None or b <= a:
+        return f"{_md(a)}, {a.year}"
+    if a.day == 1 and b == _month_end(b):
+        if (a.month, b.month) == (1, 12) and a.year == b.year:
+            return str(a.year)
+        if (a.year, a.month) == (b.year, b.month):
+            return f"{_MONTHS[a.month - 1]} {a.year}"
+        if a.year == b.year:
+            return f"{_MONTHS[a.month - 1]}–{_MONTHS[b.month - 1]} {a.year}"
+    if (a.year, a.month) == (b.year, b.month):
+        return f"{_md(a)}–{b.day}, {a.year}"
+    if a.year == b.year:
+        return f"{_md(a)} – {_md(b)}, {a.year}"
+    return f"{_md(a)}, {a.year} – {_md(b)}, {b.year}"
+
+
+CERTAINTY_NOTES = {"approximate": "Approximate", "relative": "Relative date"}
+
+
+def fact_groups(facts: Sequence[Fact], by_year: bool) -> list[dict[str, Any]]:
+    """Consecutive facts grouped by year (or one unlabeled group), undated facts last.
+
+    Each group is ``{"key", "label", "facts", "months"}``; ``months`` maps a fact id to the
+    month heading shown above it (only in busy years, where month rows help scanning).
+    """
+    groups: list[dict[str, Any]] = []
+    ordered = [f for f in facts if f.date_start is not None]
+    ordered += [f for f in facts if f.date_start is None]
+    for f in ordered:
+        if f.date_start is None:
+            key, label = "undated", "Undated"
+        elif by_year:
+            key = label = str(f.date_start.year)
+        else:
+            key, label = "dated", ""
+        if not groups or groups[-1]["key"] != key:
+            groups.append({"key": key, "label": label, "facts": [], "months": {}})
+        groups[-1]["facts"].append(f)
+    for g in groups:
+        if by_year and g["key"] != "undated" and len(g["facts"]) > 4:
+            last = None
+            for f in g["facts"]:
+                month = f"{MONTH_NAMES[f.date_start.month - 1]} {f.date_start.year}"
+                if month != last:
+                    g["months"][f.fact_id] = month
+                    last = month
+    return groups
+
+
+MONTH_NAMES = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)  # fmt: skip
+
+# Avatar colors: dark enough for white initials in both themes.
+_AVATAR_HUES = (
+    "#0E7490",
+    "#9F1239",
+    "#4D7C0F",
+    "#6D28D9",
+    "#B45309",
+    "#1D4ED8",
+    "#BE185D",
+    "#0F766E",
+)
+
+
+def avatar_color(key: str) -> str:
+    return _AVATAR_HUES[sum(map(ord, key or "")) % len(_AVATAR_HUES)]
+
+
+def initials(name: str) -> str:
+    words = [w for w in re.split(r"[\s.]+", name or "") if w and w[0].isalnum()]
+    if not words:
+        return "?"
+    picked = [words[0], words[-1]] if len(words) > 1 else words[:1]
+    return "".join(w[0] for w in picked).upper()
+
+
+def short_name(name: str) -> str:
+    """'Dana Rivera' -> 'D. Rivera'; single names are kept."""
+    words = (name or "").split()
+    if len(words) < 2:
+        return name or ""
+    return f"{words[0][0]}. {words[-1]}"
 
 
 def evidence_cite(ev: EvidenceLink) -> str:

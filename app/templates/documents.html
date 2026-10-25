@@ -1,60 +1,68 @@
 {% extends "base.html" %}
+{% import "_macros.html" as m with context %}
 {% block title %}Documents{% endblock %}
 {% block content %}
 {% set base = '/cases/' ~ quote(case_id) %}
-<section class="page-head">
-  <h1>Documents <span class="muted">({{ rows | length }})</span></h1>
-  <form method="post" action="{{ base }}/process" hx-post="{{ base }}/process" hx-target="#job-status" hx-swap="outerHTML">
-    <button class="btn primary" hx-disabled-elt="this">Process now</button>
-  </form>
-</section>
-
-<div class="doc-top">
-<section class="card">
-  <h2>Upload</h2>
-  <p class="muted small">Files are saved to this case’s inbox on this machine (the evidence folder is never written) and the next processing job drafts facts from them. PDF, DOCX, TXT, MD or EML, up to 200 MB each.</p>
-  <form method="post" action="{{ base }}/documents" enctype="multipart/form-data" class="upload-form">
-    <input type="file" name="files" multiple required accept=".pdf,.docx,.txt,.md,.eml">
-    <button class="btn primary">Upload</button>
-  </form>
-  {% if results %}
-  <ul class="plain upload-results">
-    {% for r in results %}
-    <li>{% if r.ok %}<span class="ok">Saved</span> {{ r.name }}{% if r.saved_as != r.name %} as {{ r.saved_as }}{% endif %} ({{ r.size }} bytes){% else %}<span class="error">Not saved</span> {{ r.name }}: {{ r.msg }}{% endif %}</li>
-    {% endfor %}
-  </ul>
-  {% endif %}
-</section>
-<section class="card">
-  <h2>Processing</h2>
-  {% include "_job.html" %}
-</section>
+<div class="titlebar">
+  <div>
+    <span class="eyebrow">{{ case_id }}</span>
+    <h1>Documents<span class="n">{{ rows | length }} file{{ '' if rows | length == 1 else 's' }}</span></h1>
+  </div>
+  <div class="actions">{{ m.job_button(base) }}</div>
 </div>
 
-<section class="card">
+<div class="split" style="margin-bottom: 16px">
+  <section class="card">
+    <h2>Upload</h2>
+    <form method="post" action="{{ base }}/documents" enctype="multipart/form-data" class="dropzone" data-dropzone>
+      <span>{{ m.icon('upload') }} <strong>Drop files here</strong> <span class="muted">or choose them</span></span>
+      <input type="file" name="files" multiple required accept=".pdf,.docx,.txt,.md,.eml" aria-label="Files to upload">
+      <span class="muted small">PDF, DOCX, TXT, MD or EML, up to 200 MB each. Files go to this case’s inbox on this machine (the evidence folder is never written), and the next processing job drafts facts from them.</span>
+      <button class="btn primary">Upload</button>
+    </form>
+    {% if results %}
+    <ul class="plain upload-results">
+      {% for r in results %}
+      <li>{% if r.ok %}<span class="ok-text">Saved</span> {{ r.name }}{% if r.saved_as != r.name %} as {{ r.saved_as }}{% endif %} <span class="muted">({{ r.size }} bytes)</span>{% else %}<span class="error"><strong>Not saved</strong></span> {{ r.name }}: {{ r.msg }}{% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+  <section class="card">
+    <h2>Processing</h2>
+    {% include "_job.html" %}
+  </section>
+</div>
+
+<div class="sheet">
   {% if rows %}
   <div class="table-wrap">
-  <table class="facts docs">
-    <thead><tr><th>Document</th><th>Kind</th><th>Location</th><th>Status</th><th class="num">Pages</th><th class="num">Facts</th><th class="num">Drafts</th><th>Added</th></tr></thead>
+  <table class="data docs">
+    <thead><tr><th>Document</th><th>Kind</th><th>Status</th><th class="num">Pages</th><th class="num">Facts</th><th class="num">AI drafts</th><th>Added</th></tr></thead>
     <tbody>
     {% for r in rows %}{% set d = r.doc %}
       <tr id="{{ d.doc_id }}">
-        <td><a href="{{ doc_view_url(d.doc_id) }}">{{ d.filename }}</a> <span class="muted small">{{ d.doc_id }}</span>
-          {% if r.info.parse_error %}<div class="error small">{{ r.info.parse_error }}</div>{% endif %}</td>
-        <td>{{ d.kind }}{% if r.info.kind_set_by %} <span class="muted small" title="Corrected by {{ r.info.kind_set_by }}">✎</span>{% endif %}</td>
-        <td>{{ d.location }}</td>
+        <td>
+          <div class="cell-main">
+            <span class="doc-ic">{{ m.kind_icon(d.kind) }}</span>
+            <span><a class="t" href="{{ doc_view_url(d.doc_id) }}">{{ d.filename }}</a>
+              <span class="s">{{ d.doc_id }} · {{ d.location }}</span></span>
+          </div>
+          {% if r.info.parse_error %}<p class="error small" style="margin: 8px 0 0">{{ r.info.parse_error }}</p>{% endif %}
+        </td>
+        <td><span class="kind">{{ d.kind }}</span>{% if r.info.kind_set_by %} <span class="muted small" title="Corrected by {{ r.info.kind_set_by }}">(set by {{ r.info.kind_set_by }})</span>{% endif %}</td>
         <td><span class="state state-{{ d.parse_status }}">{{ d.parse_status }}</span></td>
         <td class="num">{{ d.pages if d.pages is not none else '—' }}</td>
-        <td class="num">{% if r.facts %}<a href="{{ base }}/facts?doc={{ quote(d.doc_id) }}">{{ r.facts }}</a>{% else %}0{% endif %}</td>
-        <td class="num">{% if r.drafts %}<a href="{{ base }}/review?doc={{ quote(d.doc_id) }}">{{ r.drafts }}</a>{% else %}0{% endif %}</td>
-        <td class="nowrap small">{{ fmt_dt(d.added_at) }}</td>
+        <td class="num">{% if r.facts %}<a href="{{ base }}/facts?doc={{ quote(d.doc_id) }}">{{ r.facts }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+        <td class="num">{% if r.drafts %}<a href="{{ base }}/facts?doc={{ quote(d.doc_id) }}&amp;review=draft">{{ r.drafts }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+        <td class="nowrap small muted">{{ fmt_dt(d.added_at) }}</td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
   </div>
   {% else %}
-  <p class="muted">No documents yet. Upload files above, or copy them into the evidence folder and press “Process now”.</p>
+  <div class="empty"><strong>No documents yet</strong>Upload files above, or copy them into the evidence folder and press “Process now”.</div>
   {% endif %}
-</section>
+</div>
 {% endblock %}

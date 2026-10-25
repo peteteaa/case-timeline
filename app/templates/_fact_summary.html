@@ -1,16 +1,76 @@
 {% import "_macros.html" as m with context %}
-<div class="fact-summary">
-  <p class="muted small">{{ fact.fact_id }} · {{ 'AI draft' if fact.origin == 'ai' else 'Created by ' ~ fact.created_by }}</p>
-  <h2><a href="{{ fact_url(fact.fact_id) }}">{{ fact.title }}</a></h2>
-  <p>{% if fact.date_start %}{{ fact_date(fact) }}{% else %}<span class="muted">Undated</span>{% endif %}{% if fact.date_text %} <span class="muted">“{{ fact.date_text }}”</span>{% endif %}</p>
-  {{ m.badges(fact, [fact.fact_id] if alleged else [], [fact.fact_id] if conflict else []) }}
-  {% if fact.details %}<p class="details">{{ fact.details }}</p>{% endif %}
-  {% if fact.tag_ids %}<div class="chips">{% for tid in fact.tag_ids %}{% if tag_map.get(tid) %}{{ m.tag_chip(tag_map[tid]) }}{% endif %}{% endfor %}</div>{% endif %}
-  {% if fact.witness_ids %}<p class="small">People: {% for wid in fact.witness_ids %}{% if witness_map.get(wid) %}<a href="/witnesses/{{ quote(wid) }}">{{ witness_map[wid].name }}</a>{% if not loop.last %}, {% endif %}{% endif %}{% endfor %}</p>{% endif %}
-  <h3>Evidence ({{ fact.evidence | length }})</h3>
-  <ul class="plain evidence-list">
-    {% for ev in fact.evidence[:4] %}{{ m.evidence_item(ev, doc_map, fact_url(fact.fact_id), controls=False) }}{% endfor %}
-  </ul>
-  {% if notes %}<p class="muted small">{{ notes | length }} note{{ '' if notes | length == 1 else 's' }}</p>{% endif %}
-  <p>{{ m.review_controls(fact, fact_url(fact.fact_id)) }} <a class="btn small" href="{{ fact_url(fact.fact_id) }}">Open fact card</a></p>
+{% set furl = fact_url(fact.fact_id) %}
+{% set base = '/cases/' ~ quote(case_id) %}
+<div class="drawer-fact" data-fact-id="{{ fact.fact_id }}">
+  <h2 class="d-title" id="drawer-title"><a href="{{ furl }}">{{ fact.title }}</a></h2>
+  <p class="d-date">
+    {%- if fact.date_start %}{{ nice_date(fact) }}{% if CERTAINTY_NOTES.get(fact.date_certainty) %}, {{ CERTAINTY_NOTES[fact.date_certainty] | lower }}{% endif %}{% else %}Undated{% endif %}
+    {%- if fact.date_text %}<span class="aw">As written: “{{ fact.date_text }}”</span>{% endif -%}
+  </p>
+  {% if fact.statuses or fact.review != 'accepted' or alleged or conflict %}
+  <div class="d-pills">
+    {% for s in fact.statuses %}{{ m.status_pill(s) }}{% endfor %}
+    {{ m.marks(fact, alleged, conflict, drawer_link=True) }}
+  </div>
+  {% endif %}
+  {% if fact.details %}<p class="d-details">{{ fact.details }}</p>{% endif %}
+
+  {% if fact.review == 'draft' %}
+  <div class="d-review">
+    <p>The AI suggested this fact{% if fact.confidence is not none %} with {{ pct(fact.confidence) }} confidence{% endif %}. Check the quotes against the source, then accept or reject it.</p>
+    {{ m.review_controls(fact, furl, with_reason=True) }}
+  </div>
+  {% endif %}
+
+  <section class="dsec" aria-labelledby="h-ev">
+    <h3 id="h-ev">Evidence <span class="n">{{ fact.evidence | length }}</span></h3>
+    {% if fact.evidence %}
+    <ul class="d-ev">{% for ev in fact.evidence %}{{ m.evidence_item(ev, doc_map, furl, controls=False) }}{% endfor %}</ul>
+    {% else %}<p class="muted small">No evidence linked yet. <a href="{{ furl }}#evidence">Link evidence</a></p>{% endif %}
+  </section>
+
+  {% if contradictions %}
+  <section class="dsec" id="d-conflicts" aria-labelledby="h-conf">
+    <h3 id="h-conf">Conflicts</h3>
+    <ul class="d-conf">
+      {% for item in contradictions %}
+      <li class="conf status-{{ item.c.status }}">
+        <div class="conf-head"><span class="state state-{{ item.c.status }}">{{ item.c.status }}</span><strong>{{ FIELD_LABELS[item.c.field] }}</strong></div>
+        <span>{{ item.c.explanation }}</span>
+        <div class="conf-others">
+          {% for o in item.others %}<a href="{{ fact_url(o.fact_id) }}" data-open="{{ o.fact_id }}"><span class="fid">{{ nice_date(o) or 'Undated' }}</span> · {{ o.title }}</a>{% endfor %}
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    <p class="muted small" style="margin-top: 8px">{% if 'disputed' in fact.statuses %}The case team marked this fact as disputed.{% else %}Confirm or dismiss on the <a href="{{ base }}/contradictions">Contradictions</a> page.{% endif %}</p>
+  </section>
+  {% endif %}
+
+  {% if fact.witness_ids %}
+  <section class="dsec" aria-labelledby="h-wits">
+    <h3 id="h-wits">Witnesses</h3>
+    <ul class="d-wits">
+      {% for wid in fact.witness_ids if witness_map.get(wid) %}{% set w = witness_map[wid] %}
+      <li>{{ m.avatar(w) }}<a href="/witnesses/{{ quote(wid) }}">{{ w.name }}</a>{% if w.role %}<span class="role">{{ w.role }}</span>{% endif %}{% if not w.confirmed %}<span class="mk ai">suggested</span>{% endif %}</li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+
+  <section class="dsec" aria-labelledby="h-notes">
+    <h3 id="h-notes">Notes <span class="n">{{ notes | length }}</span></h3>
+    {% if notes %}
+    <div class="notes">
+      {% for n in notes[-3:] %}<div class="note"><div class="note-head"><strong>{{ n.author }}</strong> · {{ fmt_dt(n.created_at) }}</div><p>{{ n.body }}</p></div>{% endfor %}
+    </div>
+    {% endif %}
+    <a class="linkbtn" href="{{ furl }}#notes">{{ 'See all notes and add one' if notes else 'Add a note' }}</a>
+  </section>
+
+  <p class="d-prov">
+    {% if fact.origin == 'ai' %}Drafted by the AI from the case documents.{% else %}Added by {{ fact.created_by }}.{% endif %}
+    Last changed by {{ fact.updated_by }} · {{ fmt_dt(fact.updated_at) }}.
+    <a href="{{ furl }}">Edit or see history</a>
+  </p>
 </div>
