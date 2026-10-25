@@ -6,12 +6,14 @@
 #   scripts/openclaw_cron.sh            # create/update the two automations
 #   scripts/openclaw_cron.sh --dry-run  # print the commands only
 #
-# Env overrides: OPENCLAW, CT_CASE_ID (default demo), CT_TZ (IANA tz),
-# CT_ALERT_CHANNEL (default "last"), CT_ALERT_TO (channel destination, optional).
+# Env overrides: OPENCLAW, CT_CASE_ID (default ntsb), CT_TZ (IANA tz),
+# CT_OPENCLAW_AGENT (default case-timeline: the shell-less agent),
+# CT_ALERT_CHANNEL (unset = no delivery; alerts stay on the dashboard), CT_ALERT_TO (optional).
 set -euo pipefail
 
 OPENCLAW="${OPENCLAW:-$HOME/.openclaw/bin/openclaw}"
-CASE_ID="${CT_CASE_ID:-demo}"
+CASE_ID="${CT_CASE_ID:-ntsb}"
+AGENT="${CT_OPENCLAW_AGENT:-case-timeline}"
 DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
 
@@ -25,8 +27,12 @@ run() {
 
 [[ -x "$OPENCLAW" ]] || { echo "openclaw CLI not found at $OPENCLAW" >&2; exit 1; }
 
-DELIVERY=(--announce --channel "${CT_ALERT_CHANNEL:-last}")
-[[ -n "${CT_ALERT_TO:-}" ]] && DELIVERY+=(--to "$CT_ALERT_TO")
+if [[ -n "${CT_ALERT_CHANNEL:-}" ]]; then
+  DELIVERY=(--announce --best-effort-deliver --channel "$CT_ALERT_CHANNEL")
+  [[ -n "${CT_ALERT_TO:-}" ]] && DELIVERY+=(--to "$CT_ALERT_TO")
+else
+  DELIVERY=(--no-deliver)
+fi
 TZ_ARGS=()
 [[ -n "${CT_TZ:-}" ]] && TZ_ARGS=(--tz "$CT_TZ")
 
@@ -43,6 +49,7 @@ Include NO case content."
 
 echo "==> Scan every 5 minutes"
 run "$OPENCLAW" cron add \
+  --agent "$AGENT" \
   --name "case-timeline scan ($CASE_ID)" \
   --declaration-key "case-timeline:scan:$CASE_ID" \
   --description "Scan the case evidence folder and alert on new contradictions/deadlines" \
@@ -55,6 +62,7 @@ run "$OPENCLAW" cron add \
 
 echo "==> Daily digest at 08:00"
 run "$OPENCLAW" cron add \
+  --agent "$AGENT" \
   --name "case-timeline digest ($CASE_ID)" \
   --declaration-key "case-timeline:digest:$CASE_ID" \
   --description "Counts-only daily digest for the case" \
