@@ -1,0 +1,316 @@
+[
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Jack Roush"
+    ],
+    "description": "N6JR departed Willow Run Airport (YIP), Ypsilanti, Michigan, bound for Oshkosh.",
+    "doc": "ATC Group Chairman - Factual Report-Master.PDF",
+    "date_text": "1729",
+    "quote": "near Ypsilanti, Michigan, at 1729 with KOSH as the intended",
+    "provenance": "final report: History of Flight"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Jack Roush"
+    ],
+    "description": "Pilot cancelled the IFR flight plan to Milwaukee en route and continued VFR on the Warbird/Turbine arrival into Oshkosh.",
+    "doc": "Transcript for NTSB Interview of Accident Pilot, Jackie E. Roush (30 August 2010)-Redacted.PDF",
+    "date_text": "that day",
+    "quote": "canceled my IFR flight plan over Lake Michigan",
+    "provenance": "final report: pilot interview paragraph"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Jack Roush",
+      "Oshkosh Tower"
+    ],
+    "description": "Pilot called Oshkosh tower on the Warbird arrival, about 10 miles east of the island; tower told him to report over the island.",
+    "doc": "Cockpit Voice Recorder 12 - Specialist's Factual Report-Master.PDF",
+    "date_text": "1810:33",
+    "quote": "At 1810:33, the pilot called Oshkosh tower advising he was 10 miles east",
+    "provenance": "final report: History of Flight (pilot reported being on the Turbine/Warbird Arrival)"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Jack Roush",
+      "Oshkosh Tower"
+    ],
+    "description": "Tower controller asked which runway the pilot wanted; pilot said 18 or 27 and was told to expect a left base for runway 18.",
+    "doc": "ATC Group Chairman - Factual Report-Master.PDF",
+    "date_text": "1811:18",
+    "quote": "at 1811:18, the controller asked",
+    "provenance": "final report: 'At 1811:18, the tower controller asked the pilot which runway...'"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Jack Roush",
+      "Oshkosh Tower"
+    ],
+    "description": "Pilot reported over Warbird Island and the tower cleared him to land on runway 18R, base turn abeam the tower.",
+    "doc": "ATC Group Chairman - Factual Report-Master.PDF",
+    "date_text": "1813:31",
+    "quote": "At 1813:31, the pilot stated, “…and N6JR’s over the island.”",
+    "provenance": "final report: 'At 1813:31, the pilot reported being over Warbird Island...'"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Oshkosh Tower",
+      "Jack Roush"
+    ],
+    "description": "Tower told the pilot he could turn northbound on the downwind.",
+    "doc": "ATC Group Chairman - Factual Report-Master.PDF",
+    "date_text": "1815:23",
+    "quote": "At 1815:23, the controller transmitted, “Premier you can",
+    "provenance": "final report: 'At 1815:23, the tower controller told the pilot to turn northbound'"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "GPWS"
+    ],
+    "description": "GPWS announced one thousand feet, followed by a sound similar to the landing gear extending.",
+    "doc": "Cockpit Voice Recorder 12 - Specialist's Factual Report-Master.PDF",
+    "date_text": "1815:32",
+    "quote": "At 1815:32, the ground proximity warning system (GPWS) voice",
+    "provenance": "CVR report only (not in final report narrative)"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Fly-by Mobile controller",
+      "Piper Cub pilot"
+    ],
+    "description": "Departure controller told the yellow Piper Cub to position and hold on runway 18R; the Cub pilot requested an angled departure.",
+    "doc": "ATC Group Chairman - Factual Report-Master.PDF",
+    "date_text": "1815:54",
+    "quote": "At 1815:54, the Fly-by Mobile AC controller instructed the pilot of a yellow Cub",
+    "provenance": "final report: 'At 1815:54, the controller handling departing aircraft told the pilot of a yellow Piper Cub...'"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Fly-by Mobile controller",
+      "Piper Cub pilot"
+    ],
+    "description": "Departure controller cleared the Piper Cub for immediate takeoff from runway 18R.",
+    "doc": "ATC Group Chairman - Factual Report-Master.PDF",
+    "date_text": "1816:10",
+    "quote": "At 1816:10, the Fly-by controller transmitted, “Cub uh 18R cleared for takeoff as",
+    "provenance": "final report: 'At 1816:10, the controller handling departures transmitted...'"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Jack Roush",
+      "Oshkosh Tower"
+    ],
+    "description": "Pilot asked the tower whether 6JR was going to be okay with this; tower answered affirmative and the pilot replied he did not think so.",
+    "doc": "Cockpit Voice Recorder 12 - Specialist's Factual Report-Master.PDF",
+    "date_text": "1816:19",
+    "quote": "At 1816:19, the pilot asked, “is six J-R gonna’ be okay with this?” to which",
+    "provenance": "final report: 'At 1816:19, the accident pilot transmitted to the tower controller...'"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Fly-by Mobile controller",
+      "Piper Cub pilot"
+    ],
+    "description": "Departure controller told the Cub to offset off the runway once airborne and then to turn left off the runway because of traffic on short final.",
+    "doc": "ATC Group Chairman - Factual Report-Master.PDF",
+    "date_text": "1816:21",
+    "quote": "At 1816:21, the Fly-by Mobile controller transmitted, “Cub as soon as you’re airborne",
+    "provenance": "final report: 'At 1816:21 ... and at 1816:33 ...'"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "GPWS"
+    ],
+    "description": "EGPWS announced bank angle five times while engine sound increased rapidly.",
+    "doc": "Cockpit Voice Recorder 12 - Specialist's Factual Report-Master.PDF",
+    "date_text": "1816:35",
+    "quote": "At 1816:35, the GPWS announced “bank angle” five times until 1816:40.",
+    "provenance": "final report: 'At 1816:35, the CVR recorded the EGPWS announcing \"bank angle\" five times'"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Jack Roush",
+      "Oshkosh Tower"
+    ],
+    "description": "Pilot transmitted that he was going around as the engine sound peaked and the airplane pitched up.",
+    "doc": "Cockpit Voice Recorder 12 - Specialist's Factual Report-Master.PDF",
+    "date_text": "1816:40",
+    "quote": "1816:40, the pilot informed tower, “goin’ around.”",
+    "provenance": "final report: 'At 1816:40, the accident pilot transmitted \"Going around\"'"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Jack Roush"
+    ],
+    "description": "Pilot overshot the runway centerline in the turn from base to final and decided not to land because of a perceived conflict with the departing Cub.",
+    "doc": "Transcript for NTSB Interview of Accident Pilot, Jackie E. Roush (30 August 2010)-Redacted.PDF",
+    "date_text": "that day",
+    "quote": "I flew past the centerline of the runway.",
+    "provenance": "final report: pilot interview paragraph"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Jack Roush"
+    ],
+    "description": "Pilot initiated the go-around advancing the throttles only about a third of the way, not to takeoff power.",
+    "doc": "Transcript for NTSB Interview of Accident Pilot, Jackie E. Roush (30 August 2010)-Redacted.PDF",
+    "date_text": "that day",
+    "quote": "I advanced the throttle probably a third of the way",
+    "provenance": "final report: probable cause; pilot interview paragraph"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Oshkosh Tower",
+      "Jack Roush"
+    ],
+    "description": "Tower acknowledged the go-around and told the Premier jet to use caution for the traffic ahead on the upwind.",
+    "doc": "ATC Group Chairman - Factual Report-Master.PDF",
+    "date_text": "1816:46",
+    "quote": "At 1816:46, the SLC controller",
+    "provenance": "final report: 'At 1816:46, the tower controller acknowledged the go-around...'"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Jack Roush"
+    ],
+    "description": "Stick shaker and stick pusher activated as the right wing stalled.",
+    "doc": "Transcript for NTSB Interview of Accident Pilot, Jackie E. Roush (30 August 2010)-Redacted.PDF",
+    "date_text": "that day",
+    "quote": "I did. I did get a stick shaker.",
+    "provenance": "final report: pilot interview paragraph"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Jack Roush",
+      "Brenda Stricklin"
+    ],
+    "description": "The airplane crashed, striking the grass west of runway 18R in a nose-down, right-wing-low attitude; CVR recorded the sound of impact.",
+    "doc": "Cockpit Voice Recorder 12 - Specialist's Factual Report-Master.PDF",
+    "date_text": "1816:57",
+    "quote": "A sound similar to impact was recorded on the CVR at 1816:57.",
+    "provenance": "final report: 'sound similar to impact at 1816:57'"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Oshkosh Tower"
+    ],
+    "description": "Tower instructed the next arrival, a Lake amphibian, to go around and notified airport rescue and firefighting.",
+    "doc": "ATC Group Chairman - Factual Report-Master.PDF",
+    "date_text": "1817:02",
+    "quote": "At 1817:02, the controller instructed the next arrival, a Lake amphibian, to go around.",
+    "provenance": "ATC factual report only"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Jack Roush",
+      "Brenda Stricklin"
+    ],
+    "description": "Pilot Jack Roush was transported to Theda Clark Medical Center and passenger Brenda Stricklin to Mercy Medical Center.",
+    "doc": "Winnebago County Sheriff's Office - Incident Report-Redacted.PDF",
+    "date_text": "07/27/10",
+    "quote": "Stricklin was transported to Mercy",
+    "provenance": "final report: 'The pilot and passenger were assisted out of the aircraft and transported to the hospital'"
+  },
+  {
+    "date": "2010-07-27",
+    "actors": [
+      "Timothy Dallenogare",
+      "Jack Roush"
+    ],
+    "description": "Deputy identified the pilot at Theda Clark Medical Center and a legal blood draw was taken at NTSB request.",
+    "doc": "Winnebago County Sheriff's Office - Incident Report-Redacted.PDF",
+    "date_text": "1939 hours",
+    "quote": "Upon arriving at Theda Clark Medical Center at 1939 hours I identified the pilot",
+    "provenance": "sheriff report only"
+  },
+  {
+    "date": "2010-07-28",
+    "actors": [
+      "NTSB ATC group",
+      "OSH ATCT"
+    ],
+    "description": "The ATC group met at Oshkosh tower, reviewed procedures and audio recordings, and interviewed the controllers on duty.",
+    "doc": "ATC Group Chairman - Factual Report-Master.PDF",
+    "date_text": "July 28, 2010",
+    "quote": "on July 28, 2010. The group reviewed ATCT standard operating procedures",
+    "provenance": "final report: 'controllers ... were interviewed on July 28, 2010'"
+  },
+  {
+    "date": "2010-07-28",
+    "actors": [
+      "D. Putzer",
+      "Luker"
+    ],
+    "description": "Deputies completed the total station measurements of the wreckage debris field.",
+    "doc": "Winnebago County Sheriff's Office - Incident Report-Redacted.PDF",
+    "date_text": "07/28/10",
+    "quote": "We completed our measurement process at 2 p.m. on 07/28/10.",
+    "provenance": "sheriff report only (final report: 'The wreckage debris path and accident site were surveyed')"
+  },
+  {
+    "date": "2010-08-02",
+    "actors": [
+      "Steve Ruffin"
+    ],
+    "description": "Witness Steve Ruffin emailed the investigator a photo and his account of seeing the jet turn sharply and crash.",
+    "doc": "Witness Statements-Redacted.PDF",
+    "date_text": "Monday, August 02, 2010",
+    "quote": "Sent: Monday, August 02, 2010 11:16 AM",
+    "provenance": "evidence only (final report: 'Several witnesses...')"
+  },
+  {
+    "date": "2010-08-17",
+    "actors": [
+      "Stephen J. Scheick",
+      "Andrew T. Fox"
+    ],
+    "description": "Witness Stephen Scheick sent a statement saying he saw the jet on base and a yellow high-wing airplane flying above runway 18R.",
+    "doc": "ATC Group Chairman - Witness Statement (Stephen J. Scheick, Jr.)-Redacted.PDF",
+    "date_text": "August 17, 2010",
+    "quote": "Please accept this statement as part of your investigation",
+    "provenance": "evidence only (contradicts controllers on the Cub's position)"
+  },
+  {
+    "date": "2010-08-29",
+    "actors": [
+      "Christine Soucy"
+    ],
+    "description": "FAA's Chris Soucy interviewed witnesses at Oshkosh, who said the Cub was clear and not in the way of the jet.",
+    "doc": "ATC Group Chairman - Witness Statements (Collected by Christine Soucy, FAA)-Redacted.PDF",
+    "date_text": "August 29, 2010",
+    "quote": "Chris Soucy, FAA- Notes from Witness Interviews Oshkosh, WI August 29, 2010",
+    "provenance": "evidence only (final report: 'Several witnesses recalled seeing the yellow Piper Cub offset')"
+  },
+  {
+    "date": "2010-08-30",
+    "actors": [
+      "David Lawrence",
+      "Jack Roush"
+    ],
+    "description": "NTSB investigator David Lawrence conducted a telephonic interview of pilot Jack Roush.",
+    "doc": "Transcript for NTSB Interview of Accident Pilot, Jackie E. Roush (30 August 2010)-Redacted.PDF",
+    "date_text": "August 30, 2010",
+    "quote": "Telephonic Interview",
+    "provenance": "final report: 'The pilot was interviewed on August 30, 2010'"
+  }
+]

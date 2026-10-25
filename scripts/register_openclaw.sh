@@ -27,21 +27,22 @@ run() {
 }
 
 [[ -x "$OPENCLAW" ]] || { echo "openclaw CLI not found at $OPENCLAW" >&2; exit 1; }
-UV="$(command -v uv || true)"
-[[ -n "$UV" ]] || { echo "uv not found on PATH" >&2; exit 1; }
+# Use the project venv directly: `uv run` would re-sync (and drop optional extras) on every spawn.
+PYTHON="$PROJECT/.venv/bin/python"
+[[ -x "$PYTHON" ]] || { echo "missing $PYTHON; run 'make setup' first" >&2; exit 1; }
 [[ -f "$SKILL_DIR/SKILL.md" ]] || { echo "missing $SKILL_DIR/SKILL.md" >&2; exit 1; }
 
 # Server definition. `mcp set` replaces any existing entry, so re-running is safe.
 SERVER_JSON="$(
-  UV="$UV" PROJECT="$PROJECT" DATA_DIR="$DATA_DIR" python3 - <<'PY'
+  PYTHON="$PYTHON" PROJECT="$PROJECT" DATA_DIR="$DATA_DIR" python3 - <<'PY'
 import json, os
 env = {"CT_DATA_DIR": os.environ["DATA_DIR"]}
 for key in ("CT_EVIDENCE_DIR", "CT_CASE_ID"):
     if os.environ.get(key):
         env[key] = os.environ[key]
 print(json.dumps({
-    "command": os.environ["UV"],
-    "args": ["run", "--project", os.environ["PROJECT"], "python", "-m", "mcp_server"],
+    "command": os.environ["PYTHON"],
+    "args": ["-m", "mcp_server"],
     "cwd": os.environ["PROJECT"],
     "env": env,
 }))
