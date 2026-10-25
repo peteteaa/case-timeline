@@ -442,3 +442,393 @@ def test_detect_same_subject_false_opens_nothing(meeting_case, fake_llm, monkeyp
     monkeypatch.setattr(llm, "chat_json", chat_json)
     assert conflicts.detect(store, "demo", [becker]) == []
     assert fake_llm["calls"]
+
+
+# --------------------------------------------------------------------------- precision rules
+
+
+def verdict_for(field, **kw):
+    return conflicts.ConflictVerdict(is_contradiction=True, field=field, **kw)
+
+
+def test_range_containment_and_approximate_edges_are_not_date_conflicts():
+    # "early March" (an approximate period) vs exact dates inside it or just past its edge.
+    early = make_fact(
+        "F-1",
+        "Lee signed the supply contract",
+        date(2024, 3, 1),
+        end=date(2024, 3, 10),
+        certainty="approximate",
+        date_text="early March 2024",
+        witnesses=["W-3"],
+        docs=["D-1"],
+    )
+
+    def on(fact_id, day):
+        title = "Lee signed the supply contract"
+        return make_fact(fact_id, title, day, witnesses=["W-3"], docs=["D-2"])
+
+    inside, edge = on("F-2", date(2024, 3, 5)), on("F-3", date(2024, 3, 12))
+    far = on("F-4", date(2024, 3, 25))
+    assert conflicts.date_relation(early, inside).compatible
+    assert conflicts.date_relation(early, edge).compatible
+    assert not conflicts.date_relation(early, far).compatible
+    assert all(c.field != "date" for c in conflicts.candidate_pairs([early, inside], {"F-1"}))
+    assert conflicts.candidate_pairs([early, edge], {"F-1"}) == []
+    assert [c.field for c in conflicts.candidate_pairs([early, far], {"F-1"})] == ["date"]
+    # Even if the model calls it a date conflict, a contained or edge date is dropped.
+    assert conflicts.final_fields(verdict_for("date"), early, inside) == []
+    assert conflicts.final_fields(verdict_for("date"), early, edge) == []
+    assert conflicts.final_fields(verdict_for("date"), early, far) == ["date"]
+    # A span stated to the day at both ends has hard edges: three days past it still counts.
+    span = early.model_copy(
+        update={"date_end": date(2024, 3, 9), "date_certainty": "exact", "date_text": "March 1-9"}
+    )
+    assert conflicts.date_relation(span, inside).compatible  # contained
+    assert not conflicts.date_relation(span, edge).compatible
+    assert [c.field for c in conflicts.candidate_pairs([span, edge], {"F-1"})] == ["date"]
+
+
+def test_contained_date_is_no_evidence_of_one_occurrence():
+    # A period that merely contains a meeting's date does not make the facts one occurrence,
+    # so "different people named" is not an actor candidate.
+    period = make_fact(
+        "F-1",
+        "Lee reviewed the budget with Chan",
+        date(2024, 3, 11),
+        end=date(2024, 3, 20),
+        certainty="approximate",
+        witnesses=["W-3", "W-4"],
+        docs=["D-1"],
+    )
+    meeting = make_fact(
+        "F-2",
+        "Lee held a budget meeting with Diaz",
+        date(2024, 3, 12),
+        witnesses=["W-3", "W-5"],
+        docs=["D-2"],
+    )
+    assert all(c.field == "fact" for c in conflicts.candidate_pairs([period, meeting], {"F-1"}))
+    # On one single day the same pair is one occurrence told two ways: worth an actor check.
+    day = {"date_start": date(2024, 3, 12), "date_end": date(2024, 3, 12)}
+    one_day = period.model_copy(update={**day, "date_certainty": "exact"})
+    assert [c.field for c in conflicts.candidate_pairs([one_day, meeting], {"F-1"})] == ["actor"]
+
+
+def test_knowledge_fact_is_never_an_actor_conflict():
+    learned = make_fact(
+        "F-1", "Lee first learned about the pump defect", witnesses=["W-3"], docs=["D-1"]
+    )
+    meeting = make_fact(
+        "F-2", "Lee discussed the pump defect with Ono", witnesses=["W-3", "W-6"], docs=["D-2"]
+    )
+    assert all(c.field != "actor" for c in conflicts.candidate_pairs([learned, meeting], {"F-1"}))
+    local = ("Nobody else knew.", "Only Lee and Ono were present.")
+    assert conflicts.final_fields(verdict_for("actor"), learned, meeting, local=local) == []
+    # Without the knowledge wording the same pair is an actor candidate.
+    told = learned.model_copy(update={"title": "Lee reported the pump defect"})
+    assert [c.field for c in conflicts.candidate_pairs([told, meeting], {"F-1"})] == ["actor"]
+
+
+def test_plan_versus_outcome_is_no_conflict_of_any_kind():
+    plan = make_fact(
+        "F-1", "Review meeting scheduled with Lee and Chan", witnesses=["W-3", "W-4"], docs=["D-1"]
+    )
+    held = make_fact(
+        "F-2", "Review meeting held with Lee and Diaz", witnesses=["W-3", "W-5"], docs=["D-2"]
+    )
+    assert conflicts.candidate_pairs([plan, held], {"F-1"}) == []
+    local = ("Only them.", "Only them.")
+    assert conflicts.final_fields(verdict_for("actor"), plan, held, local=local) == []
+    # Two plans for the same review on different dates are still compared.
+    plan2 = make_fact(
+        "F-3",
+        "Review meeting with Lee set for March 9",
+        date(2024, 3, 9),
+        witnesses=["W-3"],
+        docs=["D-3"],
+    )
+    assert [c.field for c in conflicts.candidate_pairs([plan, plan2], {"F-1"})] == ["date"]
+
+
+def test_message_date_is_not_the_date_of_the_reported_occurrence():
+    # An email dated by its header (March 14) reports a meeting on March 12; another document
+    # dates the meeting March 12. The header date must not be compared with the meeting date.
+    email = make_fact(
+        "F-1",
+        "Lee called Ortiz into her office about the audit",
+        date(2024, 3, 14),
+        date_text="Thursday, March 14, 2024 9:02 AM",
+        witnesses=["W-3", "W-7"],
+        docs=["D-1"],
+        quotes=["On March 12, 2024 she called me into her office about the audit."],
+    )
+    report = make_fact(
+        "F-2",
+        "Lee met Ortiz in her office about the audit",
+        date(2024, 3, 12),
+        witnesses=["W-3", "W-7"],
+        docs=["D-2"],
+    )
+    assert conflicts.carrier_dates(email) == [date(2024, 3, 12)]
+    rel = conflicts.date_relation(email, report)
+    assert rel.carrier and rel.gap == 0 and rel.compatible
+    assert all(c.field != "date" for c in conflicts.candidate_pairs([email, report], {"F-1"}))
+    assert conflicts.final_fields(verdict_for("date"), email, report) == []
+    # The quoted date is what gets compared when it disagrees with the other source.
+    march_9 = {"date_start": date(2024, 3, 9), "date_end": date(2024, 3, 9)}
+    early = report.model_copy(update={"fact_id": "F-3", **march_9})
+    rel = conflicts.date_relation(email, early)
+    assert rel.carrier and rel.gap == 3
+    assert [c.field for c in conflicts.candidate_pairs([email, early], {"F-1"})] == ["date"]
+    # A quote that states the fact's own date is not a message date ...
+    march_12 = {"date_start": date(2024, 3, 12), "date_end": date(2024, 3, 12)}
+    assert conflicts.carrier_dates(email.model_copy(update=march_12)) == []
+    # ... nor is a merged fact whose other document's quote states it.
+    merged = make_fact(
+        "F-4",
+        "Lee called Ortiz into her office about the audit",
+        date(2024, 3, 14),
+        witnesses=["W-3", "W-7"],
+        docs=["D-1", "D-4"],
+        quotes=[
+            "On March 12, 2024 she called me into her office about the audit.",
+            "The audit meeting in her office was on March 14.",
+        ],
+    )
+    assert conflicts.carrier_dates(merged) == []
+
+
+def test_actor_exclusion_must_come_from_the_side_missing_the_person():
+    both = make_fact("F-1", "meeting in Lee's office", witnesses=["W-3", "W-4"], docs=["D-1"])
+    lee_only = make_fact("F-2", "Lee held a meeting", witnesses=["W-3"], docs=["D-2"])
+    # Only the side naming everyone has an exclusion cue: D-2 merely omits Chan.
+    local = ("Lee and Chan met. Nobody else came.", "Lee held a meeting.")
+    assert conflicts.final_fields(verdict_for("actor"), both, lee_only, local=local) == []
+    # D-2 itself says no one else was there: a real disagreement about Chan.
+    local = ("Lee and Chan met.", "Lee held a meeting. No one else was present.")
+    assert conflicts.final_fields(verdict_for("actor"), both, lee_only, local=local) == ["actor"]
+
+
+def test_local_context_ignores_exclusions_about_earlier_occurrences():
+    text = (
+        "On May 1 Lee met Chan. No one else was present.\n"
+        "On May 3 Lee was suspended.\n"
+        "Q. Who attended? A. Lee and Ortiz. Nobody else."
+    )
+    quote = "On May 3 Lee was suspended."
+    assert text[48:75] == quote
+    local = conflicts.local_context(text, quote, 48, 75)
+    assert "No one else" not in local and local.startswith("On May 3")
+    assert "No one else" in conflicts.quote_context(text, quote, 48, 75)  # the wider window
+    assert "Nobody else" in conflicts.local_context(text, "Q. Who attended?")
+    assert conflicts.local_context(None, " A  quote ") == "A quote"
+
+
+@pytest.fixture
+def office_case(tmp_path):
+    """One document says Lee and Chan met in Lee's office (and nobody else came)."""
+    store = new_store(tmp_path)
+    lee = store.add_witness("demo", "Ann Lee", by="alice").witness_id
+    chan = store.add_witness("demo", "Bo Chan", by="alice").witness_id
+
+    def fact(title, text, quote, witnesses):
+        doc = add_doc(store, text, filename=f"{len(store.list_facts('demo'))}.txt")
+        i = text.index(quote)
+        return store.add_fact(
+            "demo",
+            title,
+            by=AGENT,
+            date_start=date(2024, 3, 4),
+            date_end=date(2024, 3, 4),
+            date_certainty="exact",
+            witness_ids=witnesses,
+            spans=[SpanIn(doc_id=doc, char_start=i, char_end=i + len(quote), quote=quote)],
+        ).fact_id
+
+    both = "Ann Lee and Bo Chan met in Lee's office on March 4, 2024."
+    first = fact(
+        "Lee and Chan meet in Lee's office", both + " Nobody else came.", both, [lee, chan]
+    )
+    yield store, fact, first, lee
+    store.close()
+
+
+def test_detect_needs_the_omitting_side_to_exclude_people(office_case, fake_llm):
+    store, fact, first, lee = office_case
+    quote = "Ann Lee held a meeting in her office on March 4, 2024."
+    # The earlier sentence excludes people from another occurrence, not from this meeting.
+    text = "On March 1 she met the auditors. No one else was present. " + quote
+    second = fact("Lee holds a meeting in her office", text, quote, [lee])
+    assert conflicts.detect(store, "demo", [second]) == []
+    assert len(fake_llm["calls"]) == 1  # the model was asked (and said yes)
+    excluded = quote + " No one else was present."
+    third = fact("Lee holds a meeting in her office alone", excluded, quote, [lee])
+    opened = conflicts.detect(store, "demo", [third])
+    assert [(c.field, c.fact_ids) for c in opened] == [("actor", sorted([first, third]))]
+
+
+def test_time_zone_shift_and_clock_precision_are_not_conflicts():
+    local_day = make_fact("F-1", "The aircraft crashed on landing", witnesses=["W-3"], docs=["D-1"])
+    utc_next = make_fact(
+        "F-2",
+        "The aircraft crashed on landing",
+        date(2024, 3, 4),
+        date_text="March 4, 2024 0216 UTC",
+        witnesses=["W-3"],
+        docs=["D-2"],
+    )
+    rel = conflicts.date_relation(local_day, utc_next)
+    assert rel.zone_shift and rel.compatible
+    assert conflicts.candidate_pairs([local_day, utc_next], {"F-1"}) == []
+    # Without the zone the exact one-day gap is a candidate.
+    plain = utc_next.model_copy(update={"date_text": "March 4, 2024"})
+    assert [c.field for c in conflicts.candidate_pairs([local_day, plain], {"F-1"})] == ["date"]
+    # Two transcripts timing one radio call a second apart.
+    a = make_fact(
+        "F-3",
+        "Tower cleared Lee to land",
+        None,
+        date_text="1815:23",
+        witnesses=["W-3"],
+        docs=["D-1"],
+    )
+    b = make_fact(
+        "F-4",
+        "Tower cleared Lee to land",
+        None,
+        date_text="at about 6:15:22 PM",
+        witnesses=["W-3"],
+        docs=["D-2"],
+    )
+    rel = conflicts.date_relation(a, b)
+    assert rel.clock_gap == 1 and rel.same_moment and rel.compatible
+    assert conflicts.final_fields(verdict_for("date"), a, b) == []
+    # A minute and a half is the limit.
+    later = b.model_copy(update={"date_text": "6:17:00 PM"})
+    assert conflicts.date_relation(a, later).clock_gap == 97
+    assert conflicts.final_fields(verdict_for("date"), a, later) == ["fact"]  # both undated
+    assert conflicts.clock_seconds("June 5, 2021") is None
+    assert conflicts.clock_seconds("12:05 a.m.") == 300
+
+
+def test_inferred_year_or_inherited_day_is_not_a_soft_date():
+    # The date resolver marks a date approximate when only its year was inferred ("March 9")
+    # or when a bare clock time inherits its day ("6:15 PM"), and relative when it is an
+    # offset ("three days earlier"). Each is one definite day, so a few days' gap is still a
+    # date conflict; only a hedged day ("around March 9") or a period is soft.
+    exact = make_fact(
+        "F-1",
+        "Lee met Chan about the safety audit",
+        date(2024, 3, 12),
+        date_text="March 12, 2024",
+        witnesses=["W-3", "W-4"],
+        docs=["D-1"],
+    )
+
+    def other(text, day=date(2024, 3, 9), certainty="approximate"):
+        return make_fact(
+            "F-2",
+            "Lee met Chan about the safety audit",
+            day,
+            date_text=text,
+            certainty=certainty,
+            witnesses=["W-3", "W-4"],
+            docs=["D-2"],
+        )
+
+    hard = [
+        other("March 9"),
+        other("6:15 PM", date(2024, 3, 15)),
+        other("three days earlier", certainty="relative"),
+        other("approximately 3:40 PM"),  # a soft time on a definite day
+    ]
+    for o in hard:
+        assert not conflicts.date_relation(exact, o).compatible, o.date_text
+        assert [c.field for c in conflicts.candidate_pairs([exact, o], {"F-1"})] == ["date"]
+    soft = [
+        other("around March 9"),
+        other("early March"),
+        other("a few days before", certainty="relative"),
+    ]
+    for o in soft:
+        assert conflicts.date_relation(exact, o).compatible, o.date_text
+        assert conflicts.candidate_pairs([exact, o], {"F-1"}) == []
+
+
+def test_distinct_timed_moments_are_not_one_occurrence():
+    # Same day, but timestamps given to the second minutes apart: two radio calls, not one
+    # occurrence told two ways, so "different people named" is no actor candidate.
+    def call(fact_id, title, text, witnesses, docs):
+        return make_fact(fact_id, title, date_text=text, witnesses=witnesses, docs=docs)
+
+    a = call("F-1", "Tower told Lee and Diaz to go around", "1813:31", ["W-3", "W-5"], ["D-1"])
+    b = call("F-2", "Tower told Lee and Ono to go around", "18:16:22", ["W-3", "W-6"], ["D-2"])
+    assert conflicts.distinct_moments(a, b)
+    assert conflicts.candidate_pairs([a, b], {"F-1"}) == []
+    # Close timestamps are one moment, so the same pair is still worth an LLM check.
+    b_close = b.model_copy(update={"date_text": "18:13:50"})
+    assert not conflicts.distinct_moments(a, b_close)
+    assert [c.field for c in conflicts.candidate_pairs([a, b_close], {"F-1"})] == ["actor"]
+    # Loose times from two witnesses ("about 2:30" vs "2:47") may still be one occurrence.
+    w1 = a.model_copy(update={"date_text": "about 2:30 PM"})
+    w2 = b.model_copy(update={"date_text": "2:47 PM"})
+    assert not conflicts.distinct_moments(w1, w2)
+    assert [c.field for c in conflicts.candidate_pairs([w1, w2], {"F-1"})] == ["actor"]
+    # One document's own timeline lists distinct moments, whatever the precision.
+    s1 = call("F-3", w1.title, "about 2:30 PM", ["W-3", "W-5"], ["D-1", "D-2"])
+    assert conflicts.distinct_moments(s1, w2)
+
+
+def test_confirm_prompt_carries_rules_and_computed_date_notes(fake_llm):
+    email = make_fact(
+        "F-1",
+        "Lee met Ortiz about the audit",
+        date(2024, 3, 14),
+        witnesses=["W-3"],
+        docs=["D-1"],
+        quotes=["On March 6, 2024 Lee met Ortiz about the audit."],
+    )
+    report = make_fact(
+        "F-2", "Lee met Ortiz about the audit", date(2024, 3, 12), witnesses=["W-3"], docs=["D-2"]
+    )
+    (cand,) = conflicts.candidate_pairs([email, report], {"F-1"})
+    conflicts.confirm(cand, {"W-3": "Ann Lee"})
+    system, user = fake_llm["calls"][-1]
+    assert "precision is not disagreement" in system and "never from an inference" in system
+    assert 'knowledge is never an "actor" conflict' in system
+    assert "Notes from the date rules" in user and "2024-03-06" in user
+    assert "date of the message or document" in user
+    # Plain dates need no notes.
+    plain = make_fact(
+        "F-3", "Lee met Ortiz about the audit", date(2024, 3, 14), witnesses=["W-3"], docs=["D-1"]
+    )
+    conflicts.confirm(conflicts.Candidate(plain, report, "date", 1.0), {})
+    assert "Notes from the date rules" not in fake_llm["calls"][-1][1]
+
+
+def test_date_notes_explain_compatible_dates_zones_and_plans():
+    plan = make_fact(
+        "F-1",
+        "Interview with Lee scheduled",
+        date(2024, 3, 1),
+        end=date(2024, 3, 10),
+        certainty="approximate",
+        witnesses=["W-3"],
+        docs=["D-1"],
+    )
+    held = make_fact(
+        "F-2", "Interview with Lee", date(2024, 3, 12), witnesses=["W-3"], docs=["D-2"]
+    )
+    notes = conflicts.date_notes(plan, held)
+    assert any("compatible" in n for n in notes)
+    assert any(n.startswith("Fact A is about a plan") for n in notes)
+    utc = make_fact(
+        "F-3",
+        "Interview with Lee",
+        date(2024, 3, 13),
+        date_text="March 13, 2024 0216 UTC",
+        witnesses=["W-3"],
+        docs=["D-3"],
+    )
+    assert any("time zones" in n for n in conflicts.date_notes(held, utc))

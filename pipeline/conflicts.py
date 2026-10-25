@@ -6,37 +6,53 @@ itself). Candidate rules, over non-rejected facts, for pairs with at least one f
 touched; "linked" means the facts share a person (names compare loosely; a shared organization
 alone doesn't link facts) and "topic" is the overlap of content words (names and dates removed):
 
+- A plan or schedule ("set for", "rescheduled") is never compared with an occurrence, on any
+  field: things get moved. Only plan-vs-plan and occurrence-vs-occurrence pairs qualify.
+- Dates are compared through ``date_relation``. Precision is not disagreement: a period or
+  range containing the other date, an approximate day ("early March", "around the 9th") within
+  ``APPROX_SLACK_DAYS`` of it, a one-day gap between dates written in different time zones
+  ("0216 UTC" vs local time), and clock times within ``CLOCK_SLACK_SECONDS`` are compatible.
+  When a fact's quotes refer to calendar dates that don't include its own date, its date is
+  most likely that of the message reporting the occurrence (a letter's date, an email's "Sent:"
+  line), so the quoted dates are compared instead whenever that narrows the gap.
 - **date**: linked facts (or, when one names nobody, near-identical ones) more than a day apart
   (a day apart when both dates are exact) that look like one occurrence: similar wording, a
-  shared topic word within two weeks, or a strong topic overlap within two months. A plan or
-  schedule ("set for", "rescheduled") is never compared with an occurrence: things get moved.
-  When either fact is about someone's knowledge ("first learned"), the candidate is "fact".
-- **actor**: facts on overlapping dates that are similar but name disjoint people, or that share
-  a person and a topic word but name different people;
-- **fact**: linked facts on overlapping dates where one negates ("never", "denied", ...) and
-  the wording differs or the topic is shared; and linked facts where one is undated but the topic
-  overlap is strong.
+  shared topic word within two weeks, or a strong topic overlap within two months. When either
+  fact is about someone's knowledge ("first learned"), the candidate is "fact".
+- **actor**: facts on the same single day that are similar but name disjoint people, or that
+  share a person and a topic word but name different people. Never for someone's knowledge
+  (when someone learned of a matter says nothing about who was present), and never for times
+  given on that day that are clearly different moments (``distinct_moments``);
+- **fact**: linked facts on the same single day where one negates ("never", "denied", ...) and
+  the wording differs or the topic is shared; and linked facts where one is undated, or where
+  one date is a period that merely contains the other, but the topic overlap is strong (a
+  contained date is no evidence that two facts are one occurrence).
 
 Each candidate is confirmed by the local LLM, which sees every quote of both facts with the
-surrounding source text; deterministic checks then veto impossible fields (a "date" conflict
-needs two non-overlapping resolved dates; an "actor" conflict between linked facts needs someone
-to exclude a person). A disagreement already opened (or dismissed) through another pair of facts
-about the same occurrences is not opened again. A reviewer then confirms (facts become disputed)
-or dismisses each contradiction.
+surrounding source text, plus plain-language notes computed from the dates (``date_notes``);
+deterministic checks then veto impossible fields (a "date" conflict needs two resolved dates
+that are not compatible; an "actor" conflict is never about a plan vs an occurrence or about
+someone's knowledge, and between linked facts it needs the side that leaves a person out to
+exclude people in its own quote or the text right after it). A disagreement already opened
+(or dismissed) through another pair of facts about the same occurrences is not opened again.
+A reviewer then confirms (facts become disputed) or dismisses each contradiction.
 """
 
 from __future__ import annotations
 
+import calendar
 import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from pipeline import prompts
 from pipeline.merge import (
+    Interval,
     Person,
     fact_similarity,
     fact_text,
@@ -63,8 +79,13 @@ NEAR_DAYS = 14  # within this many days, one shared topic word is enough for an 
 TOPIC_MIN = 0.3  # topic overlap for dated pairs further apart than NEAR_DAYS
 TOPIC_MIN_UNDATED = 0.4  # stricter when one fact is undated (no date evidence)
 SAME_OCCURRENCE_TOPIC = 0.5  # two facts on one day this alike are one occurrence (dedupe)
+# An approximate or ranged date ("early June", "that week") has soft edges: a date this many
+# days outside it is still a granularity difference, not a disagreement.
+APPROX_SLACK_DAYS = 3
+CLOCK_SLACK_SECONDS = 90  # two sources' clock times this close are one moment
 CONTEXT_BEFORE = 300  # characters of source text shown around each quote
 CONTEXT_AFTER = 400
+LOCAL_AFTER = 200  # characters after a quote searched for an exclusion cue ("Only the two of us.")
 VERDICT_MAX_TOKENS = 1200
 
 NEGATION_CUES = re.compile(
@@ -74,7 +95,8 @@ NEGATION_CUES = re.compile(
     re.IGNORECASE,
 )
 # A disagreement about *who* was there needs one source to exclude someone affirmatively;
-# silence is not exclusion. One of these cues must appear in either fact's quotes or context.
+# silence is not exclusion. One of these cues must appear in the quotes (or the text right
+# after them) of the side that leaves a person out.
 EXCLUSION_CUES = re.compile(
     r"\b(only|nobody|no\s+one|no-one|none|alone|nor|neither|never|not|no|absent|"
     r"wasn't|weren't|didn't|denie[sd]|deny|except|besides|other\s+than|else)\b",
@@ -201,6 +223,261 @@ def topic_overlap(
     return overlap(topic_tokens(texts[0], names), topic_tokens(texts[1], names))
 
 
+# --------------------------------------------------------------------------- date relation
+
+_MONTH_NUM = {
+    **{calendar.month_name[i].lower(): i for i in range(1, 13)},
+    **{calendar.month_abbr[i].lower(): i for i in range(1, 13)},
+    "sept": 9,
+}
+_MON = "|".join(sorted(_MONTH_NUM, key=len, reverse=True))
+_DAY = r"\d{1,2}(?:st|nd|rd|th)?"
+_YEAR = r"(?:19|20)\d{2}"
+_EXPLICIT_DATE = re.compile(
+    rf"\b(?:(?P<m1>{_MON})\.?\s+(?P<d1>{_DAY})(?:,?\s+(?P<y1>{_YEAR}))?"  # June 5(, 2021)
+    rf"|(?P<d2>{_DAY})\s+(?:of\s+)?(?P<m2>{_MON})\.?,?\s+(?P<y2>{_YEAR})"  # 5 June 2021
+    rf"|(?P<y3>{_YEAR})-(?P<m3>\d{{2}})-(?P<d3>\d{{2}}))\b",  # 2021-06-05
+    re.IGNORECASE,
+)
+
+
+def referenced_dates(f: Fact) -> list[date]:
+    """Calendar dates written out in the fact's quotes ("June 5, 2021", "5 June 2021").
+
+    A date without a year takes the year of the fact's own resolved date.
+    """
+    out: list[date] = []
+    default_year = f.date_start.year if f.date_start else None
+    for quote in _quotes(f):
+        for m in _EXPLICIT_DATE.finditer(quote):
+            try:
+                if m.group("y3"):
+                    d = date(int(m.group("y3")), int(m.group("m3")), int(m.group("d3")))
+                else:
+                    mon = _MONTH_NUM[(m.group("m1") or m.group("m2")).lower()]
+                    day = int(re.sub(r"\D", "", m.group("d1") or m.group("d2")))
+                    year = m.group("y1") or m.group("y2") or default_year
+                    if year is None:
+                        continue
+                    d = date(int(year), mon, day)
+            except (KeyError, ValueError):
+                continue
+            if d not in out:
+                out.append(d)
+    return out
+
+
+def carrier_dates(f: Fact) -> list[date]:
+    """Dates the fact's quotes refer to when its own date is not among them, else [].
+
+    Then the fact's date is most likely the date of the message or document that reports the
+    occurrence (an email's "Sent:" line, a letter's date), not the occurrence's own date: "we
+    booked the site visit for June 9" in a message dated by its header. A fact citing several
+    documents keeps its own date when any of its quotes states it.
+    """
+    own = interval(f.date_start, f.date_end)
+    if own is None:
+        return []
+    refs = referenced_dates(f)
+    if not refs or any(own[0] <= d <= own[1] for d in refs):
+        return []
+    return refs
+
+
+# Time zone markers in a date as written ("0216 UTC", "3:40 PM CDT"). A UTC timestamp late in
+# the evening falls on the next calendar day, so a one-day gap across zones is no conflict.
+_ZONE = re.compile(r"\b(?:UTC|GMT|Z|Zulu|[ECMPA][SD]T|local(?:\s+time)?)\b", re.IGNORECASE)
+# Clock times in a date as written: "09:42:15", "3:40 PM", "0942:15" (HHMM:SS).
+_CLOCK = re.compile(
+    r"\b(?:(?P<h>[01]?\d|2[0-3]):(?P<m>[0-5]\d)(?::(?P<s>[0-5]\d))?\s*(?P<ap>[ap]\.?m\.?)?"
+    r"|(?P<h2>[01]\d|2[0-3])(?P<m2>[0-5]\d):(?P<s2>[0-5]\d))(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def _zones(f: Fact) -> frozenset[str]:
+    return frozenset(z.casefold() for z in _ZONE.findall(f.date_text or ""))
+
+
+def clock_seconds(text: str | None) -> int | None:
+    """Seconds after midnight of the first clock time in ``text``, or None."""
+    m = _CLOCK.search(text or "")
+    if m is None:
+        return None
+    if m.group("h2"):
+        return int(m.group("h2")) * 3600 + int(m.group("m2")) * 60 + int(m.group("s2"))
+    hour = int(m.group("h"))
+    ap = (m.group("ap") or "").replace(".", "").lower()
+    if ap == "pm" and hour < 12:
+        hour += 12
+    elif ap == "am" and hour == 12:
+        hour = 0
+    return hour * 3600 + int(m.group("m")) * 60 + int(m.group("s") or 0)
+
+
+def clock_gap_seconds(a: Fact, b: Fact) -> int | None:
+    """Seconds between the clock times written in both facts' dates (None unless both have
+    one and their resolved dates, where both have one, overlap)."""
+    ca, cb = clock_seconds(a.date_text), clock_seconds(b.date_text)
+    if ca is None or cb is None:
+        return None
+    gap = gap_days(interval(a.date_start, a.date_end), interval(b.date_start, b.date_end))
+    if gap is not None and gap > 0:
+        return None
+    return abs(ca - cb)
+
+
+# Words that make the *day* itself soft ("early June", "a few days later", "sometime that
+# week"), and hedges that do so unless they qualify a clock time ("around March 9" is soft,
+# "approximately 3:40 PM" is a soft time on a definite day).
+_PERIOD_HEDGE = re.compile(
+    r"\b(?:early|mid|late|beginning|end|week|weekend|month|couple|few|several|sometime|"
+    r"some\s+time|or\s+so)\b|\bmid-",
+    re.IGNORECASE,
+)
+_POINT_HEDGE = re.compile(
+    r"\b(?:around|about|approx\w*|circa|ca\.|roughly|nearly|on\s+or\s+about)\b", re.IGNORECASE
+)
+
+
+def _is_fuzzy(f: Fact) -> bool:
+    """The resolved *day* has soft edges: a period ("March 2024", "early June", "that week")
+    or a hedged day ("around March 9").
+
+    A span stated to the day at both ends ("March 3-5, 2024", certainty "exact") has hard
+    edges. "approximate" or "relative" alone is not enough either: the date resolver also
+    uses them for a year inferred from context ("March 9"), a day a bare clock time inherits
+    ("3:40 PM") or a computed offset ("three weeks later"). Those are single definite days,
+    and a few days' gap to another date is a real disagreement.
+    """
+    if f.date_certainty == "exact":
+        return False
+    span = interval(f.date_start, f.date_end)
+    if span is not None and span[0] != span[1]:
+        return True
+    if f.date_certainty not in ("approximate", "relative"):
+        return False
+    text = f.date_text or ""
+    if _PERIOD_HEDGE.search(text):
+        return True
+    return bool(_POINT_HEDGE.search(text)) and clock_seconds(text) is None
+
+
+@dataclass(frozen=True)
+class DateRelation:
+    """How the resolved dates of two facts relate."""
+
+    gap: int | None  # days between them (0 if overlapping); None if either is undated
+    same_day: bool  # both are the same single calendar day
+    approximate: bool  # either date has soft edges (``_is_fuzzy``)
+    carrier: bool = False  # a message date was replaced by the dates its quotes refer to
+    zone_shift: bool = False  # the dates are written in different time zones
+    clock_gap: int | None = None  # seconds between the clock times both dates give
+
+    @property
+    def same_moment(self) -> bool:
+        """Both sources give clock times within ``CLOCK_SLACK_SECONDS``: one moment."""
+        return self.clock_gap is not None and self.clock_gap <= CLOCK_SLACK_SECONDS
+
+    @property
+    def compatible(self) -> bool:
+        """The dates cannot conflict: they overlap, an approximate period nearly touches the
+        other date, a one-day gap comes from different time zones, or the clock times are one
+        moment (precision, not disagreement)."""
+        if self.same_moment:
+            return True
+        if self.gap is None:
+            return False
+        return (
+            self.gap == 0
+            or (self.approximate and self.gap <= APPROX_SLACK_DAYS)
+            or (self.zone_shift and self.gap <= 1)
+        )
+
+
+def date_relation(a: Fact, b: Fact) -> DateRelation:
+    """Compare two facts' dates, treating a message date as the dates its quotes refer to.
+
+    The comparison only ever gets more lenient: the gap is the smaller of the plain gap and
+    the gap after substituting quoted dates for a message date.
+    """
+    ia, ib = interval(a.date_start, a.date_end), interval(b.date_start, b.date_end)
+    approximate = _is_fuzzy(a) or _is_fuzzy(b)
+    clock_gap = clock_gap_seconds(a, b)
+    if ia is None or ib is None:
+        return DateRelation(None, False, approximate, clock_gap=clock_gap)
+    gap = _span_gap(ia, ib)
+    same_day = ia == ib and ia[0] == ia[1]
+    carrier = False
+    if gap > 0:
+        spans_a = [(d, d) for d in carrier_dates(a)] or [ia]
+        spans_b = [(d, d) for d in carrier_dates(b)] or [ib]
+        quoted = min(_span_gap(x, y) for x in spans_a for y in spans_b)
+        if quoted < gap:
+            gap, carrier = quoted, True
+    zone_shift = _zones(a) != _zones(b)
+    return DateRelation(gap, same_day, approximate, carrier, zone_shift, clock_gap)
+
+
+def _span_gap(x: Interval, y: Interval) -> int:
+    return gap_days(x, y) or 0  # never None: both intervals are set
+
+
+def _has_seconds(text: str | None) -> bool:
+    m = _CLOCK.search(text or "")
+    return m is not None and bool(m.group("s") or m.group("s2"))
+
+
+def distinct_moments(a: Fact, b: Fact, rel: DateRelation | None = None) -> bool:
+    """Both facts are timed on the same day, more than ``CLOCK_SLACK_SECONDS`` apart, and the
+    times are precise enough to tell occurrences apart: both are given to the second (log or
+    transcript timestamps), or both come from one document's own timeline (the facts share a
+    document). A loose "about 2:30" vs "2:47" from two witnesses may still be one occurrence."""
+    rel = rel or date_relation(a, b)
+    if rel.clock_gap is None or rel.same_moment:
+        return False
+    if _docs(a) & _docs(b):
+        return True
+    return _has_seconds(a.date_text) and _has_seconds(b.date_text)
+
+
+def date_notes(a: Fact, b: Fact) -> list[str]:
+    """Plain-language facts about the two dates, given to the LLM with the candidate."""
+    rel = date_relation(a, b)
+    notes: list[str] = []
+    for label, f in (("A", a), ("B", b)):
+        refs = carrier_dates(f)
+        if refs:
+            notes.append(
+                f"Fact {label}'s date ({f.date_text or _resolved(f)}) is not mentioned in its "
+                f"quotes, which refer to {', '.join(d.isoformat() for d in refs)}: it is "
+                "probably the date of the message or document, not of the occurrence it reports."
+            )
+    if rel.same_moment:
+        notes.append(
+            f"Both facts give clock times only {rel.clock_gap} seconds apart: for these "
+            "sources that is the same moment, not a timing conflict."
+        )
+    elif rel.zone_shift and rel.gap == 1:
+        notes.append(
+            "The dates are written in different time zones (e.g. UTC vs local time); a "
+            "one-day difference can be the same moment and is not a date conflict."
+        )
+    elif rel.gap is not None and rel.compatible and not rel.same_day:
+        notes.append(
+            "The two dates are compatible: one is an approximate period or range that contains "
+            "or nearly touches the other date. This is a difference in precision, never a date "
+            "conflict."
+        )
+    for label, f in (("A", a), ("B", b)):
+        if _is_plan(f):
+            notes.append(
+                f"Fact {label} is about a plan, schedule or deadline; it is only in conflict "
+                "with another statement about that same plan, not with what later happened."
+            )
+    return notes
+
+
 # --------------------------------------------------------------------------- candidates
 
 
@@ -211,24 +488,33 @@ def classify(
     da, db = _docs(a), _docs(b)
     if da == db:
         return None  # one source is not checked against itself
-    gap = gap_days(interval(a.date_start, a.date_end), interval(b.date_start, b.date_end))
+    if _is_plan(a) != _is_plan(b):
+        # A plan, schedule or deadline vs what actually happened: things get rescheduled, so
+        # this is no conflict of any kind unless both facts make the same kind of claim.
+        return None
+    rel = date_relation(a, b)
+    gap = rel.gap
     pa, pb = _persons(a, witness_names), _persons(b, witness_names)
     link = linked(pa, pb)
     sim = fact_similarity(a.title, a.details, b.title, b.details)
     topic, shared = topic_overlap(a, b, witness_names)
 
-    if gap is None:
-        # One side is undated: only a strong same-subject signal is worth an LLM call
-        # (e.g. "learned of it only after the hearing" vs a dated written notice).
+    if gap is None or (gap == 0 and not rel.same_day):
+        # One side is undated, or one date is a period that merely contains the other: the
+        # dates are no evidence that the facts are one occurrence, so only a strong
+        # same-subject signal is worth an LLM call (e.g. "learned of it only after the
+        # hearing" vs a dated written notice).
         if link and shared >= 2 and topic >= TOPIC_MIN_UNDATED and (a.date_start or b.date_start):
             return Candidate(a, b, "fact", 100.0 * topic)
         return None
+    if gap > 0 and rel.compatible:
+        return None  # precision only: an approximate edge, or a time-zone shift
 
     both_exact = a.date_certainty == "exact" and b.date_certainty == "exact"
     if gap > 1 or (gap == 1 and both_exact):
         # A one-day gap only counts when both dates are stated exactly ("March 11" vs "12").
         strong = (not pa or not pb) and sim >= STRONG_SIMILAR
-        if not (link or strong) or _is_plan(a) != _is_plan(b):
+        if not (link or strong):
             return None
         near = gap <= NEAR_DAYS and shared >= 1
         if sim >= SIMILAR_THRESHOLD or near or (gap <= MAX_GAP_DAYS and topic >= TOPIC_MIN):
@@ -238,11 +524,17 @@ def classify(
         return None
     if gap != 0:
         return None
+    if distinct_moments(a, b, rel):
+        # Same day but clearly different moments (a log or transcript lists many timed
+        # entries per day): the rules below assume one occurrence, so they do not apply.
+        return None
 
+    # The same single day on both sides.
     qa, qb = _people_only(pa), _people_only(pb)
-    if qa and qb and not link and sim >= SIMILAR_THRESHOLD:
+    knowledge = _is_knowledge(a) or _is_knowledge(b)  # about who knew, not who was there
+    if qa and qb and not link and sim >= SIMILAR_THRESHOLD and not knowledge:
         return Candidate(a, b, "actor", sim)
-    if link and shared >= 1 and (unmatched(qa, qb) or unmatched(qb, qa)):
+    if link and shared >= 1 and not knowledge and (unmatched(qa, qb) or unmatched(qb, qa)):
         # Same occurrence, different people named: an omission or a real disagreement about
         # who was there; the LLM decides using the surrounding source text.
         return Candidate(a, b, "actor", 100.0 * topic)
@@ -370,6 +662,33 @@ def quote_context(
     return _WS.sub(" ", text[lo:hi]).strip()
 
 
+def local_context(
+    text: str | None,
+    quote: str,
+    start: int | None = None,
+    end: int | None = None,
+    after: int = LOCAL_AFTER,
+) -> str:
+    """The quote plus up to ``after`` characters of the text that follows it.
+
+    Narrower than ``quote_context``: used to decide whether a source itself excludes people
+    from an occurrence ("A. Only the two of us were there." right after the answer), so an
+    exclusion stated about some other occurrence a few sentences earlier does not count.
+    """
+    span = _locate(text, quote, start, end) if text else None
+    if not text or span is None:
+        return _norm(quote)
+    s, t = span
+    hi = min(len(text), t + after)
+    if hi < len(text):  # end at the last sentence/line boundary inside the window
+        last = None
+        for m in _BOUNDARY.finditer(text, t, hi):
+            last = m
+        if last is not None:
+            hi = last.start()
+    return _WS.sub(" ", text[s:hi]).strip()
+
+
 class _Docs:
     """Cached document text and filenames from the store (best effort)."""
 
@@ -429,6 +748,14 @@ def _evidence_block(f: Fact, docs: _Docs) -> tuple[str, str]:
     return "\n".join(lines), " ".join(contexts)
 
 
+def _local_text(f: Fact, docs: _Docs) -> str:
+    """Each quote shown for the fact plus the text right after it (``local_context``)."""
+    return " ".join(
+        local_context(docs.text(e.doc_id), e.quote, e.char_start, e.char_end)
+        for e in _shown_evidence(f)
+    )
+
+
 def _resolved(f: Fact) -> str:
     if f.date_start is None:
         return "undated"
@@ -467,6 +794,11 @@ def confirm(
     user = prompts.CONFLICT_USER.format(
         field=cand.field, **_fields(cand.a, "a", names, ev_a), **_fields(cand.b, "b", names, ev_b)
     )
+    notes = date_notes(cand.a, cand.b)
+    if notes:
+        user += "\n\nNotes from the date rules (computed, reliable):\n" + "\n".join(
+            f"- {n}" for n in notes
+        )
     result = llm.chat_json(
         prompts.CONFLICT_SYSTEM, user, ConflictVerdict, max_tokens=VERDICT_MAX_TOKENS
     )
@@ -482,35 +814,60 @@ def final_fields(
     b: Fact,
     context: str = "",
     witness_names: Mapping[str, Sequence[str]] | None = None,
+    local: tuple[str, str] | None = None,
 ) -> list[ConflictField]:
     """Fields to open after deterministic sanity checks on the model's answer.
 
-    - DATE needs two resolved dates; when either side has none the disagreement is reported as
-      FACT. Two resolved dates that overlap cannot be a date contradiction, so DATE is dropped
-      then. When either fact is about someone's knowledge ("first learned of it in mid-March"),
-      DATE becomes FACT.
-    - When the facts share a person, ACTOR needs an exclusion cue ("only", "no one else", "was
-      not there") in either fact's quotes or surrounding text: a source that merely omits a
-      person is not a conflict. (The same act attributed to different people needs none.)
+    - DATE is dropped when the dates are compatible (see ``date_relation``): overlapping, one
+      approximate period containing or nearly touching the other date, a message date vs the
+      date it reports, a one-day time-zone shift, or clock times within a minute and a half.
+      Otherwise DATE needs two resolved dates; when either side has none the disagreement is
+      reported as FACT, and also when either fact is about someone's knowledge ("first
+      learned of it in mid-March").
+    - ACTOR is dropped for a plan compared with an outcome and for knowledge facts (when
+      someone learned of a matter says nothing about who was present). When the facts share
+      a person, ACTOR also needs the side that lacks a person named by the other to exclude
+      people affirmatively ("only", "no one else", "was not there") in its quotes or the text
+      right after them (``local``: fact A's, fact B's; without it, either fact's quotes or
+      ``context`` will do): a source that merely omits a person is not a conflict. (The same
+      act attributed to entirely different people needs no cue.)
     """
     if not (verdict.is_contradiction and verdict.same_subject):
         return []
+    rel = date_relation(a, b)
     out: list[ConflictField] = []
     for f in verdict.fields():
         if f == "date":
-            gap = gap_days(interval(a.date_start, a.date_end), interval(b.date_start, b.date_end))
-            if gap is None or _is_knowledge(a) or _is_knowledge(b):
+            if rel.compatible:
+                continue
+            if rel.gap is None or _is_knowledge(a) or _is_knowledge(b):
                 f = "fact"
-            elif gap == 0:
-                continue
-        if f == "actor":
-            pa, pb = _persons(a, witness_names), _persons(b, witness_names)
-            cues = " ".join([*_quotes(a), *_quotes(b), context])
-            if linked(pa, pb) and not EXCLUSION_CUES.search(cues):
-                continue
+        if f == "actor" and not _actor_conflict_possible(a, b, context, witness_names, local):
+            continue
         if f not in out:
             out.append(f)
     return out
+
+
+def _actor_conflict_possible(
+    a: Fact,
+    b: Fact,
+    context: str,
+    witness_names: Mapping[str, Sequence[str]] | None,
+    local: tuple[str, str] | None,
+) -> bool:
+    if _is_plan(a) != _is_plan(b) or _is_knowledge(a) or _is_knowledge(b):
+        return False
+    pa, pb = _persons(a, witness_names), _persons(b, witness_names)
+    if not linked(pa, pb):
+        return True
+    if local is None:
+        return bool(EXCLUSION_CUES.search(" ".join([*_quotes(a), *_quotes(b), context])))
+    la, lb = local
+    return bool(
+        (unmatched(pb, pa) and EXCLUSION_CUES.search(la))
+        or (unmatched(pa, pb) and EXCLUSION_CUES.search(lb))
+    )
 
 
 def detect(
@@ -565,7 +922,8 @@ def detect(
             (verdict.explanation or verdict.comparison).strip()[:300],
         )
         explanation = (verdict.explanation or verdict.comparison).strip()
-        for field in final_fields(verdict, cand.a, cand.b, context, witness_names):
+        local = (_local_text(cand.a, docs), _local_text(cand.b, docs))
+        for field in final_fields(verdict, cand.a, cand.b, context, witness_names, local):
             if same_disagreement(field, cand.a, cand.b, opened_pairs):
                 log.info("conflict %s (%s) restates an open disagreement; skipped", ids, field)
                 continue
