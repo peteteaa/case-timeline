@@ -281,3 +281,18 @@ def test_case_time_zone_and_incident_settings(tmp_path: Path) -> None:
     assert Settings(**base, case_incident_date="").case_incident_date is None
     with pytest.raises(ValueError):
         Settings(**base, case_tz="Mars/Olympus")
+
+
+def test_draft_cap_scales_with_document_length(tmp_path: Path) -> None:
+    from pipeline.schema import Page
+
+    base = {"evidence_dir": tmp_path / "ev", "data_dir": tmp_path / "data"}
+    short = _parsed("x", "D-1")
+    long = _parsed("x", "D-2").model_copy(
+        update={"pages": [Page(number=i, char_start=0, char_end=1) for i in range(1, 16)]}
+    )
+    s = Settings(**base)
+    assert jobs.draft_cap(s, short) == 40  # one page: the floor
+    assert jobs.draft_cap(s, long) == 120  # 15 pages x 8
+    assert jobs.draft_cap(Settings(**base, max_drafts_per_doc=0), long) == 0  # no cap
+    assert jobs.draft_cap(Settings(**base, max_drafts_per_page=0), long) == 40

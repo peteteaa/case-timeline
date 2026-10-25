@@ -761,3 +761,23 @@ def test_on_this_date_is_the_date_just_mentioned_not_the_documents() -> None:
 def test_ocr_date_run_into_a_time_still_parses() -> None:
     found = parse_absolute("07/02/202118:17")
     assert found is not None and found[0] == (date(2021, 7, 2), date(2021, 7, 2))
+
+
+def test_an_account_dated_with_the_interviews_own_date_moves_to_the_incident() -> None:
+    held = located("held", "August 30, 2010", INTERVIEW, "Interview conducted by telephone")
+    stall = located("stall", "August 30, 2010", INTERVIEW, "the right wing stalled")
+    out = resolve_drafts(
+        [held, stall], date(2010, 8, 30), [], parsed=doc(INTERVIEW), case_incident_date=ACCIDENT
+    )
+    assert out[0].date_start == date(2010, 8, 30)  # the heading keeps the document's date
+    assert out[1].date_start == out[1].date_end == ACCIDENT
+    assert out[1].date_certainty == APPROXIMATE
+
+
+def test_a_sentence_that_states_the_documents_date_keeps_it() -> None:
+    text = INTERVIEW + "A. On August 30, 2010 I called the FAA to report it after the accident.\n"
+    call = located("call", "August 30, 2010", text, "I called the FAA to report it")
+    out = resolve_drafts(
+        [call], date(2010, 8, 30), [], parsed=doc(text), case_incident_date=ACCIDENT
+    )
+    assert out[0].date_start == date(2010, 8, 30)

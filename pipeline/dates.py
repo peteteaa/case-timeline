@@ -1167,6 +1167,33 @@ def resolve_drafts(
         else:
             out[i] = d.model_copy(update=undated)
 
+    # A draft dated with the document's own date in a document about an incident on another
+    # day, outside the heading, whose sentence never states that date: the model took the
+    # interview's or report's own date for an occurrence it recounts. It happened at the
+    # incident, not when it was told.
+    if ctx.incident is not None and doc_date is not None and ctx.incident != doc_date:
+        for i in order:
+            d = out[i]
+            first = _first_span(d)
+            if (
+                d.date_start != doc_date
+                or d.date_end not in (None, doc_date)
+                or first is None
+                or _in_heading(first.char_start, ctx)
+                or _open_ended(d.date_text)
+            ):
+                continue
+            lo, hi = _sentence_bounds(ctx.text, first.char_start, first.char_end)
+            if any(lo <= m.pos < hi and doc_date in (m.day, m.stated) for m in ctx.mentions):
+                continue  # the sentence itself states the document's date
+            out[i] = d.model_copy(
+                update={
+                    "date_start": ctx.incident,
+                    "date_end": ctx.incident,
+                    "date_certainty": "approximate",
+                }
+            )
+
     if ctx.incident is not None:
         stating = [
             j

@@ -201,7 +201,7 @@ def _draft_doc(
     drafts, vcounts = verify.verify_drafts(parsed, drafts)
     for k in ("quotes_checked", "quotes_rejected", "drafts_discarded"):
         run.counts[k] += vcounts.get(k, 0)
-    cap = settings.max_drafts_per_doc
+    cap = draft_cap(settings, parsed)
     if cap and len(drafts) > cap:
         drafts = sorted(drafts, key=lambda d: -d.confidence)[:cap]
     drafts = dates.resolve_drafts(
@@ -215,6 +215,15 @@ def _draft_doc(
     _store_drafts(store, parsed, drafts, run)
     store.mark_drafted(parsed.doc.doc_id)
     run.processed_doc_ids.append(parsed.doc.doc_id)
+
+
+def draft_cap(settings: Settings, parsed: ParsedDocument) -> int:
+    """Most drafts kept for one document (0 = no cap): ``max_drafts_per_doc``, raised to
+    ``max_drafts_per_page`` per page for longer documents."""
+    if not settings.max_drafts_per_doc:
+        return 0
+    pages = len(parsed.pages) or (parsed.doc.pages or 1)
+    return max(settings.max_drafts_per_doc, settings.max_drafts_per_page * pages)
 
 
 def case_incident_date(parsed_docs: Iterable[ParsedDocument]) -> date | None:

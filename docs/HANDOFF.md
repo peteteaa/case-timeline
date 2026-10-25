@@ -58,7 +58,8 @@ Branch `port/handoff` (on top of `4004c9d`). 655 tests green, ruff clean.
 
 Live NTSB scan on the port (one scan, concurrency 4, `CT_CASE_TZ=America/Chicago`, 252 s): **date accuracy 1.000 (21/21)**, recall 0.778 (21/27), 0 contradictions from 28 candidates (the model judged all of them distinct occurrences; there is no ntsb disputes gold to score them).
 
-Still open (not in the list above):
-- **Recall** is the gap to the old 0.926, and it is extraction, not dates: the per-document cap (`CT_MAX_DRAFTS_PER_DOC=40`) dropped part of the sheriff report's 64 drafts, and Spec 2's extractor has no gleaning passes (the old `GLEAN_PASSES`), so the interview's go-around / stick-shaker passages were never drafted.
+Recall fix (follow-up, same evening): the extraction prompt now gives each step of a recounted occurrence (a pilot's account of the flight in a later interview) its own fact, tied to the occurrence ("during the accident flight") rather than the interview's date, and asks for an incident's whole sequence (departure through response). The per-document cap scales with length (`CT_MAX_DRAFTS_PER_PAGE=8`, floor `CT_MAX_DRAFTS_PER_DOC=40`). A model-written authoring date on a recounted step moves to the incident date, and placeholder dates ("no date", "N/A") become empty. Second live scan (351 s): **recall 0.926 (25/27)**, date accuracy 0.920 as stored, **0.96 (24/25) with the authoring-date guard** (re-resolved offline on the same drafts), 202 facts, 8 contradictions from 39 candidates (unscored: no ntsb disputes gold). Extraction varies run to run (vLLM batching), so single-run recall is noisy (the interview's G14/G15 appear in some runs and not others).
+
+Still open:
 - The FAA Controller Statements PDF needs OCR (install the extras: `uv sync --all-extras`).
 - Not ported from `cc59d06` (WIP, unverified): the `importance` key-event flag, low-yield re-OCR, `_refine_from_quote`.

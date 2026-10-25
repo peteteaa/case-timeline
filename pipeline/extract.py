@@ -25,6 +25,11 @@ MAX_TITLE_CHARS = 200
 UNCOPIED_DATE_PENALTY = 0.8  # date_text not found in the document (the model computed it)
 
 _WS = re.compile(r"\s+")
+_NO_DATE = re.compile(
+    r"^(?:\(?\s*(?:no|without|missing)\s+(?:date|time)(?:\s+(?:given|stated|provided))?\s*\)?"
+    r"|n/?a|none|null|unknown|undated|not\s+(?:dated|stated|given|specified))\.?$",
+    re.IGNORECASE,
+)
 _PRONOUNS = frozenset(
     "i me my he him his she her hers they them their we us our you your it its someone somebody "
     "nobody everyone anyone".split()
@@ -153,6 +158,8 @@ def _to_draft(
     if not title:
         return None
     date_text = _norm(item.date_text)
+    if _NO_DATE.match(date_text):  # "no date", "N/A", "unknown": the model's way of saying none
+        date_text = ""
     confidence = min(1.0, max(0.0, item.confidence))
     squashed = squashed_text if squashed_text is not None else _squash(parsed.text)
     if date_text and _squash(date_text) not in squashed:

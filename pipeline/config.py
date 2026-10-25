@@ -78,7 +78,11 @@ class Settings(BaseSettings):
     # The case's incident date, when the documents' consensus should not be used.
     case_incident_date: date | None = None
 
-    max_drafts_per_doc: int = 40  # keep the most confident drafts per document (0 = no cap)
+    # Keep the most confident drafts per document: at least max_drafts_per_doc, or
+    # max_drafts_per_page per page for longer documents (a 15-page report is not held to the
+    # same count as a one-page letter). max_drafts_per_doc = 0 means no cap.
+    max_drafts_per_doc: int = 40
+    max_drafts_per_page: int = Field(default=8, ge=0)
     worker_poll_seconds: float = 2.0
     run_worker: bool = True  # the app server starts the job worker
 

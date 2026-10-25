@@ -17,8 +17,16 @@ filing, notice, or deadline). Keep its participants, what was said or decided, a
 ended together in ONE fact.
 - When people in the same document give differing accounts of one occurrence (one says X, \
 another denies it or says Y), write ONE fact that states both accounts. What someone says \
-during an interview, call or meeting is part of that occurrence unless it reports a separate \
-occurrence with its own date.
+during an interview, call or meeting about that interview, call or meeting itself is part of \
+it. But when an interview, statement, deposition or report recounts an EARLIER occurrence \
+(what happened at the incident, on the flight, at a meeting), each significant step of that \
+account (an action, decision, maneuver, warning, injury or statement made then) is its own \
+fact about that occurrence, dated by its own time reference; if it has none, use the phrase \
+that ties it to the occurrence as its date_text ("during the accident flight", "at the time \
+of the collision"), never the interview's or report's own date.
+- For an incident or accident, include each step of its sequence from start to finish (the \
+departure or arrival, communications, maneuvers, warnings, the impact, and the response \
+afterwards), not only the climax.
 - A sentence that links occurrences at DIFFERENT times gives one fact each (e.g. notice \
 received on one date that a suit was filed on an earlier date: two facts).
 - Include occurrences dated only relatively or vaguely ("three weeks later", "that evening", \
@@ -34,7 +42,8 @@ letter or email announces it (the message date is not its date). Setting a date 
 larger communication is part of that communication's fact, not a separate fact.
 - Skip biographical background (job tenure, education) and undated generalities unless they \
 are part of the dispute. An undated fact is allowed only when it is legally significant and \
-the excerpt gives no time reference for it at all.
+the excerpt gives no time reference for it at all (a step of a recounted occurrence is never \
+a generality: tie it to that occurrence as above).
 
 Fields:
 1. "title": a short, neutral headline (about 6 to 14 words): who did what to whom, plus the \

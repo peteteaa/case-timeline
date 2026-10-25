@@ -308,3 +308,22 @@ def test_live_extraction_quotes_are_verbatim() -> None:
     for d in verified:
         for s in d.spans:
             assert TEXT[s.char_start : s.char_end] == s.quote
+
+
+@pytest.mark.parametrize("placeholder", ["no date", "N/A", "unknown", "(no date given)", "none"])
+def test_placeholder_date_text_means_no_date(fake_llm, placeholder: str) -> None:
+    _, responses = fake_llm
+    responses.append(
+        ExtractionResult(
+            facts=[
+                ExtractedFact(
+                    title="Smith emails Doe",
+                    date_text=placeholder,
+                    quotes=["Two days after the meeting, Smith emailed Jane Doe"],
+                    confidence=1.0,
+                )
+            ]
+        )
+    )
+    (d,) = draft_facts(make_parsed(TEXT))
+    assert d.date_text is None and d.confidence == 1.0  # no "uncopied date" penalty either
