@@ -57,6 +57,9 @@ class Event(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     status: EventStatus = EventStatus.PROPOSED
     deadline_relevant: bool = False  # always surfaced as "needs attorney review"
+    # How central the event is to the case: 0 = trivial, 1 = central. Added after day 0 with a
+    # default so older rows and payloads still load.
+    importance: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class Contradiction(BaseModel):

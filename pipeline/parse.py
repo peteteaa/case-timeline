@@ -17,7 +17,9 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import unicodedata
+from collections import Counter
 from datetime import date
 from email.message import EmailMessage, Message
 from email.utils import parsedate_to_datetime
@@ -155,31 +157,63 @@ def _join_pages(page_texts: list[str]) -> tuple[str, list[Page]]:
     return "".join(parts), pages
 
 
+_TRUE = {"1", "true", "yes"}
+
+
 def _docling_enabled() -> bool:
-    return os.environ.get("CT_DISABLE_DOCLING", "").lower() not in {"1", "true", "yes"}
+    return os.environ.get("CT_DISABLE_DOCLING", "").lower() not in _TRUE
+
+
+def _docling_ocr_enabled() -> bool:
+    """Docling's own OCR is off unless ``CT_DOCLING_OCR`` is set.
+
+    On scans that carry a text layer it replaced good text-layer lines with garbled OCR, it
+    left many image-only pages empty, and it was slow; image-only pages are OCR'd by
+    ``_ocr_pages`` instead.
+    """
+    return os.environ.get("CT_DOCLING_OCR", "").lower() in _TRUE
 
 
 class NeedsOCRError(RuntimeError):
-    """A PDF has no usable text layer and no OCR engine is available to read it."""
+    """A PDF has no usable text layer and no OCR engine could read it."""
 
 
 _docling_lock = threading.Lock()
 _docling_converter: Any = None
 
 
+def _new_docling_converter() -> Any:
+    from docling.document_converter import DocumentConverter  # type: ignore[import-not-found]
+
+    try:
+        from docling.datamodel.base_models import InputFormat  # type: ignore[import-not-found]
+        from docling.datamodel.pipeline_options import (  # type: ignore[import-not-found]
+            PdfPipelineOptions,
+        )
+        from docling.document_converter import PdfFormatOption  # type: ignore[import-not-found]
+
+        options = PdfPipelineOptions(do_ocr=_docling_ocr_enabled())
+        return DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
+        )
+    except (ImportError, TypeError, ValueError):  # older/newer Docling API: its defaults
+        log.debug("docling pipeline options unavailable; using defaults", exc_info=True)
+        return DocumentConverter()
+
+
 def _parse_pdf_docling(path: Path) -> list[str] | None:
-    """Per-page markdown via Docling (which OCRs scanned pages if it can), else None."""
+    """Per-page markdown via Docling, else None."""
     global _docling_converter
     if not _docling_enabled():
         return None
     try:
-        from docling.document_converter import DocumentConverter  # type: ignore[import-not-found]
+        import docling.document_converter  # type: ignore[import-not-found]  # noqa: F401
     except ImportError:
         return None
     try:
         with _docling_lock:  # the converter loads models once; reuse it
             if _docling_converter is None:
-                _docling_converter = DocumentConverter()
+                _docling_converter = _new_docling_converter()
             result = _docling_converter.convert(str(path))
         ddoc = result.document
         n = len(ddoc.pages)
@@ -188,6 +222,58 @@ def _parse_pdf_docling(path: Path) -> list[str] | None:
         log.warning("docling failed on %s; falling back to PyMuPDF", path.name, exc_info=True)
         return None
     return pages if any(p.strip() for p in pages) else None
+
+
+_DOCLING_MIN_AGREEMENT = 0.95  # share of words Docling and the text layer must have in common
+_IMAGE_PLACEHOLDER_RE = re.compile(r"<!--\s*image\s*-->")
+
+
+def _word_counts(text: str) -> Counter[str]:
+    return Counter(re.findall(r"[^\W_]{2,}", _IMAGE_PLACEHOLDER_RE.sub(" ", text).lower()))
+
+
+def _docling_agrees(docling: list[str], layer: list[str]) -> bool:
+    """True if Docling kept every text-layer page's words, on the same page, and added none.
+
+    Docling can drop or garble text-layer lines and move a paragraph that runs over a page
+    break onto the previous page, which would lose evidence or put quotes on the wrong page.
+    Pages without a text layer are not compared.
+    """
+    if len(docling) != len(layer):
+        return False
+    for d, t in zip(docling, layer, strict=True):
+        if _meaningful_chars(t) < _MIN_PAGE_CHARS:
+            continue
+        a, b = _word_counts(t), _word_counts(d)
+        common = sum((a & b).values())
+        need = _DOCLING_MIN_AGREEMENT * max(a.total(), b.total())
+        if common < need:
+            return False
+    return True
+
+
+def _pdf_page_texts(path: Path, data: bytes) -> list[str]:
+    """Per-page text: Docling when it is faithful to the text layer, else PyMuPDF's layout.
+
+    Docling is skipped for PDFs with no text layer at all unless its own OCR is enabled.
+    """
+    layer = _parse_pdf_pymupdf(data)
+    has_layer = any(_meaningful_chars(t) >= _MIN_PAGE_CHARS for t in layer)
+    if not (has_layer or _docling_ocr_enabled()):
+        return layer
+    docling = _parse_pdf_docling(path)
+    if not docling:
+        return layer
+    if _docling_agrees(docling, layer):
+        return docling
+    log.info("%s: Docling text disagrees with the text layer; using PyMuPDF", path.name)
+    if len(docling) != len(layer):
+        return layer
+    # Keep what Docling read (OCR) on pages that have no text layer.
+    return [
+        d if _meaningful_chars(t) < _MIN_PAGE_CHARS <= _meaningful_chars(d) else t
+        for d, t in zip(docling, layer, strict=True)
+    ]
 
 
 # ---- PyMuPDF: rebuild visual rows so labels, values and transcript columns stay together
@@ -271,10 +357,15 @@ def _parse_pdf_pymupdf(data: bytes) -> list[str]:
         return [_page_text_rows(page) for page in pdf]
 
 
-# ---- OCR for pages without a text layer
+# ---- OCR for pages without a (usable) text layer
 
 _MIN_PAGE_CHARS = 20  # fewer alphanumerics than this (after redaction marks): no text layer
+_LOW_YIELD_RATIO = 0.25  # an image page yielding under this share of the doc median is re-read
+_MIN_OCR_CONFIDENCE = 0.6  # confident, upright characters per character read, below: retry
 _OCR_DPI = 300
+_OCR_RETRY_DPI = 400
+_OCR_ROTATIONS = (90, 180, 270)  # tried, besides upright, on pages that read poorly
+_OCR_MAX_PIXELS = 5000  # longest side of a rendered page, whatever the DPI
 _OCR_TIMEOUT = 180  # seconds per page
 
 
@@ -304,6 +395,26 @@ def ocr_engine() -> str | None:
 
 
 _ocr_models: dict[str, Any] = {}
+_ocr_lock = threading.Lock()
+
+
+class OcrText(str):
+    """OCR output text carrying a quality ``score``.
+
+    The score counts characters read with confidence in upright (horizontal) lines, so
+    the right page orientation scores highest. Plain strings score their character count.
+    """
+
+    score: float
+
+    def __new__(cls, text: str, score: float | None = None) -> OcrText:
+        obj = super().__new__(cls, text)
+        obj.score = float(_meaningful_chars(text) if score is None else score)
+        return obj
+
+
+def _ocr_score(text: str) -> float:
+    return text.score if isinstance(text, OcrText) else float(_meaningful_chars(text))
 
 
 def _boxes_to_text(items: list[tuple[float, float, float, str]]) -> str:
@@ -317,7 +428,39 @@ def _boxes_to_text(items: list[tuple[float, float, float, str]]) -> str:
     return "\n".join(" ".join(t for _, t in sorted(r[2])) for r in rows)
 
 
+def _ocr_results(png: bytes, engine: str) -> list[tuple[Any, str, float]]:
+    """(box corner points, text, confidence) for each line the engine read."""
+    with _ocr_lock:  # models load once and are not documented as thread-safe
+        if engine in {"rapidocr_onnxruntime", "rapidocr"}:
+            if engine not in _ocr_models:
+                mod = __import__(engine, fromlist=["RapidOCR"])
+                _ocr_models[engine] = mod.RapidOCR()
+            # The line-orientation classifier flips some upright lines and garbles them
+            # ("NOTIFICATION, INVESTIGATION, ..." read as "NOT I  I -  A IOSE"); upside-down
+            # pages are handled by reading the whole page turned instead.
+            try:
+                out = _ocr_models[engine](png, use_cls=False)
+            except TypeError:  # an engine version without the switch
+                out = _ocr_models[engine](png)
+            if isinstance(out, tuple):  # rapidocr_onnxruntime: ([[box, text, score], ...], t)
+                return [(r[0], str(r[1]), float(r[2])) for r in (out[0] or [])]
+            boxes = out.boxes if out.boxes is not None else []  # rapidocr >= 2
+            scores = out.scores if out.scores is not None else [1.0] * len(boxes)
+            return [
+                (b, str(t), float(s))
+                for b, t, s in zip(boxes, out.txts or (), scores, strict=False)
+            ]
+        if engine == "easyocr":
+            if engine not in _ocr_models:
+                import easyocr  # type: ignore[import-not-found]
+
+                _ocr_models[engine] = easyocr.Reader(["en"], gpu=False, verbose=False)
+            return [(r[0], str(r[1]), float(r[2])) for r in _ocr_models[engine].readtext(png)]
+    raise ValueError(f"unknown OCR engine {engine}")
+
+
 def _ocr_png(png: bytes, engine: str) -> str:
+    """OCR one rendered page; returns an ``OcrText`` (a str with a quality score)."""
     if engine == "tesseract":
         proc = subprocess.run(
             ["tesseract", "stdin", "stdout", "--psm", "6"],
@@ -327,75 +470,141 @@ def _ocr_png(png: bytes, engine: str) -> str:
             check=True,
         )
         return proc.stdout.decode("utf-8", "replace")
-    if engine in {"rapidocr_onnxruntime", "rapidocr"}:
-        if engine not in _ocr_models:
-            mod = __import__(engine, fromlist=["RapidOCR"])
-            _ocr_models[engine] = mod.RapidOCR()
-        out = _ocr_models[engine](png)
-        if isinstance(out, tuple):  # rapidocr_onnxruntime: ([[box, text, score], ...], elapse)
-            results = [(r[0], r[1]) for r in (out[0] or [])]
-        else:  # rapidocr >= 2: object with .boxes / .txts
-            boxes = out.boxes if out.boxes is not None else []
-            results = list(zip(boxes, out.txts or (), strict=False))
-    elif engine == "easyocr":
-        if engine not in _ocr_models:
-            import easyocr  # type: ignore[import-not-found]
-
-            _ocr_models[engine] = easyocr.Reader(["en"], gpu=False, verbose=False)
-        results = [(r[0], r[1]) for r in _ocr_models[engine].readtext(png)]
-    else:
-        raise ValueError(f"unknown OCR engine {engine}")
     items = []
-    for box, text in results:
-        ys = [float(pt[1]) for pt in box]
+    score = 0.0
+    for box, text, conf in _ocr_results(png, engine):
         xs = [float(pt[0]) for pt in box]
-        items.append((min(xs), (min(ys) + max(ys)) / 2, max(ys) - min(ys), str(text)))
-    return _boxes_to_text(items)
+        ys = [float(pt[1]) for pt in box]
+        width, height = max(xs) - min(xs), max(ys) - min(ys)
+        items.append((min(xs), (min(ys) + max(ys)) / 2, height, text))
+        if width >= height:  # sideways lines mean the page is probably turned
+            score += conf * sum(ch.isalnum() for ch in text)
+    return OcrText(_boxes_to_text(items), score)
 
 
-def _ocr_missing_pages(data: bytes, page_texts: list[str], name: str) -> list[str]:
-    """OCR pages that have (almost) no text; raise NeedsOCRError if nothing is readable."""
+def _render_png(page: Any, dpi: int, rotation: int = 0) -> bytes:
     import pymupdf
 
-    missing = [i for i, t in enumerate(page_texts) if _meaningful_chars(t) < _MIN_PAGE_CHARS]
-    if not missing:
+    longest = max(page.rect.width, page.rect.height, 1.0) / 72  # inches
+    zoom = min(dpi, _OCR_MAX_PIXELS / longest) / 72
+    matrix = pymupdf.Matrix(zoom, zoom)
+    if rotation:
+        matrix = matrix.prerotate(rotation)
+    return page.get_pixmap(matrix=matrix).tobytes("png")
+
+
+def _ocr_page(page: Any, engine: str, dpi: int, rotation: int, name: str) -> str:
+    try:
+        return _ocr_png(_render_png(page, dpi, rotation), engine)
+    except Exception:
+        log.warning(
+            "OCR (%s) failed on %s page %d (%d dpi, %d deg)",
+            engine,
+            name,
+            page.number + 1,
+            dpi,
+            rotation,
+            exc_info=True,
+        )
+        return ""
+
+
+def _reads_poorly(text: str, floor: float) -> bool:
+    score = _ocr_score(text)
+    return score < floor or score < _MIN_OCR_CONFIDENCE * _meaningful_chars(text)
+
+
+def _median(values: list[float]) -> float:
+    vals = sorted(values)
+    if not vals:
+        return 0.0
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
+
+
+def _ocr_pages(data: bytes, page_texts: list[str], name: str) -> list[str]:
+    """OCR scanned pages whose text is missing or far below the rest of the document.
+
+    A page is a candidate if it carries an image and yields fewer than ``_MIN_PAGE_CHARS``
+    characters, or under ``_LOW_YIELD_RATIO`` of the document's median page. Candidates are
+    read upright at ``_OCR_DPI``; image-only pages that still read poorly (little or
+    low-confidence text, or sideways lines) are read again at ``_OCR_RETRY_DPI`` and turned
+    90/180/270 degrees, keeping the best-scoring reading. A page with some text layer keeps
+    it unless OCR reads clearly more. Raises ``NeedsOCRError`` if the document has
+    no readable text at all.
+    """
+    import pymupdf
+
+    yields = [_meaningful_chars(t) for t in page_texts]
+    text_median = _median([y for y in yields if y >= _MIN_PAGE_CHARS])
+    low = max(_MIN_PAGE_CHARS, _LOW_YIELD_RATIO * text_median)
+    if all(y >= low for y in yields):
         return page_texts
     with pymupdf.open(stream=data, filetype="pdf") as pdf:
-        # Only pages carrying an image can be scans; blank or short pages are left alone.
-        missing = [i for i in missing if i < len(pdf) and pdf[i].get_images(full=True)]
-        if not missing:
+        # Only pages carrying an image can be scans; blank or short text pages are left alone.
+        todo = [
+            i
+            for i, y in enumerate(yields)
+            if y < low and i < len(pdf) and pdf[i].get_images(full=True)
+        ]
+        if not todo:
             return page_texts
         engine = ocr_engine()
         out = list(page_texts)
         if engine:
-            for i in missing:
-                try:
-                    pix = pdf[i].get_pixmap(dpi=_OCR_DPI)
-                    out[i] = _ocr_png(pix.tobytes("png"), engine)
-                except Exception:
-                    log.warning("OCR (%s) failed on %s page %d", engine, name, i + 1, exc_info=True)
-            log.info("%s: OCR'd %d page(s) with %s", name, len(missing), engine)
-            still = [i for i in missing if _meaningful_chars(out[i]) < _MIN_PAGE_CHARS]
-        else:
-            still = missing
+            started = time.monotonic()
+            read = {i: _ocr_page(pdf[i], engine, _OCR_DPI, 0, name) for i in todo}
+            # Judge each reading against the document's typical page, OCR'd pages included.
+            median = _median(
+                [_ocr_score(read[i]) if i in read else y for i, y in enumerate(yields)]
+            )
+            floor = max(_MIN_PAGE_CHARS, _LOW_YIELD_RATIO * median)
+            # Text-layer pages were only checked for missing scanned text: one reading.
+            retried = [
+                i for i in todo if yields[i] < _MIN_PAGE_CHARS and _reads_poorly(read[i], floor)
+            ]
+            for i in retried:
+                tries = [(_OCR_RETRY_DPI, 0)] + [(_OCR_DPI, r) for r in _OCR_ROTATIONS]
+                for dpi, rot in tries:
+                    text = _ocr_page(pdf[i], engine, dpi, rot, name)
+                    if _ocr_score(text) > _ocr_score(read[i]):
+                        read[i] = text
+            for i in todo:
+                # A page with some text layer keeps it unless OCR reads clearly more.
+                if yields[i] < _MIN_PAGE_CHARS or _ocr_score(read[i]) > 2 * yields[i] + low:
+                    out[i] = str(read[i])
+            log.info(
+                "%s: OCR (%s) of %d page(s) in %.1f s; %d re-read at %d dpi / turned; "
+                "chars per page %s",
+                name,
+                engine,
+                len(todo),
+                time.monotonic() - started,
+                len(retried),
+                _OCR_RETRY_DPI,
+                ", ".join(f"p{i + 1}: {yields[i]}->{_meaningful_chars(out[i])}" for i in todo),
+            )
+        still = [i for i in todo if _meaningful_chars(out[i]) < _MIN_PAGE_CHARS]
     total = len(page_texts)
     if total and sum(_meaningful_chars(t) for t in out) < _MIN_PAGE_CHARS:
+        tried = (
+            f"OCR ({engine}, {_OCR_DPI} and {_OCR_RETRY_DPI} dpi, 4 orientations) found no "
+            "readable text; the pages may be blank, handwritten or too faint"
+            if engine
+            else "no OCR engine available (install the tesseract-ocr binary, the "
+            "rapidocr-onnxruntime or easyocr Python package, or the docling extra)"
+        )
         raise NeedsOCRError(
-            f"needs OCR, no text layer: {total} of {total} pages are scanned images with no "
-            "extractable text"
-            + (
-                f" and OCR ({engine}) returned nothing"
-                if engine
-                else "; no OCR engine available (install the tesseract-ocr binary, the "
-                "rapidocr-onnxruntime or easyocr Python package, or the docling extra)"
-            )
+            f"needs OCR, no text layer: {len(still)} of {total} pages are scanned images with "
+            f"no extractable text; {tried}"
         )
     if still:
         log.warning(
-            "%s: %d of %d pages have no text layer and were not OCR'd (pages %s)",
+            "%s: %d of %d pages have no text layer and %s (pages %s)",
             name,
             len(still),
             total,
+            "OCR found no readable text on them" if engine else "were not OCR'd",
             ", ".join(str(i + 1) for i in still[:20]),
         )
     return out
@@ -691,8 +900,7 @@ def parse(doc: Document) -> ParsedDocument:
     if not data:  # zero-byte file: nothing to parse (and not a corrupt PDF/DOCX)
         text = ""
     elif ext == ".pdf":
-        page_texts = _parse_pdf_docling(path) or _parse_pdf_pymupdf(data)
-        page_texts = _ocr_missing_pages(data, page_texts, doc.filename)
+        page_texts = _ocr_pages(data, _pdf_page_texts(path, data), doc.filename)
         text, pages = _join_pages(_clean_pdf_pages(page_texts))
         doc = doc.model_copy(update={"num_pages": len(pages)})
     elif ext == ".docx":

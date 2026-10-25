@@ -6,6 +6,10 @@ Gold file format (``eval/gold/<case>.json``): a list of
 Predictions come from the Store (``settings.db_path``) or, with ``--pred-json``,
 from a JSON file holding a list of ``Event`` objects (or ``{"events": [...]}``).
 
+Precision/recall are also reported for key events only (``importance >=
+KEY_EVENT_THRESHOLD``, the timeline's default view), so noise reduction is measurable; the
+gold chronology is scored in full against that subset.
+
 Contradictions are scored too when ``eval/gold/<case>_contradictions.json`` exists: a list of
 ``{"id", "field": "date"|"actor"|"fact", "planted": bool, "sides": [{"doc": ...}, ...]}``.
 A predicted contradiction matches a gold one when the fields agree and the documents of its
@@ -36,6 +40,7 @@ log = logging.getLogger(__name__)
 GOLD_DIR = Path(__file__).resolve().parent / "gold"
 DESC_THRESHOLD = 60.0
 ACTOR_BONUS = 20.0  # bonus added at full actor overlap
+KEY_EVENT_THRESHOLD = 0.6  # same as pipeline.store.KEY_EVENT_THRESHOLD (checked by a test)
 
 
 @dataclass(frozen=True)
@@ -53,6 +58,8 @@ class Pred:
     description: str
     doc: str
     event_id: str = ""
+    importance: float = 0.5
+    duplicate: bool = False  # linked duplicate (hidden on the timeline)
 
 
 @dataclass
@@ -140,11 +147,12 @@ class EvalResult:
     date_correct: int = 0
     per_doc: dict[str, dict[str, Any]] = field(default_factory=dict)
     contradictions: ContradictionResult | None = None
+    n_duplicates: int = 0  # predictions that are linked duplicates (hidden on the timeline)
+    key_events: dict[str, Any] | None = None  # the same scores over key events only
 
-    def as_dict(self) -> dict[str, Any]:
+    def summary(self) -> dict[str, Any]:
+        """Headline numbers (no per-match details)."""
         return {
-            "case_id": self.case_id,
-            "n_gold": self.n_gold,
             "n_pred": self.n_pred,
             "n_matched": len(self.matches),
             "precision": self.precision,
@@ -153,6 +161,24 @@ class EvalResult:
             "date_accuracy": self.date_accuracy,
             "date_scored": self.date_scored,
             "date_correct": self.date_correct,
+            "unmatched_gold": self.unmatched_gold,
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "case_id": self.case_id,
+            "n_gold": self.n_gold,
+            "n_pred": self.n_pred,
+            "n_duplicates": self.n_duplicates,
+            "n_timeline": self.n_pred - self.n_duplicates,
+            "n_matched": len(self.matches),
+            "precision": self.precision,
+            "recall": self.recall,
+            "f1": self.f1,
+            "date_accuracy": self.date_accuracy,
+            "date_scored": self.date_scored,
+            "date_correct": self.date_correct,
+            "key_events": self.key_events,
             "per_doc": self.per_doc,
             "matches": self.matches,
             "unmatched_gold": self.unmatched_gold,
@@ -197,8 +223,13 @@ def load_gold(path: Path) -> list[GoldEvent]:
     ]
 
 
-def events_to_preds(events: Sequence[Event], doc_names: dict[str, str] | None = None) -> list[Pred]:
-    """Convert Events to scoring records; ``doc_names`` maps doc_id -> filename."""
+def events_to_preds(
+    events: Sequence[Event],
+    doc_names: dict[str, str] | None = None,
+    duplicate_ids: set[str] | frozenset[str] = frozenset(),
+) -> list[Pred]:
+    """Convert Events to scoring records; ``doc_names`` maps doc_id -> filename and
+    ``duplicate_ids`` are the linked duplicates among them."""
     names = doc_names or {}
     return [
         Pred(
@@ -207,6 +238,8 @@ def events_to_preds(events: Sequence[Event], doc_names: dict[str, str] | None = 
             description=ev.description,
             doc=names.get(ev.source.doc_id, ev.source.doc_id),
             event_id=ev.id,
+            importance=ev.importance,
+            duplicate=ev.id in duplicate_ids,
         )
         for ev in events
     ]
@@ -251,6 +284,19 @@ def load_store_events(
     else:
         events = list(store.list_events(case_id))
     return events, _doc_names(store, case_id)
+
+
+def load_store_duplicate_ids(case_id: str) -> set[str]:
+    """Ids of the stored events that are linked duplicates (hidden on the timeline)."""
+    from pipeline.config import get_settings
+    from pipeline.store import Store
+
+    db_path = Path(get_settings().db_path)
+    if not db_path.exists():
+        return set()
+    store = Store(db_path)
+    every = {e.id for e in store.list_events(case_id, include_duplicates=True)}
+    return every - {e.id for e in store.list_events(case_id)}
 
 
 def load_store_contradictions(case_id: str) -> tuple[list[Contradiction], list[Event]]:
@@ -414,10 +460,35 @@ def match(
     return out
 
 
-def score(case_id: str, gold: Sequence[GoldEvent], preds: Sequence[Pred]) -> EvalResult:
-    """Compute precision/recall/F1, date accuracy and a per-doc breakdown."""
+def score(
+    case_id: str,
+    gold: Sequence[GoldEvent],
+    preds: Sequence[Pred],
+    *,
+    key_threshold: float | None = KEY_EVENT_THRESHOLD,
+) -> EvalResult:
+    """Compute precision/recall/F1, date accuracy and a per-doc breakdown.
+
+    With ``key_threshold``, ``key_events`` holds the same headline scores computed over the
+    predictions whose importance reaches it (against the full gold list).
+    """
+    res = _score(case_id, gold, preds)
+    if key_threshold is not None:
+        key_preds = [p for p in preds if p.importance >= key_threshold]
+        key = _score(case_id, gold, key_preds)
+        res.key_events = {
+            "threshold": key_threshold,
+            **key.summary(),
+            "n_duplicates": sum(p.duplicate for p in key_preds),
+            "n_timeline": sum(not p.duplicate for p in key_preds),
+        }
+    return res
+
+
+def _score(case_id: str, gold: Sequence[GoldEvent], preds: Sequence[Pred]) -> EvalResult:
     pairs = match(gold, preds)
     res = EvalResult(case_id=case_id, n_gold=len(gold), n_pred=len(preds))
+    res.n_duplicates = sum(p.duplicate for p in preds)
     res.precision = _ratio(len(pairs), len(preds))
     res.recall = _ratio(len(pairs), len(gold))
     res.f1 = _f1(res.precision, res.recall)
@@ -462,9 +533,22 @@ def format_table(res: EvalResult) -> str:
     """Render a plain-text summary table."""
     da = "n/a" if res.date_accuracy is None else f"{res.date_accuracy:.3f}"
     lines = [
-        f"Case: {res.case_id}   gold={res.n_gold}  pred={res.n_pred}  matched={len(res.matches)}",
-        f"precision={res.precision:.3f}  recall={res.recall:.3f}  f1={res.f1:.3f}  "
+        f"Case: {res.case_id}   gold={res.n_gold}  pred={res.n_pred} "
+        f"(timeline {res.n_pred - res.n_duplicates}, linked duplicates {res.n_duplicates})  "
+        f"matched={len(res.matches)}",
+        f"all events: precision={res.precision:.3f}  recall={res.recall:.3f}  f1={res.f1:.3f}  "
         f"date_acc={da} ({res.date_correct}/{res.date_scored})",
+    ]
+    if res.key_events is not None:
+        k = res.key_events
+        kda = "n/a" if k["date_accuracy"] is None else f"{k['date_accuracy']:.3f}"
+        lines.append(
+            f"key events (importance >= {k['threshold']:g}): pred={k['n_pred']} "
+            f"(timeline {k['n_timeline']})  matched={k['n_matched']}  "
+            f"precision={k['precision']:.3f}  recall={k['recall']:.3f}  f1={k['f1']:.3f}  "
+            f"date_acc={kda} ({k['date_correct']}/{k['date_scored']})"
+        )
+    lines += [
         "",
         f"{'doc':<40} {'gold':>5} {'pred':>5} {'match':>5} {'P':>6} {'R':>6} {'F1':>6}",
         "-" * 78,
@@ -521,11 +605,14 @@ def run(
     gold_path = gold_path or GOLD_DIR / f"{case_id}.json"
     gold = load_gold(gold_path)
     names: dict[str, str] = {}
+    dup_ids: set[str] = set()
     if pred_json is not None:
         events = load_pred_json(pred_json)
     else:
         events, names = load_store_events(case_id, include_duplicates=include_duplicates)
-    preds = events_to_preds(events, names)
+        if include_duplicates:
+            dup_ids = load_store_duplicate_ids(case_id)
+    preds = events_to_preds(events, names, dup_ids)
     res = score(case_id, gold, preds)
     if contradictions_path.exists():
         gold_c = load_gold_contradictions(contradictions_path)

@@ -22,6 +22,9 @@ HEAD_CHARS = 600  # start of the document shown as context for later chunks
 # extraction latency; enable when recall matters more than scan time.
 GLEAN_PASSES = 0
 UNCOPIED_DATE_PENALTY = 0.8  # date_text not found in the excerpt (model computed it)
+# Deadline-relevant events always need attorney review, so they are never rated below the
+# key-event level (pipeline.store.KEY_EVENT_THRESHOLD) and never hidden by the key filter.
+DEADLINE_MIN_IMPORTANCE = 0.6
 
 _WS = re.compile(r"\s+")
 
@@ -39,6 +42,12 @@ class ExtractedEvent(BaseModel):
         description="One short neutral sentence: who did what to whom (no date or location)."
     )
     deadline_relevant: bool = False
+    importance: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="0 to 1: how central the event is to the case (1 = the central occurrence).",
+    )
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
 
 
@@ -170,7 +179,13 @@ def _to_event(
         confidence=confidence,
         status=EventStatus.PROPOSED,
         deadline_relevant=item.deadline_relevant,
+        importance=_importance(item),
     )
+
+
+def _importance(item: ExtractedEvent) -> float:
+    value = min(1.0, max(0.0, item.importance))
+    return max(value, DEADLINE_MIN_IMPORTANCE) if item.deadline_relevant else value
 
 
 def _merge_dup(a: Event, b: Event) -> Event:
@@ -187,6 +202,7 @@ def _merge_dup(a: Event, b: Event) -> Event:
             "actors": actors,
             "confidence": max(a.confidence, b.confidence),
             "deadline_relevant": a.deadline_relevant or b.deadline_relevant,
+            "importance": max(a.importance, b.importance),
         }
     )
 

@@ -10,11 +10,13 @@
     <div class="badges">{% include "_badges.html" %}</div>
   </td>
   <td><a href="{{ source_url(e) }}">Source{% if e.source.page %} p.{{ e.source.page }}{% endif %}</a>
-      <div class="muted small">conf {{ '%.2f' | format(e.confidence) }}</div></td>
+      <div class="muted small">conf {{ '%.2f' | format(e.confidence) }}</div>
+      <div class="muted small" title="How central the event is to the case (0 to 1)">importance {{ '%.2f' | format(e.importance) }}</div></td>
   <td class="review">
     <span class="state state-{{ e.status.value }}">{{ e.status.value }}</span>
     <form method="post" action="/events/{{ e.id | urlencode }}/status" class="inline"
           hx-post="/events/{{ e.id | urlencode }}/status" hx-target="closest tr" hx-swap="outerHTML">
+      <input type="hidden" name="view" value="{{ view | default('key') }}">
       <button class="btn small ok" name="status" value="accepted" {% if e.status.value == 'accepted' %}disabled{% endif %}>Accept</button>
       <button class="btn small danger" name="status" value="rejected" {% if e.status.value == 'rejected' %}disabled{% endif %}>Reject</button>
     </form>

@@ -1,7 +1,9 @@
 """Resolve free-text dates on events into date ranges with an honest certainty level.
 
 Precision is never invented: a month-only date becomes the whole month (APPROXIMATE), a
-season becomes the season's months, and an unparseable date stays UNKNOWN with no dates.
+season becomes the season's months, a year-only date the whole year, and an unparseable date
+stays UNKNOWN with no dates. A time stated explicitly in UTC ("2316 UTC", "0016Z") is
+converted to the case's time zone (``tz``) before its calendar day is taken.
 """
 
 from __future__ import annotations
@@ -11,7 +13,8 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import dateparser
 from dateutil.relativedelta import relativedelta
@@ -74,6 +77,14 @@ _OPEN_BOUND = re.compile(
     r"^(?:shortly |soon |immediately |just |right |sometime |some time |not long |well )?"
     r"(before|after|prior to|since|until|till|following|preceding|up to|subsequent to)\s+(.+)$"
 )
+# A start point: "since 2006", "from 2006", "starting in 2006", "beginning in March 2007"
+# ("beginning of March 2024" is the first part of March, not a start point).
+_START_BOUND = re.compile(r"^(since|from|starting(?:\s+in)?|beginning\s+in)\s+(.+)$")
+
+
+def _open_ended(cleaned: str) -> bool:
+    """`cleaned` is an open bound ("since 2006", "before March 3, 2024"), not a period."""
+    return bool(_OPEN_BOUND.match(cleaned) or _START_BOUND.match(cleaned))
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -144,13 +155,19 @@ def _sub_times(s: str) -> tuple[str, bool]:
 _TIME_JOINERS = re.compile(r"\b(?:or|to|and|until|till|through|between|from)\b")
 
 
+def _split_zones(s: str) -> str:
+    """Separate one time given in two zones ("2316 utc/1816 cdt") so both read as times."""
+    return re.sub(r"(?<=[a-z])/(?=\d)", " / ", s)
+
+
 def _is_time_only(s: str) -> bool:
     """`s` (already cleaned) states only a time of day, no date ("at 1405:12", "6:40 pm",
-    "about 2:30 or 3:00")."""
+    "about 2:30 or 3:00", "2316:19 utc/1816:19 cdt")."""
+    s = _split_zones(s)
     rest, _ = _sub_times(s)
-    if rest.strip(" ,;:-") and rest != s:  # "2:30 or 3:00", "between 3 pm and 5 pm"
+    if rest.strip(" ,;:-/") and rest != s:  # "2:30 or 3:00", "between 3 pm and 5 pm"
         rest = _TIME_JOINERS.sub(" ", rest)
-    return bool(s) and not rest.strip(" ,;:-") and s.strip() != ""
+    return bool(s) and not rest.strip(" ,;:-/") and s.strip() != ""
 
 
 def _has_time(s: str) -> bool:
@@ -169,13 +186,65 @@ def _strip_time(s: str) -> tuple[str, bool]:
     ("around 3pm"), which keeps the date APPROXIMATE rather than EXACT.
     """
     s = re.sub(r"(\d)t(?=\d{1,2}:\d{2})", r"\1 ", s)  # ISO 8601 "2021-06-05T09:30"
-    out, approx = _sub_times(s)
+    out, approx = _sub_times(_split_zones(s))
     if re.search(r"\d", out):  # never reduce "this morning" to "this"
         out = _DAY_PART_PREFIX.sub("", out.strip())
         out = _DAY_PART_SUFFIX.sub("", out)
-    out = re.sub(r"\s+", " ", out).strip(" ,;:-")
+    out = re.sub(r"\s+", " ", out).strip(" ,;:-/")
     out = re.sub(r"\s+(?:on|at|of)$", "", out)
     return (out, approx) if out else (s, False)
+
+
+# ------------------------------------------------------------------------- time zones
+
+# A clock time stated in UTC: "2316 utc", "2316:57 utc", "23:16z", "0016 z", "11:16 pm gmt",
+# "t00:16:00z", "00:16+00:00".
+_UTC_CLOCK = re.compile(
+    r"(?<![\d:.])(?P<h>[01]?\d|2[0-3]):?(?P<m>[0-5]\d)(?::[0-5]\d(?:\.\d+)?)?"
+    r"(?:\s*(?P<ap>[ap])\.?\s?m\b\.?)?"
+    r"\s*(?:(?:utc|gmt|zulu|z)\b(?!\s*[+-]\s*\d)|[+-]00:?00\b)"
+)
+# A local zone: abbreviations, spelled-out zones, "local", or a non-zero numeric offset.
+_LOCAL_ZONE = re.compile(
+    r"\b(?:[ecmp][sd]t|ak[sd]t|h[sd]t|local|lcl"
+    r"|(?:eastern|central|mountain|pacific|alaska|hawaii|atlantic)\s+(?:standard|daylight))\b"
+    r"|\d\s*[+-](?!00:?00\b)\d{2}:?\d{2}\b"
+)
+
+
+def case_zone(tz: str | tzinfo | None) -> tzinfo | None:
+    """The case time zone from an IANA name ("America/Chicago"); None when unset or unknown."""
+    if tz is None or isinstance(tz, tzinfo):
+        return tz
+    name = tz.strip()
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        logger.warning("unknown case time zone %r; UTC times are not converted", name)
+        return None
+
+
+def _utc_to_case_day(text: str, day: date, tz: tzinfo | None) -> date:
+    """`day` as a calendar day in the case zone `tz`, when `text` (cleaned) gives the time
+    of day explicitly in UTC/GMT/Zulu ("July 28, 2010, 0016 UTC" is July 27 in Chicago).
+
+    A local zone ("1816 cdt", "central daylight time", "local", "-0500") keeps its own date,
+    and so does text that also names one; a time with no zone is never shifted.
+    """
+    if tz is None:
+        return day
+    m = _UTC_CLOCK.search(text)
+    if m is None or _LOCAL_ZONE.search(text):
+        return day
+    hour, minute = int(m.group("h")), int(m.group("m"))
+    if m.group("ap"):
+        if hour > 12:
+            return day
+        hour = hour % 12 + (12 if m.group("ap") == "p" else 0)
+    when = datetime(day.year, day.month, day.day, hour, minute, tzinfo=UTC)
+    return when.astimezone(tz).date()
 
 
 def _last_day(y: int, m: int) -> int:
@@ -212,8 +281,14 @@ def _nearest_year(month: int, day: int, ref: date) -> date | None:
 # ----------------------------------------------------------------------- absolute dates
 
 
-def parse_absolute(text: str, ref: date | None = None) -> tuple[Span, Certainty] | None:
-    """Parse a date that needs no anchor event. `ref` only helps infer a missing year."""
+def parse_absolute(
+    text: str, ref: date | None = None, tz: str | tzinfo | None = None
+) -> tuple[Span, Certainty] | None:
+    """Parse a date that needs no anchor event. `ref` only helps infer a missing year.
+
+    With a case time zone `tz`, a single day stated with an explicit UTC time ("July 28,
+    2010, 0016 UTC") becomes that instant's calendar day in `tz`.
+    """
     cleaned = _clean(text)
     if _is_time_only(cleaned):  # "at 1729" is a time of day, never the year 1729
         return None
@@ -235,6 +310,10 @@ def parse_absolute(text: str, ref: date | None = None) -> tuple[Span, Certainty]
                     break
     if found is not None and approx_time and found[1] == Certainty.EXACT:
         found = (found[0], Certainty.APPROXIMATE)
+    zone = case_zone(tz)
+    if found is not None and zone is not None and found[0][0] == found[0][1]:
+        day = _utc_to_case_day(cleaned, found[0][0], zone)
+        found = ((day, day), found[1])
     return found
 
 
@@ -246,6 +325,17 @@ def _parse_point(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
                 return None
             span, cert = inner
             return span, Certainty.RANGE if cert == Certainty.RANGE else Certainty.APPROXIMATE
+
+    m = _START_BOUND.match(s)
+    if m:
+        inner = parse_absolute(m.group(2), ref)
+        if inner is None:
+            return None
+        (lo, hi), cert = inner
+        if lo != hi:  # "since 2006" began at some point in 2006, not on January 1
+            return (lo, hi), Certainty.APPROXIMATE if cert == Certainty.EXACT else cert
+        if m.group(1) != "since":  # "from March 3, 2024": that day
+            return inner
 
     m = _OPEN_BOUND.match(s)
     if m:
@@ -421,6 +511,10 @@ def _parse_range(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
         m = re.match(r"^(.+?)\s+(?:to|through|thru|until|till)\s+(.+)$", s)
         if m:
             pairs.append((m.group(1), m.group(2)))
+        # Alternatives span both: "May or June of 2007", "March 3 or 4, 2024".
+        m = re.match(rf"^((?:{_MONTH}|\d)[^,]*?)\s+or\s+(.+)$", s)
+        if m:
+            pairs.append((m.group(1), m.group(2)))
         numeric = re.search(r"\d{1,4}-\d{1,2}-\d{1,4}", s)
         part_prefix = re.match(r"^(?:the\s+)?(?:early|mid|middle|late)\s*-", s)
         if not numeric and not part_prefix:
@@ -551,6 +645,17 @@ _DIR_BACK = {"before", "earlier", "prior to", "ago", "beforehand", "preceding", 
 _DAY_UNITS = {"day", "morning", "afternoon", "evening", "night"}
 
 
+_PRONOUN_ANCHOR = re.compile(r"^(?:that|this|then|it|which|those|these|there|so)$")
+
+
+def _anchor_phrase(rest: str | None) -> str | None:
+    """The anchor a relative date names; None for a pronoun ("after that", "before this"),
+    which refers back to the previous event rather than naming one."""
+    if rest is None or _PRONOUN_ANCHOR.match(rest.strip()):
+        return None
+    return rest
+
+
 def parse_relative(text: str) -> RelativeSpec | None:
     """Recognize a relative date expression; None if the text is not relative."""
     s = _clean(text)
@@ -593,7 +698,7 @@ def parse_relative(text: str) -> RelativeSpec | None:
         sign = -1 if direction in _DIR_BACK else 1
         within = bool(m.group("within"))
         fuzzy = bool(m.group("qual"))
-        rest = m.group("rest")
+        rest = _anchor_phrase(m.group("rest"))
         if direction in ("later", "earlier", "ago", "thereafter", "afterwards", "afterward",
                          "beforehand", "hence", "previously"):  # fmt: skip
             rest = None
@@ -684,7 +789,9 @@ def parse_relative(text: str) -> RelativeSpec | None:
         unit = "day" if m.group("unit") in _DAY_UNITS else m.group("unit")
         d = m.group("dir")
         n = 0 if d == "of" else (-1 if d in ("before", "prior to", "preceding") else 1)
-        return RelativeSpec(lambda a, _e, n=n, u=unit: _period(a, u, n), phrase=m.group("rest"))
+        return RelativeSpec(
+            lambda a, _e, n=n, u=unit: _period(a, u, n), phrase=_anchor_phrase(m.group("rest"))
+        )
 
     m = re.match(
         r"^(?P<q>shortly|soon|immediately|right|just|directly|not long|sometime|some time)?\s*"
@@ -708,7 +815,7 @@ def parse_relative(text: str) -> RelativeSpec | None:
                 return a[0] - timedelta(days=width), a[0]
             return a[1], a[1] + timedelta(days=width)
 
-        return RelativeSpec(apply_b, phrase=m.group("rest"))
+        return RelativeSpec(apply_b, phrase=_anchor_phrase(m.group("rest")))
     return None
 
 
@@ -734,6 +841,22 @@ def _match_anchor(phrase: str, pos: int, candidates: list[tuple[int, Event]]) ->
     return best[1] if best else None
 
 
+def _waits_for_prior(
+    i: int, pool: list[int], order: list[int], pos_of: dict[int, int], ctx: _DocContext
+) -> bool:
+    """The nearest earlier event that could anchor event `i` (any of `pool`, or an earlier
+    relative event still being resolved) is still unresolved: wait for it, so "after that"
+    follows the event just before it rather than an older one."""
+    before = [j for j in order if pos_of[j] < pos_of[i]]
+    anchors = set(pool)
+    for j in reversed(before):
+        if j in ctx.waiting:
+            return True
+        if j in anchors:
+            return False
+    return False
+
+
 def _prior(pos: int, candidates: list[tuple[int, Event]]) -> Event | None:
     prior = [(cpos, ev) for cpos, ev in candidates if cpos < pos]
     return max(prior, key=lambda x: x[0])[1] if prior else None
@@ -743,7 +866,7 @@ def _single_day(ev: Event) -> bool:
     """The event is pinned to one day: not a span, and not an open bound ("since 2006")."""
     if ev.date_start is None or (ev.date_end is not None and ev.date_end != ev.date_start):
         return False
-    return not _OPEN_BOUND.match(_clean(ev.date_text))
+    return not _open_ended(_clean(ev.date_text))
 
 
 def _span_of(ev: Event) -> Span:
@@ -778,6 +901,7 @@ class _Mention:
     day: date
     timed: bool  # a time of day is stated with it ("June 5, 2021, about 0940 cdt")
     dateline: bool  # the date stands alone on its line (a letter or section date)
+    stated: date | None = None  # the day as written, before a UTC time moved it to the case zone
 
 
 @dataclass
@@ -787,6 +911,9 @@ class _DocContext:
     incident_event_id: str | None = None
     text: str = ""
     mentions: list[_Mention] = field(default_factory=list)
+    tz: tzinfo | None = None
+    heading_end: int = 0  # end of the line stating the document's own date near the top
+    waiting: set[int] = field(default_factory=set)  # relative events not yet resolved
 
 
 def _sentence_bounds(text: str, start: int, end: int) -> tuple[int, int]:
@@ -798,14 +925,14 @@ def _sentence_bounds(text: str, start: int, end: int) -> tuple[int, int]:
     return min(lo, start), (m.start() if m else end)
 
 
-def _text_mentions(text: str) -> list[_Mention]:
+def _text_mentions(text: str, tz: tzinfo | None = None) -> list[_Mention]:
     out: list[_Mention] = []
     for m in _TEXT_DATE.finditer(text):
         found = parse_absolute(m.group(0))
         if found is None or found[0][0] != found[0][1]:
             continue
         lo, hi = _sentence_bounds(text, m.start(), m.end())
-        around = (
+        around = _clean(
             text[max(lo, m.start() - _CONTEXT_CHARS) : m.start()]
             + " , "
             + text[m.end() : min(hi, m.end() + _CONTEXT_CHARS)]
@@ -814,8 +941,86 @@ def _text_mentions(text: str) -> list[_Mention]:
         line_hi = text.find("\n", m.end())
         line = text[line_lo : len(text) if line_hi < 0 else line_hi]
         dateline = not re.sub(r"[\W_]+", "", line.replace(m.group(0), ""))
-        out.append(_Mention(m.start(), m.end(), found[0][0], _has_time(_clean(around)), dateline))
+        stated = found[0][0]
+        day = _utc_to_case_day(around, stated, tz)  # "July 28, 2010, 0016 UTC"
+        out.append(_Mention(m.start(), m.end(), day, _has_time(around), dateline, stated))
     return out
+
+
+_HEADING_LINES = 25  # how far down a document's own date (its heading) is looked for
+
+
+def _heading_end(text: str, doc_date: date | None, mentions: list[_Mention]) -> int:
+    """End of the line near the top that states the document's own date, else 0.
+
+    Everything up to there is the document's heading (an interview's caption, a letter's
+    date line), not the account it goes on to give.
+    """
+    if doc_date is None or not text:
+        return 0
+    limit = 0
+    for _ in range(_HEADING_LINES):
+        nl = text.find("\n", limit)
+        if nl < 0:
+            limit = len(text)
+            break
+        limit = nl + 1
+    for m in mentions:
+        if m.pos >= limit:
+            break
+        if m.stated == doc_date or m.day == doc_date:
+            nl = text.find("\n", m.end)
+            return len(text) if nl < 0 else nl
+    return 0
+
+
+def _in_heading(ev: Event, ctx: _DocContext) -> bool:
+    return _known_pos(ev) and ev.source.char_start < ctx.heading_end
+
+
+def _own_date_heading(ev: Event, ctx: _DocContext) -> bool:
+    """An event in the document's heading dated with the document's own date (the interview
+    being held, the letter being written) in a document whose account is of an incident on
+    another day: it never anchors that account's times or "that day"."""
+    return (
+        ctx.incident is not None
+        and ctx.doc_date is not None
+        and ctx.doc_date != ctx.incident
+        and ev.date_start == ctx.doc_date
+        and _in_heading(ev, ctx)
+    )
+
+
+_INCIDENT_WORD = re.compile(r"\b(?:accident|incident|crash|collision|mishap|wreck)\b", re.I)
+
+
+def _about_an_incident(text: str, events: list[Event]) -> bool:
+    """The document refers to an incident at all (so the case's incident date can apply)."""
+    hay = text or " ".join(f"{e.description} {e.source.quote}" for e in events)
+    return bool(_INCIDENT_WORD.search(hay))
+
+
+_APPROX_BEFORE = re.compile(r"\b(?:about|around|approximately|approx|circa|roughly)\W*$", re.I)
+
+
+def _refine_from_quote(
+    ev: Event, found: tuple[Span, Certainty], tz: tzinfo | None
+) -> tuple[Span, Certainty]:
+    """A year- or month-wide date ("2010", "in July 2010") whose own quote states one full
+    date inside that period ("On July 27, 2010, ...") takes that day: a coarse date_text never
+    overrides the better date the source gives. Open bounds ("since 2006") are kept."""
+    (lo, hi), cert = found
+    if lo == hi or cert != Certainty.APPROXIMATE or _open_ended(_clean(ev.date_text)):
+        return found
+    if _TEXT_DATE.search(ev.date_text):  # "the week of March 3, 2024" names its own day
+        return found
+    quote = ev.source.quote
+    inside = [m for m in _text_mentions(quote, tz) if lo <= m.day <= hi]
+    if len({m.day for m in inside}) != 1:
+        return found
+    m = inside[0]
+    approx = _APPROX_BEFORE.search(quote[max(0, m.pos - 25) : m.pos])
+    return (m.day, m.day), Certainty.APPROXIMATE if approx else Certainty.EXACT
 
 
 def _known_pos(ev: Event) -> bool:
@@ -846,6 +1051,8 @@ def resolve_dates(
     *,
     parsed: ParsedDocument | None = None,
     incident_date: date | None = None,
+    case_incident_date: date | None = None,
+    tz: str | tzinfo | None = None,
 ) -> list[Event]:
     """Fill date_start/date_end/certainty (and anchor_event_id for anchored dates).
 
@@ -861,9 +1068,20 @@ def resolve_dates(
     "at the time of the accident" and otherwise unanchored times refer to. `incident_date`
     overrides the detected one. Days inherited this way are APPROXIMATE; a day stated in the
     same sentence as the time is EXACT.
+
+    `case_incident_date` is the incident date of the whole case (the consensus of its
+    documents). A document about an incident that never states its date itself (an interview
+    held weeks later) resolves its account ("that day", "after the show", bare times)
+    against it, while events about the document itself (the interview being held, at the
+    top of the document) keep the document's own date.
+
+    `tz` is the case time zone (IANA name): a day stated with an explicit UTC/GMT/Zulu time
+    is converted to it ("July 28, 2010, 0016 UTC" is July 27 in America/Chicago). Local
+    zones keep their own date, and times without a zone are never shifted.
     """
     if not events:
         return []
+    zone = case_zone(tz)
     if parsed is not None and incident_date is None:
         from pipeline import parse  # local import: parse pulls in heavy optional deps lazily
 
@@ -874,12 +1092,19 @@ def resolve_dates(
         by_doc.setdefault(ev.source.doc_id, []).append(i)
 
     for doc_id, idxs in by_doc.items():
-        ctx = _DocContext(doc_date=doc_date)
+        ctx = _DocContext(doc_date=doc_date, tz=zone)
         if parsed is None or parsed.doc.id == doc_id:
             ctx.incident = incident_date
         if parsed is not None and parsed.doc.id == doc_id:
             ctx.text = parsed.text
-            ctx.mentions = _text_mentions(parsed.text)
+            ctx.mentions = _text_mentions(parsed.text, zone)
+            ctx.heading_end = _heading_end(parsed.text, doc_date, ctx.mentions)
+        if (
+            ctx.incident is None
+            and case_incident_date is not None
+            and _about_an_incident(ctx.text, [out[i] for i in idxs])
+        ):
+            ctx.incident = case_incident_date
         order = sorted(idxs, key=lambda i: (out[i].source.char_start, i))
         pos_of = {i: p for p, i in enumerate(order)}
         pending: list[tuple[int, RelativeSpec]] = []
@@ -891,11 +1116,12 @@ def resolve_dates(
                 last_dated = ev.date_start
                 continue
             ref = last_dated or ctx.incident or doc_date
-            absolute = parse_absolute(ev.date_text, ref)
+            absolute = parse_absolute(ev.date_text, ref, zone)
             if absolute is not None:
-                (lo, hi), cert = absolute
+                (lo, hi), cert = _refine_from_quote(ev, absolute, zone)
                 out[i] = ev.model_copy(update={"date_start": lo, "date_end": hi, "certainty": cert})
-                last_dated = lo
+                if not _open_ended(_clean(ev.date_text)):  # "since 2006" is background
+                    last_dated = lo
                 continue
             spec = parse_relative(ev.date_text)
             if spec is not None:
@@ -915,6 +1141,7 @@ def resolve_dates(
             ]
             ctx.incident_event_id = out[stating[0]].id if stating else None
 
+        ctx.waiting = {i for i, _spec in pending}
         for final in (False, True):
             still: list[tuple[int, RelativeSpec]] = []
             for i, spec in pending:
@@ -923,6 +1150,7 @@ def resolve_dates(
                     still.append((i, spec))
                 else:
                     out[i] = resolved
+                    ctx.waiting.discard(i)
             pending = still
         for i, _spec in pending:
             out[i] = out[i].model_copy(
@@ -957,11 +1185,15 @@ def _resolve_clock(
         if same:
             m = min(same, key=lambda m: abs(m.pos - start))
             cert = Certainty.APPROXIMATE if approx_time else Certainty.EXACT
-            return (m.day, m.day), cert, _covering_event(m.pos, out, order)
+            day = m.day
+            if m.day == m.stated and not _LOCAL_ZONE.search(_clean(ctx.text[lo:hi])):
+                day = _utc_to_case_day(_clean(ev.date_text), m.day, ctx.tz)  # "at 0016 UTC"
+            return (day, day), cert, _covering_event(m.pos, out, order)
 
     # Skip the document's own date lines ("March 3, 2024" heading a letter) once the
     # document names the incident: a witness's account happened then, not when written.
     skip_datelines = ctx.incident is not None
+    narrative = not _in_heading(ev, ctx)
 
     def offset(j: int) -> int:
         return out[j].source.char_start
@@ -974,6 +1206,7 @@ def _resolve_clock(
         and pos_of[j] < pos_of[i]
         and _single_day(out[j])
         and not (skip_datelines and _is_dateline_event(out[j]))
+        and not (narrative and _own_date_heading(out[j], ctx))
     ]
     timed_ev = [
         j
@@ -988,6 +1221,8 @@ def _resolve_clock(
         and not (skip_datelines and (m.dateline or m.day == ctx.doc_date != ctx.incident))
     ]
 
+    if not final and _waits_for_prior(i, events, order, pos_of, ctx):
+        return None
     for ev_pool, m_pool in ((timed_ev, [m for m in mentions if m.timed]), (events, mentions)):
         best_ev = max(ev_pool, key=lambda j: (offset(j), pos_of[j])) if ev_pool else None
         best_m = max(m_pool, key=lambda m: m.pos) if m_pool else None
@@ -1027,6 +1262,10 @@ def _resolve_relative(
         )
 
     candidates = [(pos_of[j], out[j]) for j in order if j != i and out[j].date_start is not None]
+    # What an unnamed anchor ("that day", "after that") can refer back to: not the
+    # document's own heading date when the account is of an incident on another day.
+    narrative = not _in_heading(ev, ctx)
+    context = [(c, e) for c, e in candidates if not (narrative and _own_date_heading(e, ctx))]
     anchor_span: Span | None = None
     anchor_id: str | None = None
     from_event = False
@@ -1036,23 +1275,35 @@ def _resolve_relative(
         anchor_span, anchor_id = (ctx.incident, ctx.incident), ctx.incident_event_id
         from_event = anchor_id is not None
     elif spec.phrase:
-        prior = _prior(pos, candidates)
+        prior = _prior(pos, context)
         ref = (prior.date_start if prior else None) or ctx.incident or doc_date
-        absolute = parse_absolute(spec.phrase, ref)
+        absolute = parse_absolute(spec.phrase, ref, ctx.tz)
         if absolute is not None:
             anchor_span = absolute[0]
         else:
             match = _match_anchor(spec.phrase, pos, candidates)
             if match is None and final:
-                match = _prior(pos, candidates)
+                match = _prior(pos, context)
             if match is not None:
                 anchor_span, anchor_id, from_event = _span_of(match), match.id, True
+            elif final and ctx.incident is not None:
+                # "at the time of the event" with nothing before it: the incident's account.
+                anchor_span, anchor_id = (ctx.incident, ctx.incident), ctx.incident_event_id
+                from_event = anchor_id is not None
     elif spec.deictic and doc_date is not None:
         anchor_span = (doc_date, doc_date)
     else:
-        if spec.day:  # "that day" never refers back to a month or "since 2006"
-            candidates = [(c, e) for c, e in candidates if _single_day(e)]
-        prior = _prior(pos, candidates)
+        # "after that" never refers back to background ("since 2006"); "that day" never
+        # to a month or year either.
+        context = [(c, e) for c, e in context if not _open_ended(_clean(e.date_text))]
+        if spec.day:
+            context = [(c, e) for c, e in context if _single_day(e)]
+        ids = {e.id for _c, e in context}
+        if not final and _waits_for_prior(
+            i, [j for j in order if out[j].id in ids], order, pos_of, ctx
+        ):
+            return None
+        prior = _prior(pos, context)
         if prior is not None:
             anchor_span, anchor_id, from_event = _span_of(prior), prior.id, True
         elif final and ctx.incident is not None:

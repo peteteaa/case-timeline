@@ -187,3 +187,9 @@ ol.cites li { margin-bottom: .75rem; }
 
 .htmx-indicator { opacity: 0; transition: opacity .2s; }
 .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { opacity: 1; }
+
+/* Key events / show all toggle */
+.view-toggle { display: flex; gap: .35rem; margin-top: .5rem; }
+.view-toggle .btn { text-decoration: none; color: var(--text); }
+.view-toggle .btn.active { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.badge.key { color: var(--accent); border-color: var(--accent); }

@@ -34,6 +34,7 @@ from pipeline.contracts import (
     EventStatus,
     Job,
 )
+from pipeline.store import KEY_EVENT_THRESHOLD, is_key_event
 
 if TYPE_CHECKING:
     from pipeline.config import Settings
@@ -48,6 +49,9 @@ ALLOWED_UPLOAD_SUFFIXES = {".pdf", ".docx", ".txt", ".md", ".eml"}
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 REVIEW_STATUSES = {EventStatus.ACCEPTED, EventStatus.REJECTED}
+# Timeline views: key events only (the default) or every event; chosen with ?view=.
+VIEW_KEY = "key"
+VIEW_ALL = "all"
 OPENCLAW_DEFAULT = Path("~/.openclaw/bin/openclaw").expanduser()
 OPENCLAW_TIMEOUT_S = 180
 CHAT_TOP_K = 8
@@ -179,6 +183,16 @@ def source_url(ev: Event) -> str:
     return f"/source/{quote(ev.source.doc_id, safe='')}?{urlencode(params)}"
 
 
+def timeline_view(value: str | None) -> str:
+    """The timeline view named by a ``view`` query value; key events unless "all"."""
+    return VIEW_ALL if (value or "").strip().lower() == VIEW_ALL else VIEW_KEY
+
+
+def filter_view(events: list[Event], view: str) -> list[Event]:
+    """Events shown in ``view``: everything, or only key events (importance >= threshold)."""
+    return list(events) if view == VIEW_ALL else [e for e in events if is_key_event(e)]
+
+
 def _sort_key(ev: Event) -> tuple:
     return (ev.date_start is None, ev.date_start or "", ev.id)
 
@@ -292,7 +306,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         loader=FileSystemLoader(TEMPLATES_DIR), autoescape=select_autoescape(default=True)
     )
     templates = Jinja2Templates(env=env)
-    env.globals.update(source_url=source_url, case_id=settings.case_id)
+    env.globals.update(
+        source_url=source_url, case_id=settings.case_id, key_threshold=KEY_EVENT_THRESHOLD
+    )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     def render(request: Request, name: str, status_code: int = 200, **ctx: Any) -> HTMLResponse:
@@ -416,16 +432,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ------------------------------------------------------------------ timeline / events
 
     @app.get("/timeline", response_class=HTMLResponse)
-    def timeline(request: Request) -> HTMLResponse:
+    def timeline(request: Request, view: str | None = None) -> HTMLResponse:
         store = _deps(request).get_store()
-        events = sorted(store.list_events(settings.case_id), key=_sort_key)
+        view = timeline_view(view)
+        every = sorted(store.list_events(settings.case_id), key=_sort_key)
+        events = filter_view(every, view)
         conflicts = _conflict_ids(store.list_contradictions(settings.case_id))
-        return render(request, "timeline.html", events=events, conflicts=conflicts)
+        return render(
+            request,
+            "timeline.html",
+            events=events,
+            conflicts=conflicts,
+            view=view,
+            total=len(every),
+            hidden=len(every) - len(events),
+        )
 
     @app.get("/api/events")
-    def api_events(request: Request) -> JSONResponse:
+    def api_events(request: Request, view: str | None = None) -> JSONResponse:
         store = _deps(request).get_store()
-        events = sorted(store.list_events(settings.case_id), key=_sort_key)
+        view = timeline_view(view)
+        every = sorted(store.list_events(settings.case_id), key=_sort_key)
+        events = filter_view(every, view)
         conflicts = _conflict_ids(store.list_contradictions(settings.case_id))
         items = []
         for ev in events:
@@ -437,6 +465,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 classes.append("conflict")
             if ev.deadline_relevant:
                 classes.append("deadline")
+            if is_key_event(ev):
+                classes.append("key")
             items.append(
                 {
                     "id": ev.id,
@@ -450,16 +480,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "quote": ev.source.quote,
                     "confidence": ev.confidence,
                     "deadline_relevant": ev.deadline_relevant,
+                    "importance": ev.importance,
+                    "key": is_key_event(ev),
                     "contradiction": ev.id in conflicts,
                     "class_name": " ".join(classes),
                     "source_url": source_url(ev),
                 }
             )
-        return JSONResponse({"case_id": settings.case_id, "items": items})
+        return JSONResponse(
+            {
+                "case_id": settings.case_id,
+                "view": view,
+                "key_threshold": KEY_EVENT_THRESHOLD,
+                "total": len(every),
+                "items": items,
+            }
+        )
 
     @app.post("/events/{event_id}/status", response_model=None)
     def event_status(
-        request: Request, event_id: str, status: Annotated[str, Form()]
+        request: Request,
+        event_id: str,
+        status: Annotated[str, Form()],
+        view: Annotated[str | None, Form()] = None,
     ) -> HTMLResponse | RedirectResponse:
         try:
             new = EventStatus(status)
@@ -472,11 +515,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "event not found")
         store.set_event_status(event_id, new)
         log.info("event %s marked %s by reviewer", event_id, new.value)
+        view = timeline_view(view)
         if not _is_htmx(request):
-            return RedirectResponse("/timeline", status_code=303)
+            target = "/timeline?view=all" if view == VIEW_ALL else "/timeline"
+            return RedirectResponse(target, status_code=303)
         ev = store.get_event(event_id)
         conflicts = _conflict_ids(store.list_contradictions(settings.case_id))
-        return render(request, "_event_row.html", e=ev, conflicts=conflicts)
+        return render(request, "_event_row.html", e=ev, conflicts=conflicts, view=view)
 
     # ------------------------------------------------------------------ source viewer
 

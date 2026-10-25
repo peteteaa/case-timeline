@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +70,30 @@ class Settings(BaseSettings):
 
     ui_host: str = "127.0.0.1"
     ui_port: int = 8090
+
+    # Case time zone (IANA name, e.g. "America/Chicago"). A time stated explicitly in UTC/GMT/
+    # Zulu is converted to it before its calendar day is taken; None = no conversion.
+    case_tz: str | None = None
+    # The case's incident date, when the documents' consensus should not be used.
+    case_incident_date: date | None = None
+
+    @field_validator("case_tz", mode="before")
+    @classmethod
+    def _valid_tz(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        if not isinstance(value, str):
+            raise ValueError("case_tz must be an IANA time zone name")
+        try:
+            ZoneInfo(value.strip())
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown time zone {value!r}") from exc
+        return value.strip()
+
+    @field_validator("case_incident_date", mode="before")
+    @classmethod
+    def _empty_date(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
 
     @model_validator(mode="after")
     def _resolve_paths(self) -> Settings:

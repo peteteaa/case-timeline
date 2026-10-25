@@ -13,14 +13,24 @@
     <span class="swatch conflict">contradiction</span>
     <span class="swatch deadline">attorney review</span>
   </div>
+  <nav class="view-toggle" aria-label="Which events to show">
+    <a href="/timeline" class="btn small{% if view != 'all' %} active{% endif %}"{% if view != 'all' %} aria-current="page"{% endif %}
+       title="Events rated important to the case (importance at least {{ key_threshold }})">Key events</a>
+    <a href="/timeline?view=all" class="btn small{% if view == 'all' %} active{% endif %}"{% if view == 'all' %} aria-current="page"{% endif %}>Show all</a>
+  </nav>
 </section>
-<div id="timeline" class="card timeline-box" data-src="/api/events">
-  <noscript>The interactive timeline needs JavaScript; the table below has every event.</noscript>
+<div id="timeline" class="card timeline-box" data-src="/api/events?view={{ view | urlencode }}">
+  <noscript>The interactive timeline needs JavaScript; the table below lists the same events.</noscript>
 </div>
 <p class="muted small">Click an item to open its source with the quote highlighted. Ctrl + scroll to zoom.</p>
 
 <section class="card">
+  {% if view == 'all' %}
   <h2>All events <span class="muted">({{ events | length }})</span></h2>
+  {% else %}
+  <h2>Key events <span class="muted">({{ events | length }} of {{ total }})</span></h2>
+  {% if hidden %}<p class="muted small">{{ hidden }} less important event{{ 's' if hidden != 1 }} hidden. <a href="/timeline?view=all">Show all</a></p>{% endif %}
+  {% endif %}
   {% if events %}
   <div class="table-wrap">
   <table class="events">
@@ -30,6 +40,8 @@
     </tbody>
   </table>
   </div>
+  {% elif total %}
+  <p class="muted">No key events. <a href="/timeline?view=all">Show all {{ total }} events</a>.</p>
   {% else %}
   <p class="muted">No events yet. Upload documents or press “Process now” on the dashboard.</p>
   {% endif %}

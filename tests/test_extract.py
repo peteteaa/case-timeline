@@ -4,7 +4,7 @@ import types
 
 import pytest
 
-from pipeline import extract
+from pipeline import extract, prompts
 from pipeline.config import get_settings
 from pipeline.contracts import Document, EventStatus, Page, ParsedDocument
 from pipeline.extract import (
@@ -352,3 +352,51 @@ def test_live_extraction_quotes_are_verbatim() -> None:
     assert events
     for e in events:
         assert e.source.quote in TEXT or e.source.char_end - e.source.char_start == len(TEXT)
+
+
+def test_importance_is_passed_through_and_deadlines_stay_key(fake_llm) -> None:
+    _, responses = fake_llm
+    responses.append(
+        ExtractionResult(
+            events=[
+                ExtractedEvent(
+                    quote="Acme Corp. hired John Smith on March 3, 2024.",
+                    date_text="March 3, 2024",
+                    description="Acme Corp. hired John Smith.",
+                    importance=0.2,
+                ),
+                ExtractedEvent(
+                    quote="The answer is due no later than April 1, 2024.",
+                    date_text="no later than April 1, 2024",
+                    description="Answer deadline.",
+                    deadline_relevant=True,
+                    importance=0.1,
+                ),
+                ExtractedEvent(
+                    quote="Two days after the meeting, Smith emailed Jane Doe about the invoice.",
+                    date_text="Two days after the meeting",
+                    description="Smith emailed Jane Doe about the invoice.",
+                ),
+            ]
+        )
+    )
+    hired, emailed, deadline = extract_events(make_parsed())
+    assert hired.importance == 0.2
+    assert emailed.importance == 0.5  # not rated by the model: the contract default
+    assert deadline.importance == extract.DEADLINE_MIN_IMPORTANCE  # never hidden as minor
+
+
+def test_overlap_duplicates_keep_the_higher_importance() -> None:
+    parsed = make_parsed()
+    quote = "Acme Corp. hired John Smith on March 3, 2024."
+    start = TEXT.index(quote)
+    item = ExtractedEvent(quote=quote, date_text="March 3, 2024", description="Hired.")
+    low = extract._to_event(parsed, item.model_copy(update={"importance": 0.3}), 0, len(TEXT))
+    high = extract._to_event(parsed, item.model_copy(update={"importance": 0.8}), start, len(TEXT))
+    assert extract._merge_dup(low, high).importance == 0.8
+
+
+def test_prompt_asks_for_importance_and_the_central_occurrence() -> None:
+    system = prompts.EXTRACTION_SYSTEM
+    assert '"importance"' in system and "central occurrence" in system
+    assert "importance" in ExtractedEvent.model_json_schema()["properties"]

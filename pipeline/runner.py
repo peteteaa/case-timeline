@@ -5,9 +5,12 @@ document id). Evidence files are only read; everything is written to ``data_dir`
 ``scan_case`` returns immediately and runs in a background thread; ``scan_case_sync`` runs
 inline. A file lock in ``data_dir`` ensures only one scan runs at a time across processes.
 
-Documents are parsed one at a time, and up to ``settings.llm_concurrency`` of them are
-extracted concurrently (the model requests share one limiter in ``pipeline.llm``); verify,
-dates, merge and every store write stay on the scan thread, in document order.
+Documents are parsed one at a time, and each one's extraction starts as soon as it is
+parsed; up to ``settings.llm_concurrency`` of them are extracted concurrently (the model
+requests share one limiter in ``pipeline.llm``). Once every document is parsed, the case's
+incident date is taken as the consensus of the documents' own incident dates, so that a
+document that never states it (an interview held weeks later) dates its account against it.
+Verify, dates, merge and every store write stay on the scan thread, in document order.
 """
 
 from __future__ import annotations
@@ -16,10 +19,12 @@ import argparse
 import logging
 import sys
 import threading
-from collections import deque
+from collections import Counter
+from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +57,8 @@ class _ScanState:
     """Mutable per-scan bookkeeping."""
 
     existing: list[Event]
+    case_incident: date | None = None  # the case's incident date (consensus of its documents)
+    case_tz: str | None = None  # IANA zone that explicit UTC times are converted to
     new_ids: set[str] = field(default_factory=set)
     events_added: int = 0
     docs_done: int = 0
@@ -96,7 +103,13 @@ def _store_document(
     """
     doc = parsed.doc
     events = verify.verify_events(parsed, events)
-    events = dates.resolve_dates(events, parse.doc_date(parsed), parsed=parsed)
+    events = dates.resolve_dates(
+        events,
+        parse.doc_date(parsed),
+        parsed=parsed,
+        case_incident_date=state.case_incident,
+        tz=state.case_tz,
+    )
     to_insert, pairs = merge.merge_events_linked(events, state.existing)
     duplicates = [dup for dup, _ in pairs]
     store.add_events(to_insert + duplicates)
@@ -118,6 +131,36 @@ def _store_document(
     return len(to_insert)
 
 
+def case_incident_date(parsed_docs: Iterable[ParsedDocument]) -> date | None:
+    """The case's incident date: the date most of its documents give as their incident date.
+
+    Each document votes with ``parse.incident_date`` (an incident form field, a where/when
+    header or an opening sentence); documents that name none do not vote. None when no
+    document names one or when two dates tie for the most votes.
+    """
+    votes: Counter[date] = Counter()
+    for parsed in parsed_docs:
+        try:
+            found = parse.incident_date(parsed)
+        except Exception:  # a heuristic must never fail the scan
+            log.debug("incident date of %s failed", parsed.doc.id, exc_info=True)
+            continue
+        if found is not None:
+            votes[found] += 1
+    ranked = votes.most_common(2)
+    if not ranked or (len(ranked) > 1 and ranked[0][1] == ranked[1][1]):
+        return None
+    return ranked[0][0]
+
+
+def _stored_parsed(store: Store, docs: Iterable[Document]) -> Iterable[ParsedDocument]:
+    """The stored parsed text of already-processed documents (lazily, one at a time)."""
+    for doc in docs:
+        parsed = store.get_parsed_text(doc.id)
+        if parsed is not None:
+            yield parsed
+
+
 @dataclass
 class _Pending:
     """A parsed document whose extraction is running (or a document that failed to parse)."""
@@ -129,37 +172,47 @@ class _Pending:
 
 
 def _process_documents(
-    store: Store, job: Job, todo: list[Document], state: _ScanState, workers: int
+    store: Store,
+    job: Job,
+    todo: list[Document],
+    state: _ScanState,
+    settings: Settings,
+    processed: list[Document] | None = None,
 ) -> Job:
-    """Parse documents one by one while up to ``workers`` of them are extracted concurrently.
+    """Parse every document while their extractions run, then date and store them in order.
 
-    Extraction (the LLM-bound step) runs on a thread pool; its model requests share the
-    process-wide limiter in ``pipeline.llm``. Everything else (verify, dates, merge, store
-    writes, job progress) happens on this thread in document order, so the stored result is
-    the same as a sequential scan. A document that fails is recorded and the scan goes on.
+    Each document's extraction (the LLM-bound step) is submitted as soon as it is parsed and
+    runs on a pool of ``settings.llm_concurrency`` threads; its model requests share the
+    process-wide limiter in ``pipeline.llm``. When all documents are parsed, the case
+    incident date is computed from them and from the case's already-processed documents
+    (``processed``), unless ``settings.case_incident_date`` sets it. Everything else
+    (verify, dates, merge, store writes, job progress) happens on this thread in document
+    order, so the stored result is the same as a sequential scan. A document that fails is
+    recorded and the scan goes on.
     """
-    workers = max(1, workers)
-    pending: deque[_Pending] = deque()
-    queue = iter(todo)
+    workers = max(1, settings.llm_concurrency)
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="extract")
-
-    def refill() -> None:
-        while len(pending) < workers:
-            doc = next(queue, None)
-            if doc is None:
-                return
+    items: list[_Pending] = []
+    try:
+        for doc in todo:
             item = _Pending(doc)
             try:
                 item.parsed = _parse_document(store, doc)
                 item.extraction = pool.submit(extract.extract_events, item.parsed)
             except Exception as exc:  # recorded when this document's turn comes
                 item.error = exc
-            pending.append(item)
+            items.append(item)
 
-    try:
-        refill()
-        while pending:
-            item = pending.popleft()
+        state.case_tz = settings.case_tz
+        state.case_incident = settings.case_incident_date or case_incident_date(
+            chain(
+                (i.parsed for i in items if i.parsed is not None),
+                _stored_parsed(store, processed or []),
+            )
+        )
+        log.info("case %s: incident date %s", job.case_id, state.case_incident)
+
+        for item in items:
             try:
                 if item.error is not None:
                     raise item.error
@@ -169,9 +222,9 @@ def _process_documents(
             except Exception as exc:  # one bad document must not kill the scan
                 log.exception("document %s (%s) failed", item.doc.id, item.doc.filename)
                 state.failures.append(f"{item.doc.filename}: {type(exc).__name__}: {exc}")
+            item.parsed = item.extraction = None  # done with this document's text
             state.docs_done += 1
             job = store.update_job(job, docs_done=state.docs_done, events_added=state.events_added)
-            refill()
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
     return job
@@ -209,7 +262,8 @@ def _run_scan(store: Store, job: Job, settings: Settings) -> Job:
         )
         log.info("scan %s case=%s: %d documents, %d new", job.id, case_id, len(docs), len(todo))
         state = _ScanState(existing=store.list_events(case_id))
-        job = _process_documents(store, job, todo, state, settings.llm_concurrency)
+        done = [d for d in docs if d.id in processed]
+        job = _process_documents(store, job, todo, state, settings, done)
 
         added = 0
         if state.new_ids:

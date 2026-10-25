@@ -52,7 +52,7 @@ def _event(eid: str, **kw) -> Event:
 class FakeStore:
     def __init__(self) -> None:
         self.events = {
-            "e1": _event("e1", deadline_relevant=True),
+            "e1": _event("e1", deadline_relevant=True, importance=0.9),
             "e2": _event(
                 "e2",
                 date_text="early March 2024",
@@ -179,11 +179,11 @@ def test_process_returns_polling_fragment(env):
 
 def test_timeline_and_api_events(env):
     client, *_ = env
-    r = client.get("/timeline")
+    r = client.get("/timeline?view=all")
     assert r.status_code == 200
     assert "Needs attorney review" in r.text
     assert "<b>bold</b>" not in r.text and "&lt;b&gt;bold&lt;/b&gt;" in r.text
-    data = client.get("/api/events").json()
+    data = client.get("/api/events?view=all").json()
     items = {i["id"]: i for i in data["items"]}
     assert "cert-exact" in items["e1"]["class_name"] and "conflict" in items["e1"]["class_name"]
     assert "deadline" in items["e1"]["class_name"]
@@ -191,6 +191,54 @@ def test_timeline_and_api_events(env):
     assert items["e2"]["end"] == "2024-03-11"  # inclusive range -> exclusive vis end
     assert items["e3"]["start"] is None
     assert items["e1"]["source_url"].startswith("/source/doc1?start=")
+
+
+def test_key_events_are_the_default_view(env):
+    client, *_ = env
+    r = client.get("/timeline")
+    assert r.status_code == 200
+    assert "Key events" in r.text and "(1 of 3)" in r.text
+    assert "Smith signed the lease (e1)" in r.text and "Key event</span>" in r.text
+    assert "&lt;b&gt;bold" not in r.text and "(e3)" not in r.text  # importance 0.5: hidden
+    assert 'href="/timeline?view=all"' in r.text and "2 less important events hidden" in r.text
+    assert 'data-src="/api/events?view=key"' in r.text
+    data = client.get("/api/events").json()
+    assert data["view"] == "key" and data["total"] == 3
+    assert [i["id"] for i in data["items"]] == ["e1"]
+    assert data["items"][0]["key"] is True and data["items"][0]["importance"] == 0.9
+    assert "key" in data["items"][0]["class_name"].split()
+
+
+def test_show_all_is_remembered_in_the_query(env):
+    client, *_ = env
+    r = client.get("/timeline", params={"view": "all"})
+    assert "All events" in r.text and "(e3)" in r.text and "&lt;b&gt;bold" in r.text
+    assert 'data-src="/api/events?view=all"' in r.text
+    assert 'aria-current="page">Show all' in r.text
+    assert 'name="view" value="all"' in r.text  # review forms keep the view
+    data = client.get("/api/events", params={"view": "all"}).json()
+    assert data["view"] == "all" and len(data["items"]) == 3
+    assert {i["id"]: i["key"] for i in data["items"]} == {"e1": True, "e2": False, "e3": False}
+    assert client.get("/api/events", params={"view": "bogus"}).json()["view"] == "key"
+
+
+def test_key_view_with_no_key_events_offers_show_all(env):
+    client, store, *_ = env
+    store.events = {k: v.model_copy(update={"importance": 0.2}) for k, v in store.events.items()}
+    r = client.get("/timeline")
+    assert "No key events" in r.text and "Show all 3 events" in r.text
+
+
+def test_review_redirect_keeps_view(env):
+    client, *_ = env
+    r = client.post(
+        "/events/e2/status",
+        data={"status": "accepted", "view": "all"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303 and r.headers["location"] == "/timeline?view=all"
+    r = client.post("/events/e2/status", data={"status": "rejected"}, follow_redirects=False)
+    assert r.headers["location"] == "/timeline"
 
 
 def test_source_escapes_and_highlights(env):

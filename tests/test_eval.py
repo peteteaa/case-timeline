@@ -240,3 +240,57 @@ def test_no_contradiction_gold_means_no_section(files: tuple[Path, Path], tmp_pa
     gold, pred = files
     res = run("t", gold_path=gold, pred_json=pred, out_path=tmp_path / "o.json")
     assert res.contradictions is None
+
+
+def test_key_events_are_scored_separately() -> None:
+    gold = [
+        GoldEvent(None, [], "contract signed by both parties", "a"),
+        GoldEvent(None, [], "warehouse flooded overnight", "a"),
+    ]
+    preds = [
+        Pred(None, [], "contract signed by both parties", "a", "p1", importance=0.9),
+        Pred(None, [], "warehouse flooded overnight", "a", "p2", importance=0.6),
+        Pred(None, [], "courier picked up a parcel", "a", "p3", importance=0.2),
+        Pred(None, [], "report filed in the archive", "a", "p4", importance=0.1, duplicate=True),
+    ]
+    res = score("x", gold, preds)
+    assert res.precision == pytest.approx(0.5) and res.recall == 1.0
+    assert res.n_duplicates == 1
+    key = res.key_events
+    assert key is not None and key["threshold"] == 0.6
+    assert key["n_pred"] == 2 and key["n_matched"] == 2 and key["n_timeline"] == 2
+    assert key["precision"] == 1.0 and key["recall"] == 1.0
+    assert score("x", gold, preds, key_threshold=None).key_events is None
+
+
+def test_key_threshold_matches_the_store() -> None:
+    from eval.run_eval import KEY_EVENT_THRESHOLD
+    from pipeline.store import KEY_EVENT_THRESHOLD as STORE_THRESHOLD
+
+    assert KEY_EVENT_THRESHOLD == STORE_THRESHOLD
+
+
+def test_pred_json_carries_importance(files: tuple[Path, Path], tmp_path: Path, capsys) -> None:
+    gold, pred = files
+    raw = json.loads(pred.read_text())
+    events = raw if isinstance(raw, list) else raw["events"]
+    for i, item in enumerate(events):
+        item["importance"] = 0.9 if i == 0 else 0.3
+    pred.write_text(json.dumps(raw))
+    res = run("t", gold_path=gold, pred_json=pred, out_path=tmp_path / "o.json")
+    assert res.key_events is not None and res.key_events["n_pred"] == 1
+    report = json.loads((tmp_path / "o.json").read_text())
+    assert report["key_events"]["n_pred"] == 1 and "n_timeline" in report
+    main(
+        [
+            "--case",
+            "t",
+            "--gold",
+            str(gold),
+            "--pred-json",
+            str(pred),
+            "--out",
+            str(tmp_path / "p.json"),
+        ]
+    )
+    assert "key events (importance >= 0.6)" in capsys.readouterr().out

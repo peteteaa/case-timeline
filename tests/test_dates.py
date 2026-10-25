@@ -633,3 +633,234 @@ def test_shortly_afterward_follows_prior_event() -> None:
     out = resolve_dates([ev("a", "June 5, 2021", 0), ev("b", "Shortly afterward", 50)], None)[1]
     assert out.date_start == date(2021, 6, 5) and out.anchor_event_id == "a"
     assert out.certainty == Certainty.RELATIVE
+
+
+# ------------------------------------------------------------- time zones (case_tz)
+
+CHICAGO = "America/Chicago"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("July 28, 2010, 0016 UTC", date(2010, 7, 27)),  # 19:16 CDT the day before
+        ("July 28, 2010, 00:16Z", date(2010, 7, 27)),
+        ("July 28, 2010 0016 Z", date(2010, 7, 27)),
+        ("2010-07-28T00:16:57Z", date(2010, 7, 27)),
+        ("July 28, 2010, 12:16 am GMT", date(2010, 7, 27)),
+        ("07/28/2010 0016 zulu", date(2010, 7, 27)),
+        ("July 27, 2010, 2316:57 UTC", date(2010, 7, 27)),  # 18:16 CDT, same day
+        ("July 28, 2010, 0016 CDT", date(2010, 7, 28)),  # a local zone keeps its date
+        ("July 28, 2010, 0016 central daylight time", date(2010, 7, 28)),
+        ("July 28, 2010, 00:16-05:00", date(2010, 7, 28)),
+        ("July 28, 2010, 0016 UTC/1916 CDT", date(2010, 7, 28)),  # local time given too
+        ("July 28, 2010, at 00:16", date(2010, 7, 28)),  # no zone: never shifted
+    ],
+)
+def test_utc_times_take_the_case_zone_day(text: str, expected: date) -> None:
+    (lo, hi), cert = parse_absolute(text, tz=CHICAGO)
+    assert lo == hi == expected
+    assert cert == EXACT
+
+
+def test_utc_times_are_not_converted_without_a_case_zone() -> None:
+    assert parse_absolute("July 28, 2010, 0016 UTC")[0] == (date(2010, 7, 28),) * 2
+    assert parse_absolute("July 28, 2010, 0016 UTC", tz="")[0] == (date(2010, 7, 28),) * 2
+
+
+def test_resolve_dates_converts_utc_with_the_case_zone() -> None:
+    out = resolve_dates([ev("a", "July 28, 2010, 0016 UTC", 0)], None, tz=CHICAGO)[0]
+    assert out.date_start == out.date_end == date(2010, 7, 27)
+    out = resolve_dates([ev("a", "July 28, 2010, 0016 UTC", 0)], None)[0]
+    assert out.date_start == date(2010, 7, 28)
+
+
+def test_utc_time_with_its_date_in_the_same_sentence_takes_the_case_zone_day() -> None:
+    text = "Summary.\n\nOn July 28, 2010, the crew called the tower at 0016 UTC. It rained.\n"
+    e = at("t", "at 0016 UTC", text, "the crew called the tower at 0016 UTC")
+    out = resolve_dates([e], None, parsed=_doc(text), tz=CHICAGO)[0]
+    assert out.date_start == date(2010, 7, 27)
+    out = resolve_dates([e], None, parsed=_doc(text))[0]
+    assert out.date_start == date(2010, 7, 28)
+
+
+def test_narrative_date_stated_with_a_utc_time_is_converted() -> None:
+    text = (
+        "Notes.\n\nThe flight ended July 28, 2010, 0016 UTC, at the field.\n\n"
+        "At 0020 it was towed.\n"
+    )
+    e = at("t", "At 0020", text, "At 0020 it was towed.")
+    out = resolve_dates([e], None, parsed=_doc(text), tz=CHICAGO)[0]
+    assert out.date_start == date(2010, 7, 27)  # inherits the converted narrative day
+
+
+def test_one_time_in_two_zones_is_a_time_of_day() -> None:
+    text = "2316:19 UTC/1816:19 CDT"
+    assert parse_absolute(text) is None
+    spec = parse_relative(text)
+    assert spec is not None and spec.clock
+
+
+# ------------------------------------------------- case incident date (case_incident_date)
+
+INTERVIEW = (
+    "Investigation of: TRUCK ACCIDENT\n"
+    "Interview of: J. Doe\n"
+    "Monday, August 30, 2021\n"
+    "The above matter convened.\n\n"
+    "Q. Tell me about that day.\n"
+    "A. I had an 8:00 delivery. And then I did a pickup after that. "
+    "The depot opened at about 2:30 or 3:00. After the depot opened I loaded up. "
+    "I was wearing glasses that day. "
+    "I had been driving trucks since 2006.\n"
+    "Q. When did you last see a doctor?\n"
+    "A. Yesterday.\n"
+)
+
+
+def _interview_events() -> list[Event]:
+    return [
+        at("held", "Monday, August 30, 2021", INTERVIEW, "Monday, August 30, 2021"),
+        at("t8", "8:00", INTERVIEW, "I had an 8:00 delivery."),
+        at("after", "after that", INTERVIEW, "And then I did a pickup after that."),
+        at("open", "about 2:30 or 3:00", INTERVIEW, "The depot opened at about 2:30 or 3:00."),
+        at("load", "After the depot opened", INTERVIEW, "After the depot opened I loaded up."),
+        at("glasses", "that day", INTERVIEW, "I was wearing glasses that day."),
+        at("since", "since 2006", INTERVIEW, "I had been driving trucks since 2006."),
+        at("doc", "Yesterday", INTERVIEW, "A. Yesterday."),
+        at("event", "at the time of the event", INTERVIEW, "Tell me about that day."),
+    ]
+
+
+def test_document_without_incident_date_uses_the_case_incident_date() -> None:
+    incident = date(2021, 7, 27)
+    out = {
+        e.id: e
+        for e in resolve_dates(
+            _interview_events(),
+            date(2021, 8, 30),
+            parsed=_doc(INTERVIEW),
+            case_incident_date=incident,
+        )
+    }
+    assert out["held"].date_start == date(2021, 8, 30)  # the interview itself
+    for eid in ("t8", "after", "open", "load", "glasses", "event"):
+        assert out[eid].date_start == out[eid].date_end == incident, eid
+    assert out["after"].anchor_event_id == "t8"  # the event just before, not "since 2006"
+    assert out["since"].date_start == date(2006, 1, 1)
+    assert out["since"].date_end == date(2006, 12, 31)
+    assert out["doc"].date_start == date(2021, 8, 29)  # "yesterday" is the document's own
+
+
+def test_without_case_incident_date_the_interview_date_is_kept() -> None:
+    out = {
+        e.id: e
+        for e in resolve_dates(_interview_events(), date(2021, 8, 30), parsed=_doc(INTERVIEW))
+    }
+    assert out["t8"].date_start == date(2021, 8, 30)
+
+
+def test_own_incident_date_beats_the_case_incident_date() -> None:
+    text = "Statement\nDate of Incident: 06/05/2021\n\nAt 0931 I saw the crash.\n"
+    e = at("t", "At 0931", text, "At 0931 I saw the crash.")
+    out = resolve_dates(
+        [e], date(2021, 9, 1), parsed=_doc(text), case_incident_date=date(2021, 7, 27)
+    )[0]
+    assert out.date_start == date(2021, 6, 5)
+
+
+def test_case_incident_date_needs_a_document_about_an_incident() -> None:
+    text = "Invoice\nSeptember 1, 2021\n\nDelivered at 0931 to the dock.\n"
+    e = at("t", "at 0931", text, "Delivered at 0931 to the dock.")
+    out = resolve_dates(
+        [e], date(2021, 9, 1), parsed=_doc(text), case_incident_date=date(2021, 7, 27)
+    )[0]
+    assert out.date_start == date(2021, 9, 1)
+
+
+def test_time_stated_with_the_document_date_keeps_it_with_a_case_incident_date() -> None:
+    head = "Interview about the accident\nRecording started at 10:05 on August 30, 2021.\n\n"
+    e = at("rec", "at 10:05", head, "Recording started at 10:05")
+    out = resolve_dates(
+        [e], date(2021, 8, 30), parsed=_doc(head), case_incident_date=date(2021, 7, 27)
+    )[0]
+    assert out.date_start == date(2021, 8, 30)  # the day stated with it wins
+
+
+# ------------------------------------------------------------------- year-only dates
+
+
+@pytest.mark.parametrize(
+    "text", ["2006", "in 2006", "In 2006", "since 2006", "from 2006", "starting in 2006"]
+)
+def test_year_only_is_an_approximate_whole_year(text: str) -> None:
+    e = one(text)
+    assert (e.date_start, e.date_end) == (date(2006, 1, 1), date(2006, 12, 31))
+    assert e.certainty == APPROXIMATE
+
+
+def test_since_a_season_or_month_is_that_period() -> None:
+    assert parse_absolute("since the fall of 2006") == (
+        (date(2006, 9, 1), date(2006, 11, 30)),
+        APPROXIMATE,
+    )
+    assert parse_absolute("since March 2007")[0] == (date(2007, 3, 1), date(2007, 3, 31))
+    # a full day keeps its open-bound meaning
+    assert parse_absolute("since March 3, 2024")[0] == (date(2024, 3, 3), date(2024, 3, 3))
+
+
+def test_alternatives_span_both() -> None:
+    assert parse_absolute("May or June of 2007") == (
+        (date(2007, 5, 1), date(2007, 6, 30)),
+        RANGE,
+    )
+    assert parse_absolute("on or about March 3, 2024") == (
+        (date(2024, 3, 3), date(2024, 3, 3)),
+        APPROXIMATE,
+    )
+
+
+def test_year_only_never_overrides_a_full_date_in_its_quote() -> None:
+    e = ev("a", "2010", 0, "On July 27, 2010, the truck overturned near the depot.")
+    out = resolve_dates([e], date(2010, 9, 1))[0]
+    assert out.date_start == out.date_end == date(2010, 7, 27)
+    assert out.certainty == EXACT
+    e = ev("b", "in 2010", 0, "In 2010 he moved; on about March 3, 2010 he left.")
+    out = resolve_dates([e], None)[0]
+    assert out.date_start == date(2010, 3, 3) and out.certainty == APPROXIMATE
+    e = ev("c", "since 2006", 0, "Since 2006 he has driven; on June 5, 2006 he started.")
+    out = resolve_dates([e], None)[0]
+    assert (out.date_start, out.date_end) == (date(2006, 1, 1), date(2006, 12, 31))
+
+
+@pytest.mark.parametrize(
+    ("text", "start", "end"),
+    [
+        ("the week of March 3, 2024", date(2024, 3, 3), date(2024, 3, 9)),
+        ("beginning of March 2024", date(2024, 3, 1), date(2024, 3, 10)),
+        ("beginning in March 2024", date(2024, 3, 1), date(2024, 3, 31)),
+    ],
+)
+def test_periods_that_name_their_own_day_are_kept(text: str, start: date, end: date) -> None:
+    out = resolve_dates([ev("a", text, 0, f"It happened {text}.")], None)[0]
+    assert (out.date_start, out.date_end) == (start, end)
+
+
+def test_background_year_does_not_set_the_year_of_later_dates() -> None:
+    events = [
+        ev("bg", "since 2006", 0, "he has driven since 2006"),
+        ev("d", "June 5", 40, "the truck tipped over"),
+    ]
+    out = resolve_dates(events, None, incident_date=date(2021, 6, 9))[1]
+    assert out.date_start == date(2021, 6, 5)  # near the incident, not 2006
+
+
+def test_after_that_follows_the_previous_event_not_background() -> None:
+    events = [
+        ev("a", "June 5, 2021", 0, "the trip"),
+        ev("bg", "since 2006", 40, "he has driven trucks since 2006"),
+        ev("c", "after that", 80, "he went home after that"),
+    ]
+    out = resolve_dates(events, None)[2]
+    assert out.anchor_event_id == "a"
+    assert out.date_start == date(2021, 6, 5)

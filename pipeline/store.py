@@ -35,6 +35,15 @@ RRF_K = 60
 _MAX_VEC_DISTANCE = 0.95  # cosine distance; drops orthogonal (unrelated) neighbours
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _HUMAN_STATUSES = (EventStatus.ACCEPTED.value, EventStatus.REJECTED.value)
+# Event.importance at or above this marks a "key event" (the timeline's default view).
+KEY_EVENT_THRESHOLD = 0.6
+DEFAULT_IMPORTANCE = 0.5  # Event.importance default; also the value migrated rows get
+
+
+def is_key_event(event: Event, threshold: float = KEY_EVENT_THRESHOLD) -> bool:
+    """True when the event's importance reaches the key-event threshold."""
+    return event.importance >= threshold
+
 
 Embedder = Callable[[list[str]], list[list[float]]]
 
@@ -76,6 +85,7 @@ CREATE TABLE IF NOT EXISTS events (
     confidence REAL NOT NULL,
     status TEXT NOT NULL,
     deadline_relevant INTEGER NOT NULL DEFAULT 0,
+    importance REAL NOT NULL DEFAULT 0.5,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -185,6 +195,14 @@ def _dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
+def _importance(row: sqlite3.Row) -> float:
+    """The row's importance, clamped to [0, 1]; the default for rows that predate the column."""
+    value = row["importance"] if "importance" in row.keys() else None
+    if value is None:
+        return DEFAULT_IMPORTANCE
+    return min(1.0, max(0.0, float(value)))
+
+
 def _embed_text(event: Event) -> str:
     return " | ".join([event.description, ", ".join(event.actors), event.source.quote])
 
@@ -235,6 +253,7 @@ class Store:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             if self._vec:
                 try:
                     self._conn.executescript(_VEC_SCHEMA)
@@ -242,6 +261,17 @@ class Store:
                     log.warning("could not create vec0 table (%s); FTS-only search", exc)
                     self._vec = False
             self._initialized = True
+
+    def _migrate(self) -> None:
+        """Bring databases created by older versions up to the current schema (idempotent)."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(events)")}
+        if "importance" not in cols:
+            self._conn.execute(
+                "ALTER TABLE events ADD COLUMN importance REAL NOT NULL "
+                f"DEFAULT {DEFAULT_IMPORTANCE}"
+            )
+            self._conn.commit()
+            log.info("migrated events table: added importance (default %s)", DEFAULT_IMPORTANCE)
 
     def close(self) -> None:
         with self._lock:
@@ -407,8 +437,8 @@ class Store:
                 self._conn.execute(
                     """INSERT INTO events (id, case_id, doc_id, date_text, date_start, date_end,
                            certainty, anchor_event_id, actors, description, source, confidence,
-                           status, deadline_relevant, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           status, deadline_relevant, importance, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(id) DO UPDATE SET case_id=excluded.case_id,
                            doc_id=excluded.doc_id, date_text=excluded.date_text,
                            date_start=excluded.date_start, date_end=excluded.date_end,
@@ -418,6 +448,7 @@ class Store:
                            status=CASE WHEN events.status IN (?, ?) THEN events.status
                                        ELSE excluded.status END,
                            deadline_relevant=excluded.deadline_relevant,
+                           importance=excluded.importance,
                            updated_at=excluded.updated_at""",
                     (
                         e.id,
@@ -434,6 +465,7 @@ class Store:
                         e.confidence,
                         e.status.value,
                         int(e.deadline_relevant),
+                        e.importance,
                         now,
                         now,
                         *_HUMAN_STATUSES,
@@ -492,6 +524,7 @@ class Store:
             confidence=row["confidence"],
             status=row["status"],
             deadline_relevant=bool(row["deadline_relevant"]),
+            importance=_importance(row),
         )
 
     def get_event(self, event_id: str) -> Event | None:
@@ -505,13 +538,21 @@ class Store:
         status: EventStatus | str | None = None,
         *,
         include_duplicates: bool = False,
+        min_importance: float | None = None,
     ) -> list[Event]:
-        """Chronological events (undated last); linked duplicates hidden by default."""
+        """Chronological events (undated last); linked duplicates hidden by default.
+
+        ``min_importance`` keeps only events rated at least that important (e.g.
+        ``KEY_EVENT_THRESHOLD`` for key events).
+        """
         sql = "SELECT * FROM events e WHERE e.case_id = ?"
         params: list[Any] = [case_id]
         if status is not None:
             sql += " AND e.status = ?"
             params.append(EventStatus(status).value)
+        if min_importance is not None:
+            sql += " AND e.importance >= ?"
+            params.append(float(min_importance))
         if not include_duplicates:
             sql += " AND NOT EXISTS (SELECT 1 FROM event_dups d WHERE d.event_id = e.id)"
         sql += " ORDER BY e.date_start IS NULL, e.date_start, e.date_end, e.created_at, e.pk"

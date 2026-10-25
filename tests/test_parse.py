@@ -439,6 +439,7 @@ def test_docling_pages_get_the_same_cleanup(monkeypatch: pytest.MonkeyPatch) -> 
     bodies = ["Arrival noted.", "Second visit.\n\nNotes taken.", "Phone call.", "Exit."]
     pages = [f"Header Of The Example Firm\n\n{b}\n\n{n}" for n, b in enumerate(bodies, 1)]
     monkeypatch.setattr(parse_mod, "_parse_pdf_docling", lambda path: list(pages))
+    monkeypatch.setattr(parse_mod, "_parse_pdf_pymupdf", lambda data: list(pages))
     parsed = parse(_docs()["incident_report.pdf"])
     assert parsed.text.count("Header Of The Example Firm") == 1
     assert "Exit." in parsed.text and "\n4" not in parsed.text
@@ -543,3 +544,187 @@ def test_doc_date_accepts_dates_without_space_after_comma() -> None:
 )
 def test_incident_date_fixtures(name: str, expected: date | None) -> None:
     assert parse_mod.incident_date(parse(_docs()[name])) == expected
+
+
+# --------------------------------------------------------------------------- Docling vs text layer
+
+
+_BOARD = ["The board met on May 2, 2022 to approve the budget.", "Signed by the board clerk."]
+
+
+def test_docling_used_when_it_agrees_with_the_text_layer() -> None:
+    layer = list(_BOARD)
+    docling = ["## " + _BOARD[0], _BOARD[1] + "\n\n<!-- image -->"]
+    assert parse_mod._docling_agrees(docling, layer)
+
+
+@pytest.mark.parametrize(
+    "docling",
+    [
+        # a garbled line replaces text-layer words
+        ["The board met on May 2, 2022 to approve the budget.", "n  t  e  l,  t s ts,,"],
+        # a paragraph that runs over the page break lands on the previous page
+        ["The board met on May 2, 2022 to approve the budget. Signed by the clerk.", ""],
+        # a page is missing
+        ["The board met on May 2, 2022 to approve the budget."],
+    ],
+)
+def test_docling_rejected_when_it_loses_or_moves_text(docling: list[str]) -> None:
+    layer = list(_BOARD)
+    assert not parse_mod._docling_agrees(docling, layer)
+
+
+def test_unfaithful_docling_falls_back_to_the_text_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CT_DISABLE_DOCLING", raising=False)
+    line = "The nose pitched up and the right wing stalled before impact."
+    path = _pdf(tmp_path, [[(72, 100, line)], [(72, 100, "Second page of notes.")]])
+    garbled = ["The nose pitched up 'rs t e l, t s ts,,", "Second page of notes."]
+    monkeypatch.setattr(parse_mod, "_parse_pdf_docling", lambda p: list(garbled))
+    parsed = _parse_path(path)
+    assert line in parsed.text and "ts,," not in parsed.text
+    assert len(parsed.pages) == 2
+
+
+def test_docling_text_kept_for_pages_without_a_text_layer(monkeypatch: pytest.MonkeyPatch) -> None:
+    layer = ["Typed page with a real text layer, nothing else.", ""]
+    docling = ["Typed page, garbled", "Handwritten statement read by Docling OCR."]
+    monkeypatch.setattr(parse_mod, "_parse_pdf_pymupdf", lambda data: list(layer))
+    monkeypatch.setattr(parse_mod, "_parse_pdf_docling", lambda path: list(docling))
+    out = parse_mod._pdf_page_texts(Path("x.pdf"), b"")
+    assert out == [layer[0], docling[1]]
+
+
+def test_docling_skipped_for_pdfs_without_any_text_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CT_DISABLE_DOCLING", raising=False)
+    monkeypatch.delenv("CT_DOCLING_OCR", raising=False)
+
+    def no_docling(path: Path) -> list[str]:
+        raise AssertionError("Docling should not run on an image-only PDF")
+
+    monkeypatch.setattr(parse_mod, "_parse_pdf_docling", no_docling)
+    path = _image_pdf(tmp_path, 2)
+    assert len(parse_mod._pdf_page_texts(path, path.read_bytes())) == 2
+
+
+# --------------------------------------------------------------------------- OCR yield / rotation
+
+
+_LINES = [
+    "Avery saw the truck leave at noon.",
+    "The gate log lists a delivery around two.",
+    "Nobody answered the phone that evening.",
+    "A second inspection was done on Friday.",
+]
+
+
+def _fake_engine(monkeypatch: pytest.MonkeyPatch, reader) -> list[tuple[int, int]]:
+    """Route OCR through ``reader(page_no, dpi, rotation) -> str``; returns the calls made."""
+    calls: list[tuple[int, int, int]] = []
+
+    def render(page, dpi: int, rotation: int = 0) -> bytes:
+        calls.append((page.number + 1, dpi, rotation))
+        return repr((page.number + 1, dpi, rotation)).encode()
+
+    def ocr(png: bytes, engine: str) -> str:
+        page_no, dpi, rotation = eval(png.decode())  # noqa: S307 - test-only round trip
+        return reader(page_no, dpi, rotation)
+
+    monkeypatch.setattr(parse_mod, "ocr_engine", lambda: "rapidocr")
+    monkeypatch.setattr(parse_mod, "_render_png", render)
+    monkeypatch.setattr(parse_mod, "_ocr_png", ocr)
+    return calls
+
+
+def test_sideways_scan_is_read_in_its_best_orientation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def reader(page_no: int, dpi: int, rotation: int) -> str:
+        good = parse_mod.OcrText(_LINES[page_no - 1], 50)
+        if page_no == 2 and rotation != 270:  # scanned sideways: only a 270 turn reads cleanly
+            return parse_mod.OcrText("lI1 lI1 Il1 ...", 3.0)
+        return good
+
+    calls = _fake_engine(monkeypatch, reader)
+    parsed = _parse_path(_image_pdf(tmp_path, 3))
+    pages = [parsed.text[p.char_start : p.char_end] for p in parsed.pages]
+    assert pages == _LINES[:3]
+    retried = [c for c in calls if c[0] == 2]
+    assert retried == [(2, 300, 0), (2, 400, 0), (2, 300, 90), (2, 300, 180), (2, 300, 270)]
+    assert [c for c in calls if c[0] != 2] == [(1, 300, 0), (3, 300, 0)]  # read once
+
+
+def test_low_yield_page_is_reocrd_against_the_document_median(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    long = " ".join(["Statement taken at the scene by the deputy on duty."] * 6)
+
+    def reader(page_no: int, dpi: int, rotation: int) -> str:
+        if page_no == 3 and dpi == 300 and rotation == 0:
+            return parse_mod.OcrText("Name:", 4.0)  # only the form label came through
+        return parse_mod.OcrText(f"{_LINES[page_no - 1]}\n{long}", 250.0)
+
+    calls = _fake_engine(monkeypatch, reader)
+    parsed = _parse_path(_image_pdf(tmp_path, 4))
+    third = parsed.text[parsed.pages[2].char_start : parsed.pages[2].char_end]
+    assert third.startswith(_LINES[2])
+    assert (3, 400, 0) in calls and (1, 400, 0) not in calls
+
+
+def test_text_layer_page_far_below_median_is_ocrd_only_if_ocr_reads_more(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = "\n".join(["Typed narrative line describing what the officer observed."] * 12)
+    texts = {0: body, 1: body, 2: "Received: county clerk office", 3: body}  # only a stamp
+    full = "Handwritten note: the caller reported smoke near the loading dock at 4 pm. " * 8
+
+    def reader(page_no: int, dpi: int, rotation: int) -> str:
+        return parse_mod.OcrText(full, 400.0)
+
+    calls = _fake_engine(monkeypatch, reader)
+    parsed = _parse_path(_image_pdf(tmp_path, 4, texts))
+    third = parsed.text[parsed.pages[2].char_start : parsed.pages[2].char_end]
+    assert "loading dock" in third
+    assert calls == [(3, 300, 0)]  # one reading; full text-layer pages are not OCR'd
+
+
+def test_rapidocr_score_ignores_sideways_lines(monkeypatch: pytest.MonkeyPatch) -> None:
+    upright = [[0, 0], [200, 0], [200, 20], [0, 20]]
+    sideways = [[0, 0], [20, 0], [20, 200], [0, 200]]
+    monkeypatch.setattr(
+        parse_mod,
+        "_ocr_results",
+        lambda png, engine: [(upright, "Upright line", 0.5), (sideways, "Sideways line", 1.0)],
+    )
+    out = parse_mod._ocr_png(b"PNG", "rapidocr")
+    assert "Upright line" in out and "Sideways line" in out
+    assert out.score == pytest.approx(0.5 * len("Uprightline"))
+
+
+def test_unreadable_scan_says_so_in_the_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _fake_engine(monkeypatch, lambda page_no, dpi, rotation: "")
+    with pytest.raises(parse_mod.NeedsOCRError) as err:
+        _parse_path(_image_pdf(tmp_path, 2))
+    msg = str(err.value)
+    assert "2 of 2 pages" in msg and "found no readable text" in msg and "rapidocr" in msg
+    assert len(calls) == 2 * 5  # upright, higher DPI, then three turns per page
+
+
+def test_rapidocr_runs_without_the_line_orientation_classifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    def model(png: bytes, **kw: object) -> SimpleNamespace:
+        seen.update(kw)
+        box = [[0, 0], [100, 0], [100, 10], [0, 10]]
+        return SimpleNamespace(boxes=[box], txts=("Line one",), scores=(0.9,))
+
+    monkeypatch.setitem(parse_mod._ocr_models, "rapidocr", model)
+    assert parse_mod._ocr_png(b"PNG", "rapidocr") == "Line one"
+    assert seen == {"use_cls": False}

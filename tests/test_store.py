@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from datetime import UTC, date, datetime, timedelta
 
@@ -315,3 +316,68 @@ def test_thread_safety(store):
         t.join()
     assert not errors
     assert len(store.list_events(CASE)) == 40
+
+
+# --- importance (key events) ----------------------------------------------------------------
+
+
+def test_importance_round_trips_and_filters(store):
+    store.add_events(
+        [
+            make_event("k1", "central occurrence", day=date(2024, 3, 3)).model_copy(
+                update={"importance": 0.9}
+            ),
+            make_event("k2", "routine logistics", day=date(2024, 3, 4)).model_copy(
+                update={"importance": 0.2}
+            ),
+            make_event("k3", "unrated event", day=date(2024, 3, 5)),
+        ]
+    )
+    assert store.get_event("k1").importance == 0.9
+    assert store.get_event("k3").importance == 0.5  # contract default
+    from pipeline.store import KEY_EVENT_THRESHOLD, is_key_event
+
+    key = store.list_events(CASE, min_importance=KEY_EVENT_THRESHOLD)
+    assert [e.id for e in key] == ["k1"]
+    assert [is_key_event(e) for e in store.list_events(CASE)] == [True, False, False]
+    # A re-extraction updates the rating.
+    store.add_events([store.get_event("k2").model_copy(update={"importance": 0.7})])
+    assert store.get_event("k2").importance == 0.7
+
+
+def test_old_database_is_migrated_with_default_importance(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    s = Store(path, embedder=fake_embed)
+    s.add_events([make_event("old1", "stored before importance existed", day=date(2024, 1, 2))])
+    s.close()
+    # Rebuild the events table the way the day-0 schema made it (no importance column).
+    con = sqlite3.connect(path)
+    (create,) = con.execute("SELECT sql FROM sqlite_master WHERE name = 'events'").fetchone()
+    old_create = re.sub(r"\s*importance REAL[^,]*,", "", create).replace(
+        "CREATE TABLE events", "CREATE TABLE events_old", 1
+    )
+    cols = [r[1] for r in con.execute("PRAGMA table_info(events)") if r[1] != "importance"]
+    con.executescript(
+        f"""
+        {old_create};
+        INSERT INTO events_old ({", ".join(cols)}) SELECT {", ".join(cols)} FROM events;
+        DROP TABLE events;
+        ALTER TABLE events_old RENAME TO events;
+        """
+    )
+    assert "importance" not in {r[1] for r in con.execute("PRAGMA table_info(events)")}
+    con.close()
+
+    s = Store(path, embedder=fake_embed)  # opening migrates
+    cols = {r[1] for r in s._conn.execute("PRAGMA table_info(events)")}
+    assert "importance" in cols
+    old = s.get_event("old1")
+    assert old is not None and old.importance == 0.5
+    s.add_events(
+        [make_event("new1", "rated", day=date(2024, 1, 3)).model_copy(update={"importance": 0.8})]
+    )
+    assert s.get_event("new1").importance == 0.8
+    s.close()
+    Store(path, embedder=fake_embed).close()  # migration is idempotent

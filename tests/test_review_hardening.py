@@ -169,7 +169,7 @@ def test_ui_escapes_case_content(tmp_path: Path) -> None:
     deps.store, deps.llm, deps.chat_backend = store, FakeLLM(), "local"
     client = TestClient(app, base_url="http://127.0.0.1:8090")
     pages = [
-        client.get("/timeline"),
+        client.get("/timeline", params={"view": "all"}),  # unrated events: not key events
         client.get("/source/d1", params={"start": start, "end": start + len(XSS), "event": "e1"}),
         client.get("/contradictions"),
         client.get("/alerts"),
@@ -182,7 +182,7 @@ def test_ui_escapes_case_content(tmp_path: Path) -> None:
         assert "<script>alert" not in body and "<img src=x" not in body, r.url
         assert '" onmouseover' not in body, r.url  # no attribute break-out from links
     assert "&lt;script&gt;" in pages[1].text and 'id="hl"' in pages[1].text
-    data = client.get("/api/events").json()  # JSON; timeline.js inserts text, not HTML
+    data = client.get("/api/events", params={"view": "all"}).json()  # timeline.js inserts text
     assert data["items"][0]["label"] == XSS
     store.close()
 
