@@ -100,7 +100,7 @@ class Backend:
 
     store: Any  # pipeline.store.Store
     case_id: str
-    dashboard: str = "http://127.0.0.1:8080"
+    dashboard: str = "http://127.0.0.1:8090"
 
 
 _backend: Backend | None = None

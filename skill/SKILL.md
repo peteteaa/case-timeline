@@ -42,7 +42,7 @@ Only `scan_case` and `mark_alerts_delivered` write, and only job and alert rows.
 
 1. **You cannot create, edit, accept, reject or delete facts**, set statuses or tags, add notes,
    confirm conflicts, or touch documents. When someone asks, say so and point them to the web
-   UI (the local dashboard, `http://127.0.0.1:8080`, reached through their SSH tunnel), where
+   UI (the local dashboard, `http://127.0.0.1:8090`, reached through their SSH tunnel), where
    people review drafts in the source viewer.
 2. **Cite or abstain.** Every factual statement about the case cites the fact ID and its
    evidence as document + page, e.g. `F-0142 (memo.pdf p. 3)`, or page:line for transcripts,
@@ -76,8 +76,8 @@ Only `scan_case` and `mark_alerts_delivered` write, and only job and alert rows.
    sending its `message` field exactly, for example:
 
    ```
-   Case demo: possible conflict between sources. Review: http://127.0.0.1:8080/cases/demo/alerts
-   Case demo: possible deadline (needs attorney review). Review: http://127.0.0.1:8080/cases/demo/alerts
+   Case demo: possible conflict between sources. Review: http://127.0.0.1:8090/cases/demo/alerts
+   Case demo: possible deadline (needs attorney review). Review: http://127.0.0.1:8090/cases/demo/alerts
    ```
 
    Then call `mark_alerts_delivered` with the `alert_id`s you announced. On a failed job, you

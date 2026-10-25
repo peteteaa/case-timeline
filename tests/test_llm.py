@@ -159,6 +159,70 @@ def test_settings_paths(tmp_path, monkeypatch):
     assert s.ui_host == "127.0.0.1"
 
 
+def test_llm_concurrency_setting(monkeypatch):
+    monkeypatch.delenv("CT_LLM_CONCURRENCY", raising=False)
+    assert Settings().llm_concurrency == 8
+    monkeypatch.setenv("CT_LLM_CONCURRENCY", "3")
+    assert Settings().llm_concurrency == 3
+    monkeypatch.setenv("CT_LLM_CONCURRENCY", "0")
+    with pytest.raises(ValueError):
+        Settings()
+
+
+def test_map_ordered_keeps_order_and_returns_errors_in_place(monkeypatch):
+    import threading
+    import time
+
+    def work(i: int) -> int:
+        time.sleep(0.01 * (5 - i))  # later items finish first
+        if i == 2:
+            raise ValueError("bad item")
+        return i * 10
+
+    out = llm.map_ordered(work, list(range(5)), workers=5)
+    assert out[:2] == [0, 10] and out[3:] == [30, 40]
+    assert isinstance(out[2], ValueError)
+    # One worker runs inline on the calling thread, in order.
+    seen: list[str] = []
+    llm.map_ordered(lambda i: seen.append(threading.current_thread().name), [1, 2], workers=1)
+    assert seen == [threading.current_thread().name] * 2
+    assert llm.map_ordered(work, []) == []
+
+
+def test_request_slot_limits_requests_in_flight(monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setenv("CT_LLM_CONCURRENCY", "2")
+    get_settings.cache_clear()
+    try:
+        llm.reset_limiter_stats()
+        lock = threading.Lock()
+        flight = {"now": 0, "max": 0}
+
+        def request(_: int) -> None:
+            with llm.request_slot():
+                with lock:
+                    flight["now"] += 1
+                    flight["max"] = max(flight["max"], flight["now"])
+                time.sleep(0.03)
+                with lock:
+                    flight["now"] -= 1
+
+        llm.map_ordered(request, list(range(8)), workers=8)  # more threads than slots
+        assert flight["max"] == 2
+        assert llm.limiter_stats() == {"in_flight": 0, "peak": 2, "total": 8}
+    finally:
+        get_settings.cache_clear()
+
+
+def test_chat_holds_a_limiter_slot(fake_client):
+    fake_client(["ok"])
+    llm.reset_limiter_stats()
+    assert llm.chat([{"role": "user", "content": "hi"}]) == "ok"
+    assert llm.limiter_stats()["total"] == 1 and llm.limiter_stats()["in_flight"] == 0
+
+
 @pytest.mark.llm
 def test_live_chat_json():
     assert llm.health()["ok"]

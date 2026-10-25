@@ -141,8 +141,8 @@ Web UI routes (internal to the box, not a public API):
 Reaching the UI from a laptop:
 
 ```bash
-ssh -N -L 8080:127.0.0.1:8080 user@gb10-host
-# then open http://localhost:8080 on the laptop
+ssh -N -L 8090:127.0.0.1:8090 user@gb10-host
+# then open http://localhost:8090 on the laptop
 ```
 
 Two rules: all real logic lives in the core library, and neither the MCP server nor the model server is ever put on the network.

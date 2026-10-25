@@ -14,9 +14,9 @@ make preflight          # aarch64, disk, GPU, uv, openclaw
 make setup              # uv sync (needs internet once)
 make llm                # vLLM on 172.17.0.1:8000 (docker0 bridge); wait for /v1/models
 make fixtures           # rebuild the fictional demo case in tests/fixtures/case_demo
-make app                # web UI + job worker on http://127.0.0.1:8080
+make app                # web UI + job worker on http://127.0.0.1:8090
                         #   "Process now" in the UI queues a scan; the worker runs it
-                        #   if 8080 is taken (e.g. by the OpenShell gateway): CT_UI_PORT=8091
+                        #   if 8090 is taken: CT_UI_PORT=8091
 make scan CASE=demo     # or: queue a scan and run it inline, without the app server
 make eval CASE=demo     # SPEC §13 metrics; report in data/eval_demo.json
 ```
@@ -52,7 +52,7 @@ GB10 host
     │     └── MCP tool calls ──► mcp_server (stdio subprocess)        │
     │                              ├── reads SQLite                   │
     │                              └── queues jobs (never runs them)  │
-    ├── App server (app/, 127.0.0.1:8080) ◄── SSH tunnel ── browser   │
+    ├── App server (app/, 127.0.0.1:8090) ◄── SSH tunnel ── browser   │
     │     ├── web UI: list + visual timeline, review, search, export  │
     │     └── job worker: parse → extract → verify → dates →          │
     │                     witnesses → merge → conflicts → alerts ─────┘
@@ -95,11 +95,11 @@ and alert rows. The agent cannot create, edit, or review facts.
 
 ## Security model
 
-- **Loopback only.** The app server binds `127.0.0.1:8080` and refuses a non-loopback host.
+- **Loopback only.** The app server binds `127.0.0.1:8090` and refuses a non-loopback host.
   vLLM binds the docker0 bridge (`172.17.0.1:8000`) so the NemoClaw sandbox can reach it, and
   is not reachable from Wi-Fi or Tailscale. Nothing binds `0.0.0.0`. `make ports` checks this.
-- **SSH tunnel for people.** Use `ssh -N -L 8080:127.0.0.1:8080 user@gb10-host`, then open
-  http://localhost:8080. Everyone who reaches the UI is a trusted teammate who gives a display
+- **SSH tunnel for people.** Use `ssh -N -L 8090:127.0.0.1:8090 user@gb10-host`, then open
+  http://localhost:8090. Everyone who reaches the UI is a trusted teammate who gives a display
   name once. There are no accounts.
 - **MCP over stdio.** The server has no port. Stdout carries JSON-RPC only: logs go to stderr
   and `data/mcp.log`, and stray prints are redirected.

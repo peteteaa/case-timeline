@@ -129,7 +129,7 @@ def is_organization(name: str) -> bool:
 
 def names_match(x: str, y: str) -> bool:
     """Loose person/org name match: equal, one name's tokens contained in the other's
-    ("Lopez" ~ "Ana Lopez", "Mr. Okafor" ~ "Sam Okafor"), or a near-identical spelling."""
+    ("Lopez" ~ "Ana Lopez", "Mr. Adeyemi" ~ "Sam Adeyemi"), or a near-identical spelling."""
     tx, ty = name_tokens(x), name_tokens(y)
     if not tx or not ty:
         return bool(_norm_text(x)) and _norm_text(x) == _norm_text(y)

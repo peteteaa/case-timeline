@@ -14,7 +14,7 @@ help:
 	@echo "  test / test-llm      unit tests (no model) / live-model tests"
 	@echo "  lint / fmt           ruff check + format check / auto-fix"
 	@echo "  llm                  start vLLM on 172.17.0.1:8000"
-	@echo "  app (alias ui)       web UI + job worker on http://127.0.0.1:8080"
+	@echo "  app (alias ui)       web UI + job worker on http://127.0.0.1:8090"
 	@echo "  serve-mcp (alias mcp) MCP server over stdio (normally spawned by OpenClaw)"
 	@echo "  scan CASE=<id>       queue a scan and run it inline (no app server needed)"
 	@echo "  eval CASE=<id>       metrics vs gold; report in data/eval_<id>.json"

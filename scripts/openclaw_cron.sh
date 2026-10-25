@@ -13,12 +13,14 @@
 # must then allow that one endpoint.
 #
 # Env overrides: OPENCLAW, CT_CASE_ID (default demo), CT_TZ (IANA tz), CT_SCAN_EVERY (default 5m),
+# CT_OPENCLAW_AGENT (default case-timeline: the shell-less agent),
 # CT_ALERT_CHANNEL (unset = no channel), CT_ALERT_TO (channel destination, optional).
 set -euo pipefail
 
 OPENCLAW="${OPENCLAW:-$HOME/.openclaw/bin/openclaw}"
 CASE_ID="${CT_CASE_ID:-demo}"
 EVERY="${CT_SCAN_EVERY:-5m}"
+AGENT="${CT_OPENCLAW_AGENT:-case-timeline}"
 DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
 
@@ -59,6 +61,7 @@ TZ_ARGS=()
 
 echo "==> Scan every $EVERY"
 run "$OPENCLAW" cron add \
+  --agent "$AGENT" \
   --name "case-timeline scan ($CASE_ID)" \
   --declaration-key "case-timeline:scan:$CASE_ID" \
   --description "Queue a scan of the case folder and check for new alerts" \
@@ -71,6 +74,7 @@ run "$OPENCLAW" cron add \
 
 echo "==> Daily digest at 08:00"
 run "$OPENCLAW" cron add \
+  --agent "$AGENT" \
   --name "case-timeline digest ($CASE_ID)" \
   --declaration-key "case-timeline:digest:$CASE_ID" \
   --description "Daily digest for the case (content-free when announced)" \

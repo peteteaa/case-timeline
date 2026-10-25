@@ -5,7 +5,8 @@
 #   scripts/register_openclaw.sh --dry-run  # print the commands only
 #
 # Env overrides: OPENCLAW (CLI path), CT_DATA_DIR, CT_EVIDENCE_DIR, CT_CASE_ID,
-# CT_SKILL_SCOPE=global (install into the shared skills dir instead of the agent workspace).
+# CT_SKILL_SCOPE=global (install into the shared skills dir instead of the agent workspace),
+# CT_OPENCLAW_AGENT (agent whose workspace gets the skill; default case-timeline).
 # Everything stays local: the server is spawned over stdio and binds no network port. The MCP
 # server only reads the database and queues jobs; the app server (`make app`) runs them.
 set -euo pipefail
@@ -53,7 +54,7 @@ echo "==> Registering MCP server '$SERVER_NAME'"
 run "$OPENCLAW" mcp set "$SERVER_NAME" "$SERVER_JSON"
 
 echo "==> Installing skill from $SKILL_DIR"
-SKILL_ARGS=(skills install "$SKILL_DIR" --as case-timeline --force)
+SKILL_ARGS=(skills install "$SKILL_DIR" --as case-timeline --force --agent "${CT_OPENCLAW_AGENT:-case-timeline}")
 [[ "${CT_SKILL_SCOPE:-}" == "global" ]] && SKILL_ARGS+=(--global)
 run "$OPENCLAW" "${SKILL_ARGS[@]}"
 

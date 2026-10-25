@@ -914,7 +914,7 @@ _MONTHS = (
     r"Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?"
 )
 _DATE_RE = re.compile(
-    rf"\b(?:{_MONTHS}\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}"
+    rf"\b(?:{_MONTHS}\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,\s*|\s+)\d{{4}}"
     rf"|\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTHS},?\s+\d{{4}}"
     r"|\d{4}-\d{2}-\d{2}"
     r"|\d{1,2}/\d{1,2}/\d{4})\b",
@@ -942,7 +942,11 @@ def _email_header_date(value: str) -> date | None:
 
 
 def doc_date(parsed: ParsedDocument) -> date | None:
-    """Best-guess authoring date: EML ``Date`` header, else a date-like line near the top."""
+    """Best-guess authoring date: EML ``Date`` header, else a date-like line near the top.
+
+    A ``Date:`` line that is the incident date of a where/when block ("Location: ...",
+    "Date: ...", "Time: ...") is not the authoring date and is not preferred.
+    """
     lines = parsed.text.split("\n")[:_DOC_DATE_SCAN_LINES]
     if parsed.doc.filename.lower().endswith(".eml"):
         for line in lines:
@@ -951,13 +955,119 @@ def doc_date(parsed: ParsedDocument) -> date | None:
                     return found
                 break
     # Prefer explicit "Date: ..." lines, then any line with a full calendar date.
+    offset = 0
     for line in lines:
         m = _DATE_LINE_RE.match(line)
-        if m and (dm := _DATE_RE.search(m.group(1))):
-            if found := _parse_date_str(dm.group(0)):
+        if m and not _is_incident_field(parsed.text, offset + m.start(1)):
+            if (dm := _DATE_RE.search(m.group(1))) and (found := _parse_date_str(dm.group(0))):
                 return found
+        offset += len(line) + 1
     for line in lines:
         if dm := _DATE_RE.search(line):
             if found := _parse_date_str(dm.group(0)):
                 return found
+    return None
+
+
+# --------------------------------------------------------------------------- incident date
+# The date of the occurrence a document is about (accident, incident, loss, offense), as
+# given by a header or form field ("Date of Accident: ...", "Date: June 5, 2021, 0940 CDT"
+# in a "Location: / Date: / Time:" block), or by an early sentence ("the collision ... on
+# June 5, 2021"). This is not the authoring date: an investigation report, statement or
+# letter is often written weeks after the occurrence it describes.
+
+_INCIDENT_SCAN_CHARS = 6000
+_INCIDENT_NOUN = (
+    r"(?:accident|incident|occurrence|crash|collision|mishap|loss|injury|offen[cs]e|event)"
+)
+_NUM_DATE = r"\d{1,2}[/-]\d{1,2}[/-](?:\d{4}|\d{2})\b"
+_ANY_DATE_RE = re.compile(rf"{_DATE_RE.pattern}|\b{_NUM_DATE}", re.IGNORECASE)
+# Form labels that name the occurrence date ("Date of Accident", "Date/Time of Incident
+# (local)", "Incident Date", "Date of Loss", "Occurred On").
+_INCIDENT_LABEL_RE = re.compile(
+    rf"\b(?:date\s*(?:/\s*time)?\s*of\s*(?:the\s+)?{_INCIDENT_NOUN}(?:\s*/\s*{_INCIDENT_NOUN})?"
+    rf"|{_INCIDENT_NOUN}\s+(?:date|dt)(?:\s*/\s*time)?"
+    r"|(?:inc(?:ident)?\.?\s+)?(?:occurred|happened)(?:\s+(?:on|date|start|from))?"
+    r"(?!\s+(?:address|location|place|end|to|until|at)\b))"
+    r"(?:\s*\([^)\n]{0,20}\))?\s*[:\-]?",
+    re.IGNORECASE,
+)
+# Another date field: the value of an incident label never extends past one.
+_OTHER_DATE_LABEL_RE = re.compile(r"\b(?:date|dt|dated|time\s*of)\b", re.IGNORECASE)
+_DATE_FIELD_RE = re.compile(r"(?<![\w/])date\s*(?:/\s*time)?\s*:\s*", re.IGNORECASE)
+_LOCATION_FIELD_RE = re.compile(r"\blocation\s*:", re.IGNORECASE)
+# A short section heading that names the occurrence ("B. VEHICLE ACCIDENT", "2. INCIDENT").
+_INCIDENT_HEADING_RE = re.compile(
+    rf"^[\W_]*(?:[A-Z0-9]{{1,3}}[.)]\s+)?[A-Z][A-Z0-9 ,/&'-]{{0,50}}\b{_INCIDENT_NOUN.upper()}\b"
+    r"[A-Z0-9 ,/&'-]{0,30}$"
+)
+# Prose: "the collision involving ... on June 5, 2021", "Incident occurred Saturday, June 5, 2021".
+_INCIDENT_PROSE_RE = re.compile(
+    r"\b(?:accident|incident|crash|collision|mishap|wreck)\b(?:(?!\n\s*\n)[^.;]){0,100}?"
+    r"\b(?:on|of|dated|(?:that\s+|which\s+)?(?:occurred|happened)(?:\s+on)?)\s+"
+    r"(?:(?:mon|tues|wednes|thurs|fri|satur|sun)day,?\s+)?(?=\S)",
+    re.IGNORECASE,
+)
+
+
+def _is_incident_field(text: str, pos: int) -> bool:
+    """The "Date:" value at `pos` sits in a where/when block or under an incident heading."""
+    before = text[max(0, pos - 160) : pos]
+    if _LOCATION_FIELD_RE.search(before):
+        return True
+    prev = [ln.strip() for ln in before.split("\n")[:-1] if ln.strip()]
+    return bool(prev) and _INCIDENT_HEADING_RE.match(prev[-1]) is not None
+
+
+def _parse_any_date(s: str) -> date | None:
+    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2}|\d{4})", s.strip())
+    if m:  # numeric form fields are month/day/year
+        mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000 if y < 70 else 1900
+        try:
+            return date(y, mo, d)
+        except ValueError:
+            return None
+    return _parse_date_str(s)
+
+
+def _leading_date(s: str, max_offset: int = 0) -> date | None:
+    """A date at (or within `max_offset` characters of) the start of `s`."""
+    s = s.lstrip()
+    m = _ANY_DATE_RE.search(s)
+    if m is None or m.start() > max_offset:
+        return None
+    return _parse_any_date(m.group(0))
+
+
+def incident_date(parsed: ParsedDocument) -> date | None:
+    """The date of the occurrence the document is about, from its header, form or opening.
+
+    Looks, in order, for an explicit incident-date form field ("Date of Accident:",
+    "Incident Date", "Date/Time of Loss"), then a "Date:" field in a
+    "Location: / Date:" block or right under an accident/incident/event heading, then an
+    early sentence tying the occurrence to a date ("the collision ... on June 5, 2021"). None
+    when the document names no such date; a plain "Date:" header (the authoring date) is
+    never taken for it.
+    """
+    head = parsed.text[:_INCIDENT_SCAN_CHARS]
+    for m in _INCIDENT_LABEL_RE.finditer(head):
+        window = head[m.end() : m.end() + 160]
+        if stop := _OTHER_DATE_LABEL_RE.search(window):
+            window = window[: stop.start()]
+        if found := _leading_date(window, len(window)):
+            return found
+
+    authored = doc_date(parsed)
+    for m in _DATE_FIELD_RE.finditer(head):
+        if not _is_incident_field(head, m.start()):
+            continue
+        found = _leading_date(head[m.end() : m.end() + 40])
+        if found is not None and found != authored:
+            return found
+
+    for m in _INCIDENT_PROSE_RE.finditer(head):
+        if found := _leading_date(head[m.end() : m.end() + 40]):
+            return found
     return None

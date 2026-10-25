@@ -384,7 +384,7 @@ def test_get_timeline_fields_and_order(server: Any, fx: Fixture) -> None:
     ev = acc["evidence"][0]
     assert ev["filename"] == "memo.pdf" and ev["page"] == 1 and ev["cite"] == "memo.pdf p. 1"
     assert ev["quote"].startswith("On March 3, 2024")
-    assert ev["source_link"].startswith("http://127.0.0.1:8080/documents/")
+    assert ev["source_link"].startswith("http://127.0.0.1:8090/documents/")
 
     assert facts[ids["draft"]]["review"] == "draft"
     assert facts[ids["draft"]]["evidence"][0]["page"] == 2
@@ -480,7 +480,7 @@ def test_pending_alerts_are_content_free(server: Any, fx: Fixture) -> None:
     out = call(server, "get_pending_alerts")
     got = {a["alert_id"]: a for a in out["alerts"]}
     assert set(got) == {ids["alert_conflict"], ids["alert_deadline"], ids["alert_witness"]}
-    link = "http://127.0.0.1:8080/cases/demo/alerts"
+    link = "http://127.0.0.1:8090/cases/demo/alerts"
     assert out["dashboard_url"] == link and "internal" in out["relay_policy"]
     for a in got.values():
         assert a["dashboard_url"] == link
@@ -514,9 +514,9 @@ def test_mark_alerts_delivered_is_idempotent(server: Any, fx: Fixture) -> None:
 def test_daily_digest(server: Any, fx: Fixture) -> None:
     out = call(server, "daily_digest")
     assert out["fact_ids"] == [fx.ids["draft"], fx.ids["alleged"]]
-    assert out["dashboard_url"] == "http://127.0.0.1:8080/cases/demo"
+    assert out["dashboard_url"] == "http://127.0.0.1:8090/cases/demo"
     assert out["message"] == (
-        "Case demo daily digest: 2 new facts, 1 alerts. Review: http://127.0.0.1:8080/cases/demo"
+        "Case demo daily digest: 2 new facts, 1 alerts. Review: http://127.0.0.1:8090/cases/demo"
     )
     assert out["text"].startswith("2 new facts")
 
