@@ -189,13 +189,24 @@ def load_disputes(path: Path) -> list[GoldDispute]:
 
 
 def default_paths(case_id: str) -> tuple[Path, Path]:
-    """Per-case gold under eval/gold/, else the public set's files at eval/."""
-    timeline = GOLD_DIR / f"{case_id}_timeline.json"
+    """Per-case gold under eval/gold/ (``<case>_timeline.json``, else ``<case>.json``), else
+    the public set's files at eval/, with a warning: scoring a case against another case's
+    gold gives meaningless numbers. A case with its own timeline but no disputes file gets
+    no disputes (the returned path doesn't exist), never the public set's."""
+    timeline = next(
+        (p for p in (GOLD_DIR / f"{case_id}_timeline.json", GOLD_DIR / f"{case_id}.json")
+         if p.exists()),
+        None,
+    )  # fmt: skip
     disputes = GOLD_DIR / f"{case_id}_disputes.json"
-    return (
-        timeline if timeline.exists() else EVAL_DIR / "gold_timeline.json",
-        disputes if disputes.exists() else EVAL_DIR / "gold_disputes.json",
-    )
+    if timeline is None:
+        timeline = EVAL_DIR / "gold_timeline.json"
+        log.warning("no gold timeline for case %r under %s; using %s", case_id, GOLD_DIR, timeline)
+        if not disputes.exists():
+            disputes = EVAL_DIR / "gold_disputes.json"
+    elif not disputes.exists():
+        log.warning("no gold disputes for case %r; contradictions are not scored", case_id)
+    return timeline, disputes
 
 
 def load_preds(store: Any, case_id: str) -> list[Pred]:

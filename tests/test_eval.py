@@ -450,3 +450,17 @@ def test_fetch_eval_fills_and_verifies_sha256(tmp_path: Path) -> None:
     manifest.write_text(json.dumps(bad))
     with pytest.raises(ValueError):
         fe.fetch_all(manifest)
+
+
+def test_default_gold_paths_accept_the_bare_case_file_and_warn_on_fallback(caplog):
+    from eval import run_eval
+
+    timeline, disputes = run_eval.default_paths("ntsb")
+    assert timeline == run_eval.GOLD_DIR / "ntsb.json"  # eval/gold/ntsb.json, not the demo set
+    assert not disputes.exists()  # never the demo set's disputes
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        timeline, disputes = run_eval.default_paths("no-such-case")
+    assert timeline == run_eval.EVAL_DIR / "gold_timeline.json"
+    assert disputes == run_eval.EVAL_DIR / "gold_disputes.json"
+    assert "no gold timeline" in caplog.text
