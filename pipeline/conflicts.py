@@ -786,8 +786,15 @@ def confirm(
 
     Returns the verdict and the surrounding source text both facts were shown with.
     """
-    from pipeline import llm
+    user, context = _confirm_prompt(cand, names, docs)
+    return _ask_verdict(user), context
 
+
+def _confirm_prompt(
+    cand: Candidate, names: Mapping[str, str], docs: _Docs | None = None
+) -> tuple[str, str]:
+    """The confirmation prompt for a candidate, and the source text both facts are shown with
+    (reads the store, so it runs on the caller's thread)."""
     docs = docs or _Docs(None)
     ev_a, ctx_a = _evidence_block(cand.a, docs)
     ev_b, ctx_b = _evidence_block(cand.b, docs)
@@ -799,13 +806,19 @@ def confirm(
         user += "\n\nNotes from the date rules (computed, reliable):\n" + "\n".join(
             f"- {n}" for n in notes
         )
+    return user, f"{ctx_a} {ctx_b}"
+
+
+def _ask_verdict(user: str) -> ConflictVerdict:
+    from pipeline import llm
+
     result = llm.chat_json(
         prompts.CONFLICT_SYSTEM, user, ConflictVerdict, max_tokens=VERDICT_MAX_TOKENS
     )
     if not isinstance(result, ConflictVerdict):
         data = result.model_dump() if isinstance(result, BaseModel) else result
         result = ConflictVerdict.model_validate(data)
-    return result, f"{ctx_a} {ctx_b}"
+    return result
 
 
 def final_fields(
@@ -879,7 +892,13 @@ def detect(
     dismissed conflict stays dismissed, and a pair that restates an existing contradiction's
     disagreement through other facts about the same occurrences is skipped. A failed
     confirmation call skips that candidate.
+
+    Prompts are built here (they read the store), the confirmation calls run concurrently
+    (bounded by ``settings.llm_concurrency`` through ``llm.map_ordered``), and the verdicts are
+    applied in candidate order, so what opens matches a sequential run.
     """
+    from pipeline import llm
+
     focus = set(fact_ids)
     if not focus:
         return []
@@ -900,15 +919,18 @@ def detect(
     cands = candidate_pairs(
         facts, focus, max_candidates=max_candidates, skip_pairs=known, witness_names=witness_names
     )
+    todo: list[tuple[Candidate, str, str]] = []
     for cand in cands:
-        ids = [cand.a.fact_id, cand.b.fact_id]
         if same_disagreement(cand.field, cand.a, cand.b, opened_pairs):
+            ids = [cand.a.fact_id, cand.b.fact_id]
             log.info("conflict %s (%s) restates an open disagreement; skipped", ids, cand.field)
             continue
-        try:
-            verdict, context = confirm(cand, names, docs)
-        except Exception as exc:
-            log.warning("conflict check failed for %s (%s): %s", ids, cand.field, exc)
+        todo.append((cand, *_confirm_prompt(cand, names, docs)))
+    verdicts = llm.map_ordered(_ask_verdict, [user for _cand, user, _ctx in todo])
+    for (cand, _user, context), verdict in zip(todo, verdicts, strict=True):
+        ids = [cand.a.fact_id, cand.b.fact_id]
+        if isinstance(verdict, Exception):
+            log.warning("conflict check failed for %s (%s): %s", ids, cand.field, verdict)
             continue
         log.info(
             "conflict verdict %s suggested=%s score=%.1f same_subject=%s contradiction=%s "

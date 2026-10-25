@@ -425,11 +425,14 @@ def test_detect_does_not_repeat_the_same_disagreement(meeting_case, fake_llm):
     opened = conflicts.detect(store, "demo", [becker, merged, depo])
     assert len(opened) == 1 and opened[0].field == "date"
     assert becker in opened[0].fact_ids
-    assert len(fake_llm["calls"]) == 1  # the restatement was not even sent to the model
-    # Also across runs: a dismissed disagreement isn't reopened through the other fact.
+    # Confirmations run in parallel, so the restatement may be asked, but it never opens.
+    asked = len(fake_llm["calls"])
+    assert 1 <= asked <= 2
+    # Across runs: a dismissed disagreement isn't reopened, or even re-asked, through the
+    # other fact.
     store.review_contradiction(opened[0].contradiction_id, "dismiss", reviewer="alice")
     assert conflicts.detect(store, "demo", [becker, merged, depo]) == []
-    assert len(fake_llm["calls"]) == 1
+    assert len(fake_llm["calls"]) == asked
 
 
 def test_detect_same_subject_false_opens_nothing(meeting_case, fake_llm, monkeypatch):
@@ -832,3 +835,19 @@ def test_date_notes_explain_compatible_dates_zones_and_plans():
         docs=["D-3"],
     )
     assert any("time zones" in n for n in conflicts.date_notes(held, utc))
+
+
+def test_detect_sends_confirmations_through_the_parallel_limiter(
+    meeting_case, fake_llm, monkeypatch
+):
+    store, becker, merged, depo = meeting_case
+    batches: list[int] = []
+    real = llm.map_ordered
+
+    def recording(fn, items, **kw):
+        batches.append(len(items))
+        return real(fn, items, **kw)
+
+    monkeypatch.setattr(llm, "map_ordered", recording)
+    conflicts.detect(store, "demo", [becker, merged, depo])
+    assert batches and batches[0] == len(fake_llm["calls"]) >= 1
