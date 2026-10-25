@@ -452,11 +452,11 @@ def test_fetch_eval_fills_and_verifies_sha256(tmp_path: Path) -> None:
         fe.fetch_all(manifest)
 
 
-def test_default_gold_paths_accept_the_bare_case_file_and_warn_on_fallback(caplog):
+def test_default_gold_paths_never_fall_back_silently(caplog):
     from eval import run_eval
 
     timeline, disputes = run_eval.default_paths("ntsb")
-    assert timeline == run_eval.GOLD_DIR / "ntsb.json"  # eval/gold/ntsb.json, not the demo set
+    assert timeline == run_eval.GOLD_DIR / "ntsb_timeline.json"  # not the demo set
     assert not disputes.exists()  # never the demo set's disputes
     caplog.clear()
     with caplog.at_level("WARNING"):

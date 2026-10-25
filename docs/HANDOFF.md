@@ -54,7 +54,7 @@ Branch `port/handoff` (on top of `4004c9d`). 655 tests green, ruff clean.
 | 2. Contradiction precision rules | Ported to `pipeline/conflicts.py` (date relation / containment / slack, message vs. referenced date, plan vs. outcome, knowledge vs. actor, time-zone and 90 s clock compatibility, local exclusion cue, date notes in the prompt). |
 | 3. llm_concurrency fan-out | Extraction chunks, documents in a job, and contradiction confirmations all go through `llm.map_ordered`; stored results stay in document/candidate order. Default `llm_concurrency` lowered to 4. |
 | 4. OpenClaw scripts | `--agent` (CT_OPENCLAW_AGENT, default case-timeline) in both scripts; `openclaw_cron.sh` defaults to the ntsb case. |
-| Gotcha: eval gold path | Fixed: `--case ntsb` now finds `eval/gold/ntsb.json`, warns on any fallback, and never scores ntsb contradictions against the demo disputes. |
+| Gotcha: eval gold path | Fixed twice over: dell-98 renamed the gold to `ntsb_timeline.json`; `default_paths` also accepts `eval/gold/<case>.json`, warns on any fallback, and never scores a case's contradictions against the demo disputes. |
 
 Live NTSB scan on the port (one scan, concurrency 4, `CT_CASE_TZ=America/Chicago`, 252 s): **date accuracy 1.000 (21/21)**, recall 0.778 (21/27), 0 contradictions from 28 candidates (the model judged all of them distinct occurrences; there is no ntsb disputes gold to score them).
 
