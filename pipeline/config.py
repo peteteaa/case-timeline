@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     ui_host: str = "127.0.0.1"
     ui_port: int = 8080
 
+    max_drafts_per_doc: int = 40  # keep the most confident drafts per document (0 = no cap)
+    worker_poll_seconds: float = 2.0
+    run_worker: bool = True  # the app server starts the job worker
+
     @model_validator(mode="after")
     def _resolve_paths(self) -> Settings:
         self.evidence_dir = _abs(self.evidence_dir)

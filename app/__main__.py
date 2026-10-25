@@ -8,7 +8,7 @@ import sys
 import uvicorn
 
 from pipeline.config import get_settings
-from ui.app import create_app, host_is_loopback
+from app.app import create_app, host_is_loopback
 
 log = logging.getLogger("ui")
 

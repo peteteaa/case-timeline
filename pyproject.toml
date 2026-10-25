@@ -18,6 +18,8 @@ dependencies = [
   "python-multipart>=0.0.9",
   "mcp>=1.2",
   "filelock>=3.15",
+  "openpyxl>=3.1.5",
+  "cairosvg>=2.9.1",
 ]
 
 [project.optional-dependencies]
@@ -40,4 +42,4 @@ markers = ["llm: requires the local vLLM server on 127.0.0.1:8000"]
 addopts = "-m 'not llm'"
 
 [tool.setuptools]
-packages = ["pipeline", "mcp_server", "ui", "eval"]
+packages = ["pipeline", "mcp_server", "app", "eval"]
