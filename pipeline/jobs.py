@@ -114,49 +114,56 @@ def _parse_doc(store: Store, settings: Settings, doc_id: str, run: _Run) -> Pars
     return store.get_parsed(doc_id)
 
 
-def _store_drafts(
-    store: Store, parsed: ParsedDocument, drafts: list[DraftFact], run: _Run
-) -> None:
+def _store_drafts(store: Store, parsed: ParsedDocument, drafts: list[DraftFact], run: _Run) -> None:
     """Witnesses, merge and storage for one document's verified, dated drafts."""
     from pipeline import merge, witnesses
 
     case_id = parsed.doc.case_id
+    # Witnesses first (SPEC §6.1 step 3): merge needs them to tell whether people agree.
+    people = {d.key: witnesses.match_people(store, case_id, d.people) for d in drafts}
     existing = store.list_facts(case_id)
-    plan = merge.plan(drafts, existing)  # draft key -> existing fact id, or None
+    plan = merge.plan(drafts, existing, witness_ids=people)  # draft key -> fact id, or None
     key_to_fact: dict[str, str] = {}
+    created: set[str] = set()
     for draft in drafts:
-        witness_ids = witnesses.match_people(store, case_id, draft.people)
+        witness_ids = people[draft.key]
         target = plan.get(draft.key)
-        if target is not None:
-            for span in draft.spans:
-                store.add_evidence(target, kind="span", by=AGENT, span=span)
-            fact = store.get_fact(target)
-            if fact is not None and fact.review == "draft" and witness_ids:
-                store.link_witnesses(target, witness_ids, by=AGENT)
-            key_to_fact[draft.key] = target
-            run.touched_fact_ids.append(target)
-            run.counts["evidence_attached"] += 1
+        try:
+            if target is not None:
+                for span in draft.spans:
+                    store.add_evidence(target, kind="span", by=AGENT, span=span)
+                fact = store.get_fact(target)
+                if fact is not None and fact.review == "draft" and witness_ids:
+                    store.link_witnesses(target, witness_ids, by=AGENT)
+                key_to_fact[draft.key] = target
+                run.touched_fact_ids.append(target)
+                run.counts["evidence_attached"] += 1
+                continue
+            fact = store.add_fact(
+                case_id,
+                draft.title,
+                by=AGENT,
+                details=draft.details,
+                date_text=draft.date_text,
+                date_start=draft.date_start,
+                date_end=draft.date_end,
+                date_certainty=draft.date_certainty,
+                anchor_fact_id=draft.anchor_fact_id,
+                witness_ids=witness_ids,
+                confidence=draft.confidence,
+                spans=draft.spans,
+            )
+        except (ValueError, KeyError, PermissionError) as exc:  # one bad draft: skip it
+            log.warning("could not store draft %r from %s: %s", draft.title, parsed.doc.doc_id, exc)
+            run.problems.append(f"{parsed.doc.filename}: draft not stored: {exc}")
             continue
-        fact = store.add_fact(
-            case_id,
-            draft.title,
-            by=AGENT,
-            details=draft.details,
-            date_text=draft.date_text,
-            date_start=draft.date_start,
-            date_end=draft.date_end,
-            date_certainty=draft.date_certainty,
-            anchor_fact_id=draft.anchor_fact_id,
-            witness_ids=witness_ids,
-            confidence=draft.confidence,
-            spans=draft.spans,
-        )
         key_to_fact[draft.key] = fact.fact_id
+        created.add(draft.key)
         run.new_fact_ids.append(fact.fact_id)
         run.counts["facts_created"] += 1
     # Relative dates anchored on another draft of this document: point at the stored fact.
     for draft in drafts:
-        if draft.anchor_key and draft.anchor_key in key_to_fact and draft.key in key_to_fact:
+        if draft.anchor_key and draft.anchor_key in key_to_fact and draft.key in created:
             fid = key_to_fact[draft.key]
             anchor = key_to_fact[draft.anchor_key]
             fact = store.get_fact(fid)
@@ -225,7 +232,7 @@ def run_job(store: Store, job: Job, settings: Settings | None = None) -> Job:
 
         error = None
         if run.problems:
-            error = (f"{len(run.problems)} problem(s): " + "; ".join(run.problems))
+            error = f"{len(run.problems)} problem(s): " + "; ".join(run.problems)
             error = error[:_MAX_ERROR_CHARS]
         failed = bool(todo) and not run.processed_doc_ids
         return store.finish_job(
@@ -245,14 +252,17 @@ class Worker:
     """Background thread that runs queued jobs (started by the app server)."""
 
     def __init__(
-        self, settings: Settings | None = None, *, store: Store | None = None,
+        self,
+        settings: Settings | None = None,
+        *,
+        store: Store | None = None,
         poll_seconds: float | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self._own_store = store is None
         self.store = store or Store(self.settings.db_path)
-        self.poll_seconds = poll_seconds if poll_seconds is not None else (
-            self.settings.worker_poll_seconds
+        self.poll_seconds = (
+            poll_seconds if poll_seconds is not None else (self.settings.worker_poll_seconds)
         )
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -303,8 +313,9 @@ class Worker:
             self._wake.clear()
 
 
-def run_now(case_id: str | None = None, *, trigger: str = "ui",
-            settings: Settings | None = None) -> Job:
+def run_now(
+    case_id: str | None = None, *, trigger: str = "ui", settings: Settings | None = None
+) -> Job:
     """Queue a scan and run the queue inline (CLI, tests, ``make scan``)."""
     settings = settings or get_settings()
     cid = valid_case_id(case_id or settings.case_id)

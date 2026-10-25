@@ -609,6 +609,35 @@ CONTRADICTIONS = [
     },
 ]
 
+
+def gold_timeline() -> list[dict]:
+    """GOLD in the eval/run_eval.py fact layout (title, people, date_end, date_certainty)."""
+    out = []
+    for i, g in enumerate(GOLD, start=1):
+        start, end = g["date_range"] if g.get("date_range") else (g["date"], None)
+        out.append(
+            {
+                "id": f"G{i:02d}",
+                "title": g["description"],
+                "date": start,
+                "date_end": end,
+                "date_text": g["date_text"],
+                "date_certainty": g["certainty"],
+                "doc": g["doc"],
+                "event_key": g["event_key"],
+                "quote": g["quote"],
+                "people": g["actors"],
+                "deadline": g["deadline_relevant"],
+            }
+        )
+    return out
+
+
+def gold_disputes() -> list[dict]:
+    """CONTRADICTIONS as gold dispute labels (every planted/derived one is disputed)."""
+    return [{**c, "label": "disputed"} for c in CONTRADICTIONS]
+
+
 # --------------------------------------------------------------------------- writers
 
 FIXED_DT = datetime(2024, 10, 1, 12, 0, 0)
@@ -699,7 +728,10 @@ def make_all(out_dir: Path, gold_dir: Path) -> list[Path]:
     make_eml(written[2])
     written[3].write_text(TXT_TEXT, encoding="utf-8", newline="\n")
     written[4].write_text(MD_TEXT, encoding="utf-8", newline="\n")
-    for name, payload in (("demo.json", GOLD), ("demo_contradictions.json", CONTRADICTIONS)):
+    for name, payload in (
+        ("demo_timeline.json", gold_timeline()),
+        ("demo_disputes.json", gold_disputes()),
+    ):
         p = gold_dir / name
         p.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         written.append(p)

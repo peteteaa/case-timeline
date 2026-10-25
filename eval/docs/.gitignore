@@ -1,0 +1,5 @@
+# Downloaded documents are not committed; only the manifest and notes are.
+*
+!.gitignore
+!manifest.json
+!README.md

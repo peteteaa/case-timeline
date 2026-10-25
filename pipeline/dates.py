@@ -1,7 +1,11 @@
-"""Resolve free-text dates on events into date ranges with an honest certainty level.
+"""Resolve free-text dates on drafted facts into date ranges with an honest certainty (§9.10).
 
-Precision is never invented: a month-only date becomes the whole month (APPROXIMATE), a
-season becomes the season's months, and an unparseable date stays UNKNOWN with no dates.
+Precision is never invented: a month-only date becomes the whole month ("approximate"), a
+season becomes the season's months, a span between two exact days ("March 3-5, 2024") is
+"exact" with both ends set, and an unparseable date stays "unknown" with no dates. Relative
+dates ("two days after the meeting") resolve against an anchor: another draft of the same
+document (``anchor_key``), an existing fact (``anchor_fact_id``) or the document's own date;
+unresolved ones stay undated with certainty "relative".
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import dateparser
 from dateutil.relativedelta import relativedelta
 from rapidfuzz import fuzz
 
-from pipeline.contracts import Certainty, Event
+from pipeline.schema import Certainty, DraftFact, Fact
 
 logger = logging.getLogger(__name__)
 
@@ -79,11 +83,18 @@ _OPEN_BOUND = re.compile(
 # ----------------------------------------------------------------------------- helpers
 
 
+_TIME_OF_DAY = re.compile(
+    r"(?:\s+(?:at|@))?(?:\s+(?:approximately|approx\.?|about|around))?\s*\b\d{1,2}:\d{2}(?::\d{2})?(?:\s*[ap]\.?m\b\.?)?"
+    r"(?:\s*[+-]\d{4}\b|\s+(?:utc|gmt|[ecmp][sd]t)\b)?"
+)
+
+
 def _clean(text: str) -> str:
     s = text.lower().replace("’", "'").replace("‘", "'")
     s = re.sub(r"\s*[–—]\s*", " - ", s)
     s = re.sub(r"\(\s*\d+\s*\)", " ", s)  # "thirty (30) days"
     s = re.sub(r"\([^)]*\)", " ", s)
+    s = _TIME_OF_DAY.sub(" ", s)  # "09:14:00 -0400", "at 4:02 pm": a date, not a range
     s = re.sub(r"\s+", " ", s).strip()
     return s.strip(" .,;:\"'")
 
@@ -139,8 +150,7 @@ def _parse_point(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
             inner = parse_absolute(s[len(prefix) + 1 :], ref)
             if inner is None:
                 return None
-            span, cert = inner
-            return span, Certainty.RANGE if cert == Certainty.RANGE else Certainty.APPROXIMATE
+            return inner[0], "approximate"
 
     m = _OPEN_BOUND.match(s)
     if m:
@@ -149,7 +159,7 @@ def _parse_point(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
             return None
         (lo, hi), _ = inner
         bound = lo if m.group(1) in ("before", "prior to", "preceding", "since") else hi
-        return (bound, bound), Certainty.APPROXIMATE
+        return (bound, bound), "approximate"
 
     for prefix in _PLAIN_PREFIXES:
         if s.startswith(prefix + " "):
@@ -160,7 +170,7 @@ def _parse_point(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
 
 def _parse_partial(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
     """Month-only, year-only, seasons, quarters, early/mid/late, week of."""
-    approx = Certainty.APPROXIMATE
+    approx: Certainty = "approximate"
 
     m = re.match(
         r"^(?:the\s+)?(?:(?:early|mid|late)[\s-]+)?(spring|summer|fall|autumn|winter)"
@@ -255,7 +265,7 @@ def _parse_full(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
     if parsed is None:
         return None
     d = parsed.date()
-    return (d, d), Certainty.EXACT
+    return (d, d), "exact"
 
 
 def _parse_month_day(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
@@ -269,9 +279,19 @@ def _parse_month_day(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
         s,
     )
     if not m:
-        return None
+        # "mid-March", "March": the month (or part of it) in the nearest year.
+        part = r"(?:early|mid|middle|late|beginning|start|end|close)"
+        mm = re.match(
+            rf"^(?:the\s+)?(?:{part}(?:\s*-\s*|\s+of\s+|\s+))?(?:the\s+month\s+of\s+)?"
+            rf"(?P<mon>{_MONTH})$",
+            s,
+        )
+        if not mm:
+            return None
+        near = _nearest_year(_month_num(mm.group("mon")), 15, ref)
+        return _parse_partial(f"{s} {near.year}", ref) if near else None
     d = _nearest_year(_month_num(m.group("mon")), int(m.group("d")), ref)
-    return ((d, d), Certainty.APPROXIMATE) if d else None
+    return ((d, d), "approximate") if d else None
 
 
 def _parse_range(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
@@ -281,7 +301,7 @@ def _parse_range(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
         y1 = int(m.group(1))
         y2 = int(m.group(2)) if len(m.group(2)) == 4 else (y1 // 100) * 100 + int(m.group(2))
         if y2 > y1:
-            return (date(y1, 1, 1), date(y2, 12, 31)), Certainty.RANGE
+            return (date(y1, 1, 1), date(y2, 12, 31)), "approximate"
         return None
 
     pairs: list[tuple[str, str]] = []
@@ -329,13 +349,17 @@ def _range_sides(left: str, right: str, ref: date | None) -> tuple[Span, Certain
     rp = parse_absolute(right, ref)
     if lp is None or rp is None:
         return None
+    if min(lp[0][0].year, rp[0][0].year) < 1000:  # "-0400" and the like are not years
+        return None
     (lo, _), _ = lp
     (_, hi), _ = rp
     if lo > hi and borrowed:
         lo = lo - relativedelta(years=1)
     if lo > hi:
         lo, hi = rp[0][0], lp[0][1]
-    return (lo, hi), Certainty.RANGE
+    # Both ends stated to the day: an exact span. Otherwise the ends are themselves fuzzy.
+    cert: Certainty = "exact" if lp[1] == "exact" and rp[1] == "exact" else "approximate"
+    return (lo, hi), cert
 
 
 # ----------------------------------------------------------------------- relative dates
@@ -550,141 +574,197 @@ def parse_relative(text: str) -> RelativeSpec | None:
 # --------------------------------------------------------------------- anchor selection
 
 _ARTICLES = re.compile(r"^(?:the|a|an|his|her|their|its|our|my|your|said|that|this)\s+")
+_ANCHOR_MIN_SCORE = 85
 
 
-def _match_anchor(phrase: str, pos: int, candidates: list[tuple[int, Event]]) -> Event | None:
-    """Best event whose description/quote mentions the anchor phrase ("the meeting")."""
+@dataclass
+class _Anchor:
+    """A dated candidate anchor: a draft of this document or an existing fact."""
+
+    span: Span
+    certainty: str
+    text: str  # lowercased title, details and quotes, for phrase matching
+    pos: int | None = None  # text position (drafts only)
+    key: str | None = None  # draft key
+    fact_id: str | None = None
+
+
+def _draft_text(d: DraftFact) -> str:
+    quotes = [s.quote for s in d.spans] or d.quotes
+    return " ".join([d.title, d.details or "", *quotes]).lower()
+
+
+def _fact_text(f: Fact) -> str:
+    quotes = [e.quote for e in f.evidence if e.quote]
+    return " ".join([f.title, f.details or "", *quotes]).lower()
+
+
+def _match_anchor(phrase: str, pos: int, candidates: list[_Anchor]) -> _Anchor | None:
+    """Best candidate whose text mentions the anchor phrase ("the meeting").
+
+    Drafts of the same document win over existing facts; then match score, then a stated
+    (not relative) date, then a position before the relative date, then proximity.
+    """
     key = _ARTICLES.sub("", _clean(phrase)).strip()
     if len(key) < 3:
         return None
-    best: tuple[tuple[float, bool, bool, int], Event] | None = None
-    for cpos, ev in candidates:
-        hay = f"{ev.description} {ev.source.quote}".lower()
-        score = fuzz.partial_ratio(key, hay)
-        if score < 85:
+    best: tuple[tuple, _Anchor] | None = None
+    for c in candidates:
+        score = fuzz.partial_ratio(key, c.text)
+        if score < _ANCHOR_MIN_SCORE:
             continue
-        rank = (score, ev.certainty != Certainty.RELATIVE, cpos < pos, -abs(cpos - pos))
+        in_doc = c.pos is not None
+        cpos = c.pos if c.pos is not None else 0
+        rank = (
+            in_doc,
+            score,
+            c.certainty != "relative",
+            in_doc and cpos < pos,
+            -abs(cpos - pos) if in_doc else 0,
+        )
         if best is None or rank > best[0]:
-            best = (rank, ev)
+            best = (rank, c)
     return best[1] if best else None
 
 
-def _prior(pos: int, candidates: list[tuple[int, Event]]) -> Event | None:
-    prior = [(cpos, ev) for cpos, ev in candidates if cpos < pos]
-    return max(prior, key=lambda x: x[0])[1] if prior else None
+def _prior(pos: int, candidates: list[_Anchor]) -> _Anchor | None:
+    prior = [c for c in candidates if c.pos is not None and c.pos < pos]
+    return max(prior, key=lambda c: c.pos or 0) if prior else None
 
 
-def _span_of(ev: Event) -> Span:
-    start = ev.date_start or date.min
-    return start, ev.date_end or start
+def _pos(d: DraftFact, i: int) -> int:
+    return min(s.char_start for s in d.spans) if d.spans else i
 
 
-def resolve_dates(events: list[Event], doc_date: date | None) -> list[Event]:
-    """Fill date_start/date_end/certainty (and anchor_event_id for relative dates).
+def _draft_anchor(d: DraftFact, pos: int) -> _Anchor:
+    assert d.date_start is not None
+    return _Anchor(
+        span=(d.date_start, d.date_end or d.date_start),
+        certainty=d.date_certainty,
+        text=_draft_text(d),
+        pos=pos,
+        key=d.key,
+    )
 
-    Events are grouped per source document and walked in text order. Absolute dates are
-    resolved first; relative ones then anchor to the event they name, else the most recent
-    prior dated event in the same document, else `doc_date` ("yesterday", "3 days ago"
-    prefer `doc_date`). Events that already carry a date_start are left untouched.
+
+def resolve_drafts(
+    drafts: list[DraftFact], doc_date: date | None, existing_facts: list[Fact] | None = None
+) -> list[DraftFact]:
+    """Fill date_start/date_end/date_certainty (and anchors for relative dates).
+
+    ``drafts`` all come from one document and are walked in text order (first span).
+    Absolute dates are resolved first; relative ones then anchor to the draft or existing
+    fact they name, else the most recent prior dated draft, else ``doc_date`` ("yesterday"
+    and "3 days ago" prefer ``doc_date``). Drafts that already carry a date_start are left
+    untouched. Input order is preserved.
     """
-    if not events:
+    if not drafts:
         return []
-    out: list[Event] = list(events)
-    by_doc: dict[str, list[int]] = {}
-    for i, ev in enumerate(out):
-        by_doc.setdefault(ev.source.doc_id, []).append(i)
+    out: list[DraftFact] = list(drafts)
+    order = sorted(range(len(out)), key=lambda i: (_pos(out[i], i), i))
+    pos_of = {i: _pos(out[i], i) for i in order}
+    facts = [
+        _Anchor(
+            span=(f.date_start, f.date_end or f.date_start),
+            certainty=f.date_certainty,
+            text=_fact_text(f),
+            fact_id=f.fact_id,
+        )
+        for f in (existing_facts or [])
+        if f.date_start is not None and f.review != "rejected"
+    ]
+    pending: list[tuple[int, RelativeSpec]] = []
+    last_dated: date | None = None
 
-    for idxs in by_doc.values():
-        order = sorted(idxs, key=lambda i: (out[i].source.char_start, i))
-        pos_of = {i: p for p, i in enumerate(order)}
-        pending: list[tuple[int, RelativeSpec]] = []
-        last_dated: date | None = None
+    for i in order:
+        d = out[i]
+        if d.date_start is not None:
+            last_dated = d.date_start
+            continue
+        text = (d.date_text or "").strip()
+        undated = {"date_start": None, "date_end": None, "date_certainty": "unknown"}
+        if not text:
+            out[i] = d.model_copy(update=undated)
+            continue
+        absolute = parse_absolute(text, last_dated or doc_date)
+        if absolute is not None:
+            (lo, hi), cert = absolute
+            out[i] = d.model_copy(update={"date_start": lo, "date_end": hi, "date_certainty": cert})
+            last_dated = lo
+            continue
+        spec = parse_relative(text)
+        if spec is not None:
+            pending.append((i, spec))
+        else:
+            out[i] = d.model_copy(update=undated)
 
-        for i in order:
-            ev = out[i]
-            if ev.date_start is not None:
-                last_dated = ev.date_start
-                continue
-            ref = last_dated or doc_date
-            absolute = parse_absolute(ev.date_text, ref)
-            if absolute is not None:
-                (lo, hi), cert = absolute
-                out[i] = ev.model_copy(update={"date_start": lo, "date_end": hi, "certainty": cert})
-                last_dated = lo
-                continue
-            spec = parse_relative(ev.date_text)
-            if spec is not None:
-                pending.append((i, spec))
-            else:
-                out[i] = ev.model_copy(
-                    update={"date_start": None, "date_end": None, "certainty": Certainty.UNKNOWN}
-                )
-
-        for final in (False, True):
-            still: list[tuple[int, RelativeSpec]] = []
-            for i, spec in pending:
-                resolved = _resolve_relative(out, i, spec, order, pos_of, doc_date, final)
-                if resolved is None:
-                    still.append((i, spec))
-                else:
-                    out[i] = resolved
-            pending = still
-        for i, _spec in pending:
-            out[i] = out[i].model_copy(
-                update={"date_start": None, "date_end": None, "certainty": Certainty.RELATIVE}
+    for final in (False, True):
+        still: list[tuple[int, RelativeSpec]] = []
+        for i, spec in pending:
+            candidates = [
+                _draft_anchor(out[j], pos_of[j])
+                for j in order
+                if j != i and out[j].date_start is not None
+            ]
+            resolved = _resolve_relative(
+                out[i], pos_of[i], spec, candidates, facts, doc_date, final
             )
+            if resolved is None:
+                still.append((i, spec))
+            else:
+                out[i] = resolved
+        pending = still
+    for i, _spec in pending:
+        out[i] = out[i].model_copy(
+            update={"date_start": None, "date_end": None, "date_certainty": "relative"}
+        )
     return out
 
 
 def _resolve_relative(
-    out: list[Event],
-    i: int,
+    d: DraftFact,
+    pos: int,
     spec: RelativeSpec,
-    order: list[int],
-    pos_of: dict[int, int],
+    drafts: list[_Anchor],
+    facts: list[_Anchor],
     doc_date: date | None,
     final: bool,
-) -> Event | None:
-    ev = out[i]
-    pos = pos_of[i]
-    candidates = [(pos_of[j], out[j]) for j in order if j != i and out[j].date_start is not None]
+) -> DraftFact | None:
     anchor_span: Span | None = None
-    anchor_id: str | None = None
-    from_event = False
+    anchor: _Anchor | None = None
 
     if spec.phrase:
-        prior = _prior(pos, candidates)
-        ref = (prior.date_start if prior else None) or doc_date
+        prior = _prior(pos, drafts)
+        ref = (prior.span[0] if prior else None) or doc_date
         absolute = parse_absolute(spec.phrase, ref)
         if absolute is not None:
             anchor_span = absolute[0]
         else:
-            match = _match_anchor(spec.phrase, pos, candidates)
-            if match is None and final:
-                match = _prior(pos, candidates)
-            if match is not None:
-                anchor_span, anchor_id, from_event = _span_of(match), match.id, True
+            anchor = _match_anchor(spec.phrase, pos, drafts + facts)
+            if anchor is None and final:
+                anchor = _prior(pos, drafts)
     elif spec.deictic and doc_date is not None:
         anchor_span = (doc_date, doc_date)
     else:
-        prior = _prior(pos, candidates)
-        if prior is not None:
-            anchor_span, anchor_id, from_event = _span_of(prior), prior.id, True
-        elif doc_date is not None and final:
+        anchor = _prior(pos, drafts)
+        if anchor is None and doc_date is not None and final:
             anchor_span = (doc_date, doc_date)
 
+    if anchor is not None:
+        anchor_span = anchor.span
     if anchor_span is None:
         return None
     try:
-        lo, hi = spec.apply(anchor_span, from_event)
+        lo, hi = spec.apply(anchor_span, anchor is not None)
     except (ValueError, OverflowError) as exc:
-        logger.debug("could not apply relative date %r: %s", ev.date_text, exc)
+        logger.debug("could not apply relative date %r: %s", d.date_text, exc)
         return None
-    return ev.model_copy(
+    return d.model_copy(
         update={
             "date_start": lo,
             "date_end": hi,
-            "certainty": Certainty.RELATIVE,
-            "anchor_event_id": anchor_id,
+            "date_certainty": "relative",
+            "anchor_key": anchor.key if anchor else None,
+            "anchor_fact_id": anchor.fact_id if anchor else None,
         }
     )

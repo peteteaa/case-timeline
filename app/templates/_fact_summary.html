@@ -1,0 +1,16 @@
+{% import "_macros.html" as m with context %}
+<div class="fact-summary">
+  <p class="muted small">{{ fact.fact_id }} · {{ 'AI draft' if fact.origin == 'ai' else 'Created by ' ~ fact.created_by }}</p>
+  <h2><a href="{{ fact_url(fact.fact_id) }}">{{ fact.title }}</a></h2>
+  <p>{% if fact.date_start %}{{ fact_date(fact) }}{% else %}<span class="muted">Undated</span>{% endif %}{% if fact.date_text %} <span class="muted">“{{ fact.date_text }}”</span>{% endif %}</p>
+  {{ m.badges(fact, [fact.fact_id] if alleged else [], [fact.fact_id] if conflict else []) }}
+  {% if fact.details %}<p class="details">{{ fact.details }}</p>{% endif %}
+  {% if fact.tag_ids %}<div class="chips">{% for tid in fact.tag_ids %}{% if tag_map.get(tid) %}{{ m.tag_chip(tag_map[tid]) }}{% endif %}{% endfor %}</div>{% endif %}
+  {% if fact.witness_ids %}<p class="small">People: {% for wid in fact.witness_ids %}{% if witness_map.get(wid) %}<a href="/witnesses/{{ quote(wid) }}">{{ witness_map[wid].name }}</a>{% if not loop.last %}, {% endif %}{% endif %}{% endfor %}</p>{% endif %}
+  <h3>Evidence ({{ fact.evidence | length }})</h3>
+  <ul class="plain evidence-list">
+    {% for ev in fact.evidence[:4] %}{{ m.evidence_item(ev, doc_map, fact_url(fact.fact_id), controls=False) }}{% endfor %}
+  </ul>
+  {% if notes %}<p class="muted small">{{ notes | length }} note{{ '' if notes | length == 1 else 's' }}</p>{% endif %}
+  <p>{{ m.review_controls(fact, fact_url(fact.fact_id)) }} <a class="btn small" href="{{ fact_url(fact.fact_id) }}">Open fact card</a></p>
+</div>

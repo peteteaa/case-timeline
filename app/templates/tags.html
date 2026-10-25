@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+{% block title %}Tags{% endblock %}
+{% block content %}
+{% set base = '/cases/' ~ quote(case_id) %}
+<section class="page-head"><h1>Issue tags <span class="muted">({{ tags | length }})</span></h1></section>
+<section class="card">
+  <form method="post" action="{{ base }}/tags" class="inline-form">
+    <input type="hidden" name="action" value="create">
+    <label class="grow">New tag<input name="name" required maxlength="80" placeholder="e.g. Breach of contract"></label>
+    <label>Color<input type="color" name="color" value="#2f5fb3"></label>
+    <button class="btn primary small">Create tag</button>
+  </form>
+</section>
+<section class="card">
+  {% if tags %}
+  <table class="facts">
+    <thead><tr><th>Tag</th><th class="num">Facts</th><th>Rename / color</th><th></th></tr></thead>
+    <tbody>
+    {% for t in tags %}
+      <tr id="{{ t.tag_id }}">
+        <td>{{ m.tag_chip(t) }}</td>
+        <td class="num"><a href="{{ base }}/facts?tag={{ quote(t.tag_id) }}">{{ tag_counts[t.tag_id] }}</a></td>
+        <td>
+          <form method="post" action="{{ base }}/tags" class="inline">
+            <input type="hidden" name="action" value="update">
+            <input type="hidden" name="tag_id" value="{{ t.tag_id }}">
+            <input name="name" value="{{ t.name }}" required maxlength="80" aria-label="Name for {{ t.name }}">
+            <input type="color" name="color" value="{{ valid_color(t.color) or '#8a8f98' }}" aria-label="Color for {{ t.name }}">
+            <button class="btn small">Save</button>
+          </form>
+        </td>
+        <td>
+          <form method="post" action="{{ base }}/tags" class="inline" data-confirm="Delete the tag “{{ t.name }}”? It is removed from every fact.">
+            <input type="hidden" name="action" value="delete">
+            <input type="hidden" name="tag_id" value="{{ t.tag_id }}">
+            <button class="btn small danger">Delete</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="muted">No tags yet. Tags group facts by legal issue; apply them from a fact card.</p>{% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,287 @@
+{
+  "description": "Public evaluation documents (SPEC §13). Every URL was fetched and checked by hand on the 'verified' date. scripts/fetch_eval.py downloads them into eval/docs/<group>/ and fills sha256 and retrieved_at on first fetch; later fetches verify the hash.",
+  "user_agent": "case-timeline-eval lozhang@dons.usfca.edu",
+  "documents": [
+    {
+      "id": "tm-01",
+      "group": "twitter_musk",
+      "title": "Skadden letter for Musk to Twitter, June 6, 2022 (data-access demand; Ex. 99.O to Musk SC 13D/A)",
+      "kind": "letter",
+      "url": "https://www.sec.gov/Archives/edgar/data/1418091/000110465922068347/tm2217761d1_ex99-o.htm",
+      "filename": "musk_letter_2022-06-06.htm",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 text/html 18,969 B",
+      "sha256": "f92def0c67bd837c581d9dd582b40457375585ab9daa2ac1bbcabd734246519e",
+      "retrieved_at": "2026-10-25",
+      "text_filename": "musk_letter_2022-06-06.txt"
+    },
+    {
+      "id": "tm-02",
+      "group": "twitter_musk",
+      "title": "Skadden letter terminating the Merger Agreement, July 8, 2022 (Ex. 99.P to Musk SC 13D/A filed 2022-07-08)",
+      "kind": "letter",
+      "url": "https://www.sec.gov/Archives/edgar/data/1418091/000110465922078413/tm2220599d1_ex99-p.htm",
+      "filename": "musk_termination_letter_2022-07-08.htm",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 text/html 37,681 B; 'Mr. Musk is terminating the Merger Agreement'",
+      "sha256": "b3ed467a5e30e59828d6fe3e460480bb26633e1fb234b7d434c0be59d67ab16a",
+      "retrieved_at": "2026-10-25",
+      "text_filename": "musk_termination_letter_2022-07-08.txt",
+      "notes": "Filing index: https://www.sec.gov/Archives/edgar/data/1418091/000110465922078413/0001104659-22-078413-index.htm"
+    },
+    {
+      "id": "tm-03",
+      "group": "twitter_musk",
+      "title": "Wachtell letter for Twitter responding to the July 8 termination, July 10, 2022 (Ex. 99.2 to Twitter 8-K filed 2022-07-11)",
+      "kind": "letter",
+      "url": "https://www.sec.gov/Archives/edgar/data/1418091/000119312522191300/d370677dex992.htm",
+      "filename": "twitter_response_letter_2022-07-10.htm",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 text/html 7,808 B",
+      "sha256": "106b7973c3a1360ea09a1171a442f9877c798e3f92621f76d85eba0a690b0f34",
+      "retrieved_at": "2026-10-25",
+      "text_filename": "twitter_response_letter_2022-07-10.txt"
+    },
+    {
+      "id": "tm-04",
+      "group": "twitter_musk",
+      "title": "Twitter, Inc. v. Musk et al., Verified Complaint (Del. Ch., filed July 12, 2022; Ex. 99.1 to Twitter 8-K filed 2022-07-13)",
+      "kind": "pleading",
+      "url": "https://www.sec.gov/Archives/edgar/data/1418091/000119312522192993/d381911dex991.htm",
+      "filename": "twitter_v_musk_verified_complaint.htm",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 text/html 165,845 B; 'IN THE COURT OF CHANCERY OF THE STATE OF DELAWARE ... VERIFIED COMPLAINT'",
+      "sha256": "e3c9f883147edfcb7cf00fb4fdf2a7288dba2ea9c3bf09cceef2c636180021c5",
+      "retrieved_at": "2026-10-25",
+      "text_filename": "twitter_v_musk_verified_complaint.txt",
+      "notes": "Official issuer copy; the C.A. number is blank in the exhibit."
+    },
+    {
+      "id": "tm-05",
+      "group": "twitter_musk",
+      "title": "Defendants' Verified Counterclaims, Answer, and Affirmative Defenses, public version filed Aug 4, 2022 (C.A. No. 2022-0613-KSJM)",
+      "kind": "pleading",
+      "url": "https://ep00.epimg.net/descargables/2022/08/10/02b146f57bd39cf4d9517c113f91e627.pdf",
+      "filename": "musk_counterclaims_answer_public_2022-08-04.pdf",
+      "official": false,
+      "verified": "2026-10-25: HTTP 200 application/pdf 5,576,802 B, 165 pp; court e-filing stamp 'EFiled: Aug 04 2022 ... Case No. 2022-0613-KSJM'",
+      "sha256": "4e7294bbbfdd2fe188dd04d354a55948c5e074d9caf661b5d538ac8f9b144915",
+      "retrieved_at": "2026-10-25",
+      "notes": "NON-OFFICIAL host (El Pais media CDN); the Court of Chancery does not publish pleadings. Replace with an official copy if one turns up."
+    },
+    {
+      "id": "tm-06",
+      "group": "twitter_musk",
+      "title": "Plaintiff's Reply to Verified Counterclaims (Twitter), Aug 4, 2022 (C.A. No. 2022-0613-KSJM)",
+      "kind": "pleading",
+      "url": "https://static.poder360.com.br/2022/08/Twitters-vs-ElonMusk.pdf",
+      "filename": "twitter_reply_to_counterclaims_2022-08-04.pdf",
+      "official": false,
+      "verified": "2026-10-25: HTTP 200 application/pdf 2,050,453 B, 127 pp; 'PLAINTIFF'S REPLY TO VERIFIED COUNTERCLAIMS'",
+      "sha256": "3f8619e1f03d591ecab3267967cf3f2cde0e0ad9b1ea2c485b6c823da940f58e",
+      "retrieved_at": "2026-10-25",
+      "notes": "NON-OFFICIAL host (poder360.com.br news site)."
+    },
+    {
+      "id": "tm-07",
+      "group": "twitter_musk",
+      "title": "Skadden letter, Aug 29, 2022: additional notice of termination (Ex. 99.Q to Musk SC 13D/A filed 2022-08-30)",
+      "kind": "letter",
+      "url": "https://www.sec.gov/Archives/edgar/data/1418091/000110465922095765/tm2224790d1_ex99-q.htm",
+      "filename": "musk_supplemental_termination_2022-08-29.htm",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 text/html 29,138 B",
+      "sha256": "f66fe1db2f5375b6170f2bbdc025fd18aaf6d2f70f5f7d1b77178adce725ff35",
+      "retrieved_at": "2026-10-25",
+      "text_filename": "musk_supplemental_termination_2022-08-29.txt"
+    },
+    {
+      "id": "tm-08",
+      "group": "twitter_musk",
+      "title": "Wachtell letter for Twitter, Aug 30, 2022, responding to the Aug 29 letter (Ex. 99.1 to Twitter 8-K filed 2022-08-30)",
+      "kind": "letter",
+      "url": "https://www.sec.gov/Archives/edgar/data/1418091/000119312522233469/d359937dex991.htm",
+      "filename": "twitter_response_letter_2022-08-30.htm",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 text/html 12,409 B",
+      "sha256": "40caaf8c2586fc3756c7ca8ce3aefac698498f260b5a96179eb1f5db12c03c21",
+      "retrieved_at": "2026-10-25",
+      "text_filename": "twitter_response_letter_2022-08-30.txt"
+    },
+    {
+      "id": "tm-09",
+      "group": "twitter_musk",
+      "title": "Skadden letter, Sep 9, 2022: second additional termination notice (Ex. 99.R to Musk SC 13D/A filed 2022-09-09)",
+      "kind": "letter",
+      "url": "https://www.sec.gov/Archives/edgar/data/1418091/000110465922098972/tm2225585d1_ex99-r.htm",
+      "filename": "musk_supplemental_termination_2022-09-09.htm",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 text/html 11,562 B",
+      "sha256": "48d6af2bb6cba87289fd053113903b15125ea6c442c241c0f16e99c39576738d",
+      "retrieved_at": "2026-10-25",
+      "text_filename": "musk_supplemental_termination_2022-09-09.txt"
+    },
+    {
+      "id": "tm-10",
+      "group": "twitter_musk",
+      "title": "Wachtell letter for Twitter, Sep 12, 2022, responding to the Sep 9 letter (Ex. 99.1 to Twitter 8-K filed 2022-09-12)",
+      "kind": "letter",
+      "url": "https://www.sec.gov/Archives/edgar/data/1418091/000119312522242335/d395119dex991.htm",
+      "filename": "twitter_response_letter_2022-09-12.htm",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 text/html 12,681 B",
+      "sha256": "8deab79d32bb45a97bae37111d451224560b1dcb80b45b37d6ff62aa8413c594",
+      "retrieved_at": "2026-10-25",
+      "text_filename": "twitter_response_letter_2022-09-12.txt"
+    },
+    {
+      "id": "tm-11",
+      "group": "twitter_musk",
+      "title": "Skadden letter, Oct 3, 2022: Musk Parties intend to proceed to closing (Ex. 99.S to Musk SC 13D/A filed 2022-10-04)",
+      "kind": "letter",
+      "url": "https://www.sec.gov/Archives/edgar/data/1418091/000110465922105787/tm2227435d1_ex99-s.htm",
+      "filename": "musk_letter_proceed_to_closing_2022-10-03.htm",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 text/html 9,479 B",
+      "sha256": "fd80e9a2074cb7e4d5f7ea7110b99ace37f87545c44662f2552bc70a7076c259",
+      "retrieved_at": "2026-10-25",
+      "text_filename": "musk_letter_proceed_to_closing_2022-10-03.txt"
+    },
+    {
+      "id": "ftx-01",
+      "group": "ftx",
+      "title": "SEC v. Samuel Bankman-Fried, Complaint, 1:22-cv-10501 (S.D.N.Y. Dec 13, 2022)",
+      "kind": "pleading",
+      "url": "https://www.sec.gov/files/litigation/complaints/2022/comp-pr2022-219.pdf",
+      "filename": "sec_v_bankman_fried_complaint.pdf",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 application/pdf 347,267 B, 28 pp",
+      "sha256": "cc47654d31d71c6eed39174cacff0b32962e564d82e2bf349e407092df953d08",
+      "retrieved_at": "2026-10-25",
+      "notes": "Press release: https://www.sec.gov/newsroom/press-releases/2022-219"
+    },
+    {
+      "id": "ftx-02",
+      "group": "ftx",
+      "title": "CFTC v. Bankman-Fried, FTX Trading Ltd. and Alameda Research LLC, Complaint, 1:22-cv-10503 (S.D.N.Y. Dec 13, 2022)",
+      "kind": "pleading",
+      "url": "https://www.cftc.gov/media/7986/enfftxtradingcomplaint121322/download",
+      "filename": "cftc_v_bankman_fried_ftx_alameda_complaint.pdf",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 application/pdf 537,560 B, 40 pp",
+      "sha256": "45076f3bfb006bd6a9d1bca8b6ab1307a1723488cd632984ecf0d6b1e19488f8",
+      "retrieved_at": "2026-10-25",
+      "notes": "Linked from https://www.cftc.gov/PressRoom/PressReleases/8638-22"
+    },
+    {
+      "id": "ftx-03",
+      "group": "ftx",
+      "title": "SEC v. Caroline Ellison and Zixiao 'Gary' Wang, Complaint, 1:22-cv-10794 (S.D.N.Y. Dec 21, 2022)",
+      "kind": "pleading",
+      "url": "https://www.sec.gov/files/litigation/complaints/2022/comp-pr2022-234.pdf",
+      "filename": "sec_v_ellison_wang_complaint.pdf",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 application/pdf 310,615 B, 38 pp",
+      "sha256": "602e77ed6c720534ce8e9e1f084e9cead9ab3245b423e689ddd2a4ccae73cb73",
+      "retrieved_at": "2026-10-25"
+    },
+    {
+      "id": "r56a-01",
+      "group": "rule56_ripple",
+      "title": "SEC v. Ripple Labs, 1:20-cv-10832 (S.D.N.Y.): Defendants' Statement of Undisputed Material Facts (Local Rule 56.1), ECF 826",
+      "kind": "motion",
+      "url": "https://storage.courtlistener.com/recap/gov.uscourts.nysd.551082/gov.uscourts.nysd.551082.826.0.pdf",
+      "filename": "ripple_defs_rule56_1_statement_ecf826.pdf",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 application/pdf 1,066,672 B, 67 pp",
+      "sha256": "4d667962373d0e123fe92a140bfb38321b7655c7c7873a6cdb652f1c816a9fb5",
+      "retrieved_at": "2026-10-25"
+    },
+    {
+      "id": "r56a-02",
+      "group": "rule56_ripple",
+      "title": "SEC v. Ripple Labs: SEC's Response and Counter-Statement to Defendants' Local Rule 56.1 Statement, ECF 842",
+      "kind": "motion",
+      "url": "https://storage.courtlistener.com/recap/gov.uscourts.nysd.551082/gov.uscourts.nysd.551082.842.0.pdf",
+      "filename": "ripple_sec_response_to_defs_rule56_1_ecf842.pdf",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 application/pdf 1,639,343 B, 232 pp",
+      "sha256": "fd815bc5de5fb84d6dac4ee4cf460b9ade299021eba4821be8407b759cac93a6",
+      "retrieved_at": "2026-10-25",
+      "notes": "Public refiling of ECF 668."
+    },
+    {
+      "id": "r56b-01",
+      "group": "rule56_giuliani",
+      "title": "Freeman v. Giuliani, 1:24-cv-06563-LJL (S.D.N.Y.): Plaintiffs' Local Rule 56.1 Statement, ECF 30",
+      "kind": "motion",
+      "url": "https://storage.courtlistener.com/recap/gov.uscourts.nysd.627518/gov.uscourts.nysd.627518.30.0.pdf",
+      "filename": "freeman_v_giuliani_pls_rule56_1_ecf30.pdf",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 application/pdf 207,027 B, 9 pp",
+      "sha256": "9098f2e15a506bc2213ad79e00901c864eaddc0fce08408bbdb33223378dcc89",
+      "retrieved_at": "2026-10-25"
+    },
+    {
+      "id": "r56b-02",
+      "group": "rule56_giuliani",
+      "title": "Freeman v. Giuliani: Defendant's Response to Plaintiffs' Local Rule 56.1 Statement, ECF 45",
+      "kind": "motion",
+      "url": "https://storage.courtlistener.com/recap/gov.uscourts.nysd.627518/gov.uscourts.nysd.627518.45.0.pdf",
+      "filename": "freeman_v_giuliani_def_response_rule56_1_ecf45.pdf",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 application/pdf 138,257 B, 12 pp",
+      "sha256": "93b57becfad2e3ee9cca755ec72caa16d0a6e2db2fa07dbb85447760ccd6f37f",
+      "retrieved_at": "2026-10-25",
+      "notes": "The CourtListener docket labels ECF 45/46 the other way round; the PDF text is authoritative."
+    },
+    {
+      "id": "enron-01",
+      "group": "enron",
+      "title": "Enron email thread, May 11-12, 2000, 'Re: Nigeria Barge Transaction' (U.S. v. Lay & Skilling trial exhibit 001226), DOJ OCR text",
+      "kind": "email",
+      "url": "https://www.justice.gov/archive/enron/exhibit/03-22/BBC-0001/OCR/EXH011-00919.TXT",
+      "filename": "enron_nigeria_barge_email_thread.txt",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 text/plain 2,465 B; 'Subject: Re: Nigeria Barge Transaction'",
+      "sha256": "d8249e9c587017fa1a02314553868d7fbb0df8615c4e4200dc5ee7326945ec6c",
+      "retrieved_at": "2026-10-25",
+      "notes": "DOJ's OCR of the scanned exhibit PDF https://www.justice.gov/archive/enron/exhibit/03-22/BBC-0001/Images/EXH011-00919.PDF (image only, no text layer)."
+    },
+    {
+      "id": "depo-01",
+      "group": "deposition",
+      "title": "Freeman v. Giuliani: excerpted transcript of the Dec 27, 2024 video deposition of Rudolph W. Giuliani (Ex. 2 to Nathan Decl., ECF 182-2)",
+      "kind": "transcript",
+      "url": "https://storage.courtlistener.com/recap/gov.uscourts.nysd.627518/gov.uscourts.nysd.627518.182.2.pdf",
+      "filename": "giuliani_deposition_excerpt_2024-12-27.pdf",
+      "official": true,
+      "verified": "2026-10-25: HTTP 200 application/pdf 634,380 B, 10 pp; condensed transcript, page:line numbered",
+      "sha256": "cf4291f85b3a7de1069117203d4192e3cbef491998a5144ca5168eb48d845b3a",
+      "retrieved_at": "2026-10-25",
+      "notes": "Condensed format (4 transcript pages per sheet); check page:line extraction."
+    }
+  ],
+  "todo": [
+    {
+      "what": "Official copies of Musk's counterclaims (Aug 4, 2022) and Twitter's reply",
+      "missing": "The Delaware Court of Chancery does not publish pleadings (File & ServeXpress only) and neither was filed as an EDGAR exhibit; tm-05 and tm-06 are news-hosted copies. Unverified leads: https://corpgov.law.harvard.edu/2022/08/10/twitter-v-musk-plaintiffs-response-to-defendants-counterclaim"
+    },
+    {
+      "what": "Musk's amended counterclaims (Sept 2022, Zatko whistleblower claims)",
+      "missing": "No public URL located."
+    },
+    {
+      "what": "Second Rule 56.1 pair per case (optional)",
+      "missing": "Verified but not added to keep the set small: Ripple ECF 838 (SEC 56.1) + ECF 835 (defendants' responses, 10 MB); Giuliani ECF 46 + ECF 57, same RECAP URL pattern."
+    },
+    {
+      "what": "Stress set (1,000-5,000 documents, SPEC §13)",
+      "missing": "Not in this manifest. Candidate: the CMU Enron corpus https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz (HTTP 200, 443,254,787 B; headers only checked). Needs a sampling script."
+    },
+    {
+      "what": "Gold labels for the public set",
+      "missing": "eval/gold_timeline.json and eval/gold_disputes.json are empty; they must be labelled by hand (see eval/docs/README.md)."
+    }
+  ]
+}

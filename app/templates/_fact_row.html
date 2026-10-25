@@ -1,0 +1,20 @@
+{% set c = counts.get(x.fact_id, {}) %}
+<tr id="{{ x.fact_id }}" class="review-{{ x.review }}{% if 'key_fact' in x.statuses %} key-fact{% endif %}">
+  <td class="sel">{% if x.review == 'draft' %}<input type="checkbox" name="fact_ids" value="{{ x.fact_id }}" form="bulk-form" aria-label="Select {{ x.fact_id }}">{% endif %}</td>
+  <td class="date nowrap">
+    {% if x.date_start %}{{ fact_date(x) }}{% else %}<span class="muted">—</span>{% endif %}
+    {% if x.date_text %}<div class="muted small" title="As written in the source">{{ x.date_text }}</div>{% endif %}
+  </td>
+  <td class="title">
+    <a href="{{ fact_url(x.fact_id) }}">{{ x.title }}</a>
+    <span class="muted small">{{ x.fact_id }}</span>
+    {{ m.badges(x, alleged, conflicts, show_statuses=False) }}
+    {% if x.tag_ids %}<div class="chips">{% for tid in x.tag_ids %}{% if tag_map.get(tid) %}{{ m.tag_chip(tag_map[tid]) }}{% endif %}{% endfor %}</div>{% endif %}
+  </td>
+  <td>{% for s in x.statuses %}<span class="badge st-{{ s }}">{{ STATUS_LABELS[s] }}</span>{% endfor %}</td>
+  <td class="num">{{ c.evidence or 0 }}</td>
+  <td class="num">{{ c.tags or 0 }}</td>
+  <td class="num">{{ c.witnesses or 0 }}</td>
+  <td class="num">{{ c.notes or 0 }}</td>
+  <td class="review nowrap">{{ m.review_controls(x, here ~ '#' ~ x.fact_id) }}</td>
+</tr>

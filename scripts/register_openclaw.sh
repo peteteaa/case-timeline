@@ -6,13 +6,14 @@
 #
 # Env overrides: OPENCLAW (CLI path), CT_DATA_DIR, CT_EVIDENCE_DIR, CT_CASE_ID,
 # CT_SKILL_SCOPE=global (install into the shared skills dir instead of the agent workspace).
-# Everything stays local: the server is spawned over stdio and binds no network port.
+# Everything stays local: the server is spawned over stdio and binds no network port. The MCP
+# server only reads the database and queues jobs; the app server (`make app`) runs them.
 set -euo pipefail
 
 PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OPENCLAW="${OPENCLAW:-$HOME/.openclaw/bin/openclaw}"
 SERVER_NAME="case-timeline"
-SKILL_DIR="$PROJECT/skill/case-timeline"
+SKILL_DIR="$PROJECT/skill"
 DATA_DIR="${CT_DATA_DIR:-$PROJECT/data}"
 DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1

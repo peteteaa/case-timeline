@@ -1,7 +1,10 @@
-"""Local review UI: FastAPI + Jinja2 + HTMX + vis-timeline (all assets vendored).
+"""Web UI and job-worker host (SPEC §5.2, §6, §7): FastAPI + Jinja2 + HTMX + vis-timeline.
 
-The UI never talks to SQL or the model directly; it goes through ``pipeline.store``,
-``pipeline.runner`` and ``pipeline.llm``. Uploads land in ``data_dir/inbox`` only.
+Every read and write goes through ``pipeline.store``; search, export and the daily digest come
+from their ``pipeline`` modules. All assets are vendored, the app binds 127.0.0.1 only, and a
+display name kept in the ``ct_user`` cookie is the author of every write.
+
+Uploads are saved to the writable inbox (``settings.inbox``), never the evidence folder.
 """
 
 from __future__ import annotations
@@ -9,66 +12,135 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import threading
-import unicodedata
+from collections import Counter
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlsplit
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-from markupsafe import Markup, escape
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from pipeline.contracts import (
-    Contradiction,
-    ContradictionStatus,
-    Event,
-    EventStatus,
+from app.helpers import (
+    ALERT_LABELS,
+    FIELD_LABELS,
+    LOOPBACK_HOSTS,
+    SORT_KEYS,
+    SORT_LABELS,
+    STATUS_LABELS,
+    USER_COOKIE,
+    ParamGetter,
+    build_query,
+    clean_display_name,
+    decode_user_cookie,
+    encode_user_cookie,
+    evidence_cite,
+    fact_changes,
+    fact_date,
+    fact_ids_in,
+    filter_pairs,
+    filters_active,
+    fmt_date,
+    fmt_dt,
+    history_value,
+    host_is_loopback,
+    hostname,
+    linkify_fact_ids,
+    parse_filters,
+    parse_int,
+    pct,
+    query_string,
+    safe_next,
+    sanitize_filename,
+    source_segments,
+    valid_color,
+)
+from pipeline import digest as digest_mod
+from pipeline import export as export_mod
+from pipeline import search as search_mod
+from pipeline.jobs import request_scan
+from pipeline.schema import (
+    CERTAINTIES,
+    DOC_KINDS,
+    STATUSES,
+    Document,
+    Fact,
+    FactQuery,
     Job,
+    SpanIn,
+    Witness,
 )
 
 if TYPE_CHECKING:
     from pipeline.config import Settings
+    from pipeline.store import Store
+
+__all__ = ["create_app", "host_is_loopback", "sanitize_filename"]
 
 log = logging.getLogger(__name__)
 
-UI_DIR = Path(__file__).resolve().parent
-TEMPLATES_DIR = UI_DIR / "templates"
-STATIC_DIR = UI_DIR / "static"
+APP_DIR = Path(__file__).resolve().parent
+TEMPLATES_DIR = APP_DIR / "templates"
+STATIC_DIR = APP_DIR / "static"
 
 ALLOWED_UPLOAD_SUFFIXES = {".pdf", ".docx", ".txt", ".md", ".eml"}
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
-LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
-REVIEW_STATUSES = {EventStatus.ACCEPTED, EventStatus.REJECTED}
+MAX_SPAN_CHARS = 20_000
 OPENCLAW_DEFAULT = Path("~/.openclaw/bin/openclaw").expanduser()
 OPENCLAW_TIMEOUT_S = 180
 CHAT_TOP_K = 8
-
-_DOC_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_CITE_RE = re.compile(r"\[E(\d+)\]")
-_SOURCE_LINK_RE = re.compile(
-    r"/source/[A-Za-z0-9_-]+\?start=\d+&amp;end=\d+(?:&amp;event=[A-Za-z0-9_-]+)?"
-)
 
 CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
     "frame-ancestors 'none'; form-action 'self'"
 )
+EXPORT_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox"
+
+EXPORT_TYPES = {
+    "csv": ("text/csv; charset=utf-8", "csv"),
+    "xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"),
+    "svg": ("image/svg+xml", "svg"),
+    "png": ("image/png", "png"),
+}
+COUNT_LABELS = {
+    "docs_seen": "Files seen",
+    "docs_new": "New documents",
+    "docs_parsed": "Parsed",
+    "docs_failed": "Failed to parse",
+    "drafts": "Drafts proposed",
+    "quotes_checked": "Quotes checked",
+    "quotes_rejected": "Quotes rejected",
+    "drafts_discarded": "Drafts discarded",
+    "facts_created": "Facts created",
+    "evidence_attached": "Evidence merged",
+    "contradictions": "Contradictions",
+    "alerts": "Alerts",
+}
 
 CHAT_SYSTEM = (
-    "You are a careful litigation-support assistant. Answer ONLY from the numbered "
-    "evidence excerpts provided. Cite every factual statement with its tag, e.g. [E1]. "
-    "If the excerpts do not answer the question, say so plainly. Never invent dates. "
-    "Any deadline or limitation date must be flagged as 'needs attorney review'."
+    "You are a careful litigation-support assistant. Answer ONLY from the case facts provided. "
+    "Cite every factual statement with its fact ID in square brackets, e.g. [F-0012]. Prefer "
+    "accepted facts; when you rely on an unreviewed draft, say so. Call a fact disputed only if "
+    "it has the disputed status; an open contradiction is only a possible conflict. If the facts "
+    "do not answer the question, say so plainly. Never invent dates. Flag any deadline or "
+    "limitation date as 'needs attorney review'."
 )
 
 
@@ -77,33 +149,23 @@ CHAT_SYSTEM = (
 
 @dataclass
 class Deps:
-    """Lazily-created collaborators; tests replace these attributes with fakes."""
+    """Collaborators, created lazily; tests replace these attributes with fakes."""
 
     settings: Any
     store: Any = None
-    runner: Any = None
     llm: Any = None
+    worker: Any = None
     openclaw_bin: Path | None = None
     chat_backend: str = "auto"  # auto | openclaw | local
-    last_job_id: str | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def get_store(self) -> Any:
+    def get_store(self) -> Store:
         with self._lock:
             if self.store is None:
                 from pipeline.store import Store
 
-                store = Store(self.settings.db_path)
-                store.init()
-                self.store = store
+                self.store = Store(self.settings.db_path)
             return self.store
-
-    def get_runner(self) -> Any:
-        if self.runner is None:
-            from pipeline import runner
-
-            self.runner = runner
-        return self.runner
 
     def get_llm(self) -> Any:
         if self.llm is None:
@@ -112,56 +174,74 @@ class Deps:
             self.llm = llm
         return self.llm
 
+    def wake_worker(self) -> None:
+        if self.worker is not None:
+            self.worker.wake()
+
+
+class NeedName(Exception):
+    """A write was attempted without a display name."""
+
+
+# --------------------------------------------------------------------------- small helpers
+
 
 def _deps(request: Request) -> Deps:
     return request.app.state.deps
 
 
-# --------------------------------------------------------------------------- helpers
+def _store(request: Request) -> Store:
+    return _deps(request).get_store()
 
 
-def host_is_loopback(host: str) -> bool:
-    """True for 127.0.0.0/8, ::1 and localhost."""
-    import ipaddress
+def _is_htmx(request: Request) -> bool:
+    return request.headers.get("hx-request", "").lower() == "true"
 
-    host = host.strip().strip("[]")
-    if host == "localhost":
-        return True
+
+def _wants_json(request: Request) -> bool:
+    ctype = request.headers.get("content-type", "")
+    return ctype.startswith("application/json")
+
+
+def current_user(request: Request) -> str | None:
+    return decode_user_cookie(request.cookies.get(USER_COOKIE))
+
+
+def require_user(request: Request) -> str:
+    user = current_user(request)
+    if user is None:
+        raise NeedName()
+    return user
+
+
+@contextmanager
+def store_errors() -> Iterator[None]:
+    """Map the store's exceptions to HTTP errors: 403, 404, 422."""
     try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+        yield
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(404, f"not found: {exc.args[0] if exc.args else ''}") from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
-def _hostname(host_header: str) -> str:
-    host_header = host_header.strip().lower()
-    if host_header.startswith("["):
-        return host_header[1 : host_header.find("]")] if "]" in host_header else host_header
-    return host_header.rsplit(":", 1)[0] if host_header.count(":") == 1 else host_header
+async def _params(request: Request) -> ParamGetter:
+    """Form or JSON body as a ParamGetter."""
+    if _wants_json(request):
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(422, "invalid JSON body") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(422, "expected a JSON object")
+        return ParamGetter(body)
+    return ParamGetter(await request.form())
 
 
-def sanitize_filename(name: str) -> str | None:
-    """Reduce an uploaded filename to a safe basename, or None if nothing usable remains."""
-    name = unicodedata.normalize("NFKC", name or "")
-    name = name.replace("\\", "/").split("/")[-1]
-    name = re.sub(r"[^A-Za-z0-9._ -]", "_", name).strip(" .")
-    name = re.sub(r"\.{2,}", ".", name)
-    if not name or name in {".", ".."}:
-        return None
-    stem, dot, suffix = name.rpartition(".")
-    if dot and len(name) > 150:
-        name = stem[: 150 - len(suffix) - 1] + "." + suffix
-    return name[:150]
-
-
-def inbox_dir(settings: Any) -> Path:
-    """Upload folder; refuses any location inside the read-only evidence dir."""
-    inbox = (Path(settings.data_dir) / "inbox").resolve()
-    evidence = Path(settings.evidence_dir).resolve()
-    if inbox == evidence or inbox.is_relative_to(evidence):
-        raise RuntimeError("inbox would be inside the evidence folder; refusing to write")
-    inbox.mkdir(parents=True, exist_ok=True)
-    return inbox
+def _redirect(url: str) -> RedirectResponse:
+    return RedirectResponse(url, status_code=303)
 
 
 def _unique_path(directory: Path, name: str) -> Path:
@@ -172,77 +252,6 @@ def _unique_path(directory: Path, name: str) -> Path:
         candidate = directory / f"{stem}-{n}{suffix}"
         n += 1
     return candidate
-
-
-def source_url(ev: Event) -> str:
-    params = {"start": ev.source.char_start, "end": ev.source.char_end, "event": ev.id}
-    return f"/source/{quote(ev.source.doc_id, safe='')}?{urlencode(params)}"
-
-
-def _sort_key(ev: Event) -> tuple:
-    return (ev.date_start is None, ev.date_start or "", ev.id)
-
-
-def _conflict_ids(contradictions: list[Contradiction]) -> set[str]:
-    return {
-        eid
-        for c in contradictions
-        if c.status != ContradictionStatus.DISMISSED
-        for eid in c.event_ids
-    }
-
-
-def _parsed_text(raw: Any) -> tuple[str | None, list[Any]]:
-    """Accept str, ParsedDocument-like, (text, pages) or dict from ``Store.get_parsed_text``."""
-    if raw is None:
-        return None, []
-    if isinstance(raw, str):
-        return raw, []
-    if isinstance(raw, tuple):
-        return raw[0], list(raw[1]) if len(raw) > 1 and raw[1] else []
-    if isinstance(raw, dict):
-        return raw.get("text"), list(raw.get("pages") or [])
-    return getattr(raw, "text", None), list(getattr(raw, "pages", None) or [])
-
-
-def _page_for(pages: list[Any], offset: int) -> int | None:
-    for p in pages:
-        get = p.get if isinstance(p, dict) else lambda k, _p=p: getattr(_p, k)
-        if get("char_start") <= offset < get("char_end"):
-            return get("number")
-    return None
-
-
-def highlight(text: str, start: int | None, end: int | None) -> tuple[Markup, bool]:
-    """HTML-escape ``text`` and wrap ``text[start:end]`` in ``<mark id=hl>``."""
-    if start is None or end is None or not (0 <= start < end <= len(text)):
-        return Markup(escape(text)), False
-    html = (
-        str(escape(text[:start]))
-        + '<mark id="hl">'
-        + str(escape(text[start:end]))
-        + "</mark>"
-        + str(escape(text[end:]))
-    )
-    return Markup(html), True
-
-
-def linkify_answer(answer: str, citations: list[dict[str, Any]]) -> Markup:
-    """Escape a model answer, then turn [E#] tags and local /source links into anchors."""
-    html = str(escape(answer))
-    by_tag = {c["tag"]: c["url"] for c in citations}
-
-    def cite(m: re.Match[str]) -> str:
-        url = by_tag.get(f"E{m.group(1)}")
-        return f'<a href="{escape(url)}">{m.group(0)}</a>' if url else m.group(0)
-
-    html = _CITE_RE.sub(cite, html)
-    html = _SOURCE_LINK_RE.sub(lambda m: f'<a href="{m.group(0)}">{m.group(0)}</a>', html)
-    return Markup(html)
-
-
-def _is_htmx(request: Request) -> bool:
-    return request.headers.get("hx-request", "").lower() == "true"
 
 
 def _extract_openclaw_text(stdout: str) -> str:
@@ -269,20 +278,49 @@ def _extract_openclaw_text(stdout: str) -> str:
     return walk(data) or stdout
 
 
+def doc_view_url(doc_id: str, evidence_id: str | None = None) -> str:
+    url = f"/documents/{quote(doc_id, safe='')}/view"
+    return url + (f"?evidence={quote(evidence_id, safe='')}" if evidence_id else "")
+
+
+def fact_url(fact_id: str) -> str:
+    return f"/facts/{quote(fact_id, safe='')}"
+
+
 # --------------------------------------------------------------------------- app factory
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
-    """Build the UI app. Collaborators live on ``app.state.deps`` and are created lazily."""
+def create_app(settings: Settings | None = None, *, store: Store | None = None) -> FastAPI:
+    """Build the app. Starts one job worker on startup when ``settings.run_worker`` is true."""
     if settings is None:
         from pipeline.config import get_settings
 
         settings = get_settings()
+    case = settings.case_id
 
-    app = FastAPI(title="Case Timeline", docs_url=None, redoc_url=None, openapi_url=None)
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> Any:
+        deps: Deps = app.state.deps
+        if settings.run_worker and deps.worker is None:
+            from pipeline.jobs import Worker
+
+            deps.worker = Worker(settings)
+            deps.worker.start()
+            log.info("job worker started")
+        try:
+            yield
+        finally:
+            if deps.worker is not None:
+                deps.worker.stop()
+                deps.worker = None
+
+    app = FastAPI(
+        title="Case Timeline", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan
+    )
     backend = os.environ.get("CT_CHAT_BACKEND", "auto").lower()
     app.state.deps = Deps(
         settings=settings,
+        store=store,
         openclaw_bin=OPENCLAW_DEFAULT if os.access(OPENCLAW_DEFAULT, os.X_OK) else None,
         chat_backend=backend if backend in {"auto", "openclaw", "local"} else "auto",
     )
@@ -291,17 +329,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     env = Environment(
         loader=FileSystemLoader(TEMPLATES_DIR), autoescape=select_autoescape(default=True)
     )
+    env.globals.update(
+        case_id=case,
+        doc_view_url=doc_view_url,
+        fact_url=fact_url,
+        fact_date=fact_date,
+        fmt_date=fmt_date,
+        fmt_dt=fmt_dt,
+        pct=pct,
+        evidence_cite=evidence_cite,
+        valid_color=valid_color,
+        STATUSES=STATUSES,
+        STATUS_LABELS=STATUS_LABELS,
+        DOC_KINDS=DOC_KINDS,
+        CERTAINTIES=CERTAINTIES,
+        ALERT_LABELS=ALERT_LABELS,
+        FIELD_LABELS=FIELD_LABELS,
+        COUNT_LABELS=COUNT_LABELS,
+        SORT_KEYS=SORT_KEYS,
+        SORT_LABELS=SORT_LABELS,
+        query_string=query_string,
+        quote=lambda s: quote(str(s), safe=""),
+    )
     templates = Jinja2Templates(env=env)
-    env.globals.update(source_url=source_url, case_id=settings.case_id)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+    def nav_counts(store: Store) -> dict[str, int]:
+        return {
+            "drafts": store.review_counts(case)["draft"],
+            "conflicts": len(store.list_contradictions(case, "open")),
+            "alerts": len(store.list_alerts(case, pending_only=True)),
+        }
+
     def render(request: Request, name: str, status_code: int = 200, **ctx: Any) -> HTMLResponse:
+        if not name.startswith("_"):
+            ctx.setdefault("nav", nav_counts(_store(request)))
+        ctx.setdefault("user", current_user(request))
+        ctx.setdefault(
+            "here", request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        )
         return templates.TemplateResponse(request, name, ctx, status_code=status_code)
+
+    # ------------------------------------------------------------------ middleware / errors
 
     @app.middleware("http")
     async def guard(request: Request, call_next: Any) -> Response:
         # DNS-rebinding and cross-site request protection for a loopback-only app.
-        if _hostname(request.headers.get("host", "")) not in allowed_hosts:
+        if hostname(request.headers.get("host", "")) not in allowed_hosts:
             return Response("Invalid Host header", status_code=400)
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("origin")
@@ -312,75 +386,547 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response = await call_next(request)
         response.headers.setdefault("Content-Security-Policy", CSP)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        # Not "no-referrer": with it, browsers send "Origin: null" on our own form POSTs and
+        # the origin check above refuses every write. "same-origin" still leaks nothing.
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        response.headers.setdefault("X-Frame-Options", "DENY")
         if not request.url.path.startswith("/static/"):
             response.headers.setdefault("Cache-Control", "no-store")
         return response
 
-    # ------------------------------------------------------------------ dashboard / jobs
+    @app.exception_handler(NeedName)
+    async def need_name(request: Request, exc: NeedName) -> Response:
+        if _is_htmx(request):
+            return PlainTextResponse(
+                "Enter your display name first.", status_code=401, headers={"HX-Redirect": "/name"}
+            )
+        if request.method == "POST" and not _wants_json(request):
+            return _redirect("/name?next=" + quote(f"/cases/{case}/facts", safe=""))
+        return JSONResponse({"detail": "a display name is required"}, status_code=401)
 
-    def last_job(deps: Deps) -> Job | None:
-        store = deps.get_store()
-        if deps.last_job_id:
-            return store.get_job(deps.last_job_id)
-        latest = getattr(store, "latest_job", None)
-        return latest(settings.case_id) if callable(latest) else None
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, exc: StarletteHTTPException) -> Response:
+        detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
+        headers = getattr(exc, "headers", None)
+        if _is_htmx(request):
+            return PlainTextResponse(detail, status_code=exc.status_code, headers=headers)
+        if "text/html" in request.headers.get("accept", ""):
+            try:
+                return render(
+                    request,
+                    "error.html",
+                    status_code=exc.status_code,
+                    code=exc.status_code,
+                    detail=detail,
+                )
+            except Exception:  # noqa: BLE001 - never fail while reporting a failure
+                log.exception("error page failed")
+        return JSONResponse({"detail": detail}, status_code=exc.status_code, headers=headers)
 
-    @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request) -> HTMLResponse:
-        deps = _deps(request)
-        store = deps.get_store()
-        events: list[Event] = store.list_events(settings.case_id)
-        contradictions: list[Contradiction] = store.list_contradictions(settings.case_id)
-        alerts = store.list_alerts(settings.case_id)
-        by_status = {s.value: 0 for s in EventStatus}
-        for ev in events:
-            by_status[ev.status.value] += 1
+    # ------------------------------------------------------------------ lookups
+
+    def check_case(case_id: str) -> None:
+        if case_id != case:
+            raise HTTPException(404, "unknown case")
+
+    def get_fact_or_404(store: Store, fact_id: str) -> Fact:
+        fact = store.get_fact(fact_id)
+        if fact is None or fact.case_id != case:
+            raise HTTPException(404, "fact not found")
+        return fact
+
+    def get_doc_or_404(store: Store, doc_id: str) -> Document:
+        doc = store.get_document(doc_id)
+        if doc is None or doc.case_id != case:
+            raise HTTPException(404, "document not found")
+        return doc
+
+    def get_witness_or_404(store: Store, witness_id: str) -> Witness:
+        w = store.get_witness(witness_id)
+        if w is None or w.case_id != case:
+            raise HTTPException(404, "witness not found")
+        return w
+
+    def get_job_or_404(store: Store, job_id: str) -> Job:
+        job = store.get_job(job_id)
+        if job is None or job.case_id != case:
+            raise HTTPException(404, "job not found")
+        return job
+
+    def make_span(store: Store, params: ParamGetter) -> SpanIn:
+        """A span from viewer offsets; the quote is re-derived from the stored text."""
+        doc_id = params.get("doc_id") or ""
+        get_doc_or_404(store, doc_id)
+        parsed = store.get_parsed(doc_id)
+        if parsed is None:
+            raise HTTPException(422, "this document has no parsed text yet")
         try:
-            inbox_count = sum(1 for p in inbox_dir(settings).iterdir() if p.is_file())
-        except (OSError, RuntimeError):
-            inbox_count = 0
-        counts = {
-            "documents": len(store.processed_doc_ids(settings.case_id)),
-            "events": len(events),
-            "by_status": by_status,
-            "deadline": sum(1 for e in events if e.deadline_relevant),
-            "contradictions_open": sum(
-                1 for c in contradictions if c.status == ContradictionStatus.OPEN
-            ),
-            "alerts": len(alerts),
-            "inbox": inbox_count,
+            start = parse_int(params.get("char_start"), "char_start")
+            end = parse_int(params.get("char_end"), "char_end")
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if not (0 <= start < end <= len(parsed.text)):
+            raise HTTPException(422, "the selection is outside the document text")
+        if end - start > MAX_SPAN_CHARS:
+            raise HTTPException(422, f"select at most {MAX_SPAN_CHARS} characters")
+        quote_text = parsed.text[start:end]
+        claimed = params.get("quote")
+        if claimed is not None and claimed != "" and claimed != quote_text:
+            raise HTTPException(422, "the selection does not match the document text")
+        if not quote_text.strip():
+            raise HTTPException(422, "the selection is empty")
+        return SpanIn(doc_id=doc_id, char_start=start, char_end=end, quote=quote_text)
+
+    def queue_scan(request: Request, trigger: str) -> Job:
+        job = request_scan(_store(request), case, trigger)
+        _deps(request).wake_worker()
+        return job
+
+    def lookups(store: Store) -> dict[str, Any]:
+        tags = store.list_tags(case)
+        witnesses = store.list_witnesses(case)
+        docs = store.list_documents(case)
+        return {
+            "tags": tags,
+            "tag_map": {t.tag_id: t for t in tags},
+            "witnesses": witnesses,
+            "witness_map": {w.witness_id: w for w in witnesses},
+            "docs": docs,
+            "doc_map": {d.doc_id: d for d in docs},
         }
-        return render(request, "dashboard.html", counts=counts, job=last_job(deps))
 
-    @app.post("/process", response_class=HTMLResponse)
-    def process(request: Request) -> HTMLResponse:
-        deps = _deps(request)
+    def known_fact(store: Store) -> Any:
+        def known(fid: str) -> bool:
+            f = store.get_fact(fid)
+            return f is not None and f.case_id == case
+
+        return known
+
+    # ------------------------------------------------------------------ name cookie
+
+    @app.get("/", include_in_schema=False)
+    def root() -> RedirectResponse:
+        return _redirect(f"/cases/{quote(case, safe='')}/facts")
+
+    @app.get("/name", response_class=HTMLResponse)
+    def name_form(request: Request, next: str | None = None) -> HTMLResponse:
+        return render(
+            request, "name.html", next=safe_next(next, f"/cases/{case}/facts"), error=None
+        )
+
+    @app.post("/name", response_model=None)
+    async def set_name(request: Request) -> Response:
+        form = ParamGetter(await request.form())
+        target = safe_next(form.get("next"), f"/cases/{case}/facts")
+        name = clean_display_name(form.get("name"))
+        if name is None:
+            return render(
+                request,
+                "name.html",
+                status_code=422,
+                next=target,
+                error="Enter a display name (not “agent”).",
+            )
+        response = _redirect(target)
+        response.set_cookie(
+            USER_COOKIE,
+            encode_user_cookie(name),
+            max_age=365 * 24 * 3600,
+            httponly=True,
+            samesite="strict",
+            path="/",
+        )
+        return response
+
+    # ------------------------------------------------------------------ today / jobs
+
+    @app.get("/cases/{case_id}", response_class=HTMLResponse)
+    def today(request: Request, case_id: str) -> HTMLResponse:
+        check_case(case_id)
+        store = _store(request)
+        digest, digest_html = None, None
         try:
-            job: Job = deps.get_runner().scan_case(settings.case_id)
-        except Exception as exc:  # noqa: BLE001 - surfaced to the reviewer, not swallowed
-            log.exception("scan_case failed to start")
-            return render(request, "_job.html", job=None, error=str(exc))
-        deps.last_job_id = job.id
-        return render(request, "_job.html", job=job, error=None)
+            digest = digest_mod.daily_digest(store, case)
+            digest_html = linkify_fact_ids(str(digest.get("text") or ""), known_fact(store))
+        except Exception as exc:  # noqa: BLE001 - the panel degrades, the page still works
+            log.warning("daily digest unavailable: %s", exc)
+        return render(
+            request,
+            "today.html",
+            counts=store.review_counts(case),
+            open_conflicts=len(store.list_contradictions(case, "open")),
+            pending_alerts=len(store.list_alerts(case, pending_only=True)),
+            documents=len(store.list_documents(case)),
+            job=store.latest_job(case),
+            jobs=store.list_jobs(case, limit=8),
+            digest=digest,
+            digest_html=digest_html,
+        )
+
+    @app.post("/cases/{case_id}/process", response_model=None)
+    def process(request: Request, case_id: str) -> Response:
+        check_case(case_id)
+        require_user(request)
+        job = queue_scan(request, "ui")
+        if _is_htmx(request):
+            return render(request, "_job.html", job=job)
+        return _redirect(f"/jobs/{quote(job.job_id, safe='')}")
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
     def job_status(request: Request, job_id: str) -> HTMLResponse:
-        job = _deps(request).get_store().get_job(job_id)
-        if job is None:
-            raise HTTPException(404, "job not found")
-        return render(request, "_job.html", job=job, error=None)
+        job = get_job_or_404(_store(request), job_id)
+        if _is_htmx(request):
+            return render(request, "_job.html", job=job)
+        return render(request, "job.html", job=job)
 
-    # ------------------------------------------------------------------ upload
+    # ------------------------------------------------------------------ timeline (facts)
 
-    @app.get("/upload", response_class=HTMLResponse)
-    def upload_form(request: Request) -> HTMLResponse:
-        return render(request, "upload.html", results=None)
+    def run_filters(store: Store, f: dict[str, Any]) -> tuple[list[Fact], str | None]:
+        fact_ids: list[str] | None = None
+        if f["q"]:
+            try:
+                fact_ids = search_mod.keyword_fact_ids(store, case, f["q"])
+            except search_mod.QueryError as exc:
+                return [], f"Search not understood: {exc}"
+            except NotImplementedError:
+                return [], "Search is not available yet."
+        return store.list_facts(case, build_query(f, fact_ids)), None
 
-    @app.post("/upload", response_class=HTMLResponse)
-    async def upload(request: Request, files: Annotated[list[UploadFile], File()]) -> HTMLResponse:
+    def visual_item(f: Fact, alleged: set[str], conflicts: set[str]) -> dict[str, Any]:
+        end = None
+        if f.date_start and f.date_end and f.date_end > f.date_start:
+            end = (f.date_end + timedelta(days=1)).isoformat()  # vis end is exclusive
+        classes = [f"review-{f.review}", f"cert-{f.date_certainty}"]
+        classes += [f"st-{s}" for s in f.statuses]
+        if f.fact_id in conflicts:
+            classes.append("conflict")
+        if f.fact_id in alleged:
+            classes.append("alleged")
+        return {
+            "id": f.fact_id,
+            "title": f.title,
+            "start": f.date_start.isoformat() if f.date_start else None,
+            "end": end,
+            "type": "range" if end else "point",
+            "undated": f.date_start is None,
+            "date_label": fact_date(f),
+            "date_text": f.date_text,
+            "certainty": f.date_certainty,
+            "statuses": list(f.statuses),
+            "key_fact": "key_fact" in f.statuses,
+            "review": f.review,
+            "origin": f.origin,
+            "alleged": f.fact_id in alleged,
+            "conflict": f.fact_id in conflicts,
+            "url": fact_url(f.fact_id),
+            "class_name": " ".join(classes),
+        }
+
+    @app.get("/cases/{case_id}/facts", response_model=None)
+    def timeline(request: Request, case_id: str, format: str | None = None) -> Response:
+        check_case(case_id)
+        store = _store(request)
+        f, errors = parse_filters(ParamGetter(request.query_params))
+        facts, search_error = run_filters(store, f)
+        alleged = store.alleged_fact_ids(case)
+        conflicts = store.conflicted_fact_ids(case)
+        if format == "json":
+            return JSONResponse(
+                {
+                    "case_id": case,
+                    "error": search_error,
+                    "items": [visual_item(x, alleged, conflicts) for x in facts],
+                }
+            )
+        pairs = filter_pairs(f)
+        return render(
+            request,
+            "timeline.html",
+            f=f,
+            errors=errors,
+            search_error=search_error,
+            syntax_help=search_mod.SYNTAX_HELP,
+            dated=[x for x in facts if x.date_start is not None],
+            undated=[x for x in facts if x.date_start is None],
+            total=len(facts),
+            counts=store.fact_counts([x.fact_id for x in facts]),
+            alleged=alleged,
+            conflicts=conflicts,
+            pairs=pairs,
+            filtered=filters_active(f),
+            export_zooms=export_mod.ZOOMS,
+            **lookups(store),
+        )
+
+    @app.post("/cases/{case_id}/facts", response_model=None)
+    async def create_fact(request: Request, case_id: str) -> Response:
+        check_case(case_id)
+        user = require_user(request)
+        store = _store(request)
+        params = await _params(request)
+        spans = [make_span(store, params)] if params.get("char_start") else []
+        with store_errors():
+            changes = fact_changes(params)
+            title = changes.pop("title", "") or ""
+            fact = store.add_fact(
+                case,
+                title,
+                by=user,
+                details=changes.get("details"),
+                date_text=changes.get("date_text"),
+                date_start=changes.get("date_start"),
+                date_end=changes.get("date_end"),
+                date_certainty=changes.get("date_certainty")
+                or ("exact" if changes.get("date_start") else "unknown"),
+                statuses=changes.get("statuses", ()),
+                tag_ids=changes.get("tag_ids", ()),
+                witness_ids=changes.get("witness_ids", ()),
+                spans=spans,
+            )
+        if _wants_json(request):
+            return JSONResponse(fact.model_dump(mode="json"), status_code=201)
+        default = fact_url(fact.fact_id)
+        if spans and fact.evidence:
+            default = doc_view_url(spans[0].doc_id, fact.evidence[0].evidence_id)
+        return _redirect(safe_next(params.get("next"), default))
+
+    # ------------------------------------------------------------------ needs review / bulk
+
+    @app.get("/cases/{case_id}/review", response_class=HTMLResponse)
+    def needs_review(
+        request: Request, case_id: str, order: str = "low", doc: str | None = None
+    ) -> HTMLResponse:
+        check_case(case_id)
+        store = _store(request)
+        high = order == "high"
+        query = FactQuery(
+            reviews=["draft"], sort="confidence", descending=high, doc_ids=[doc] if doc else []
+        )
+        facts = store.list_facts(case, query)
+        return render(
+            request,
+            "review.html",
+            facts=facts,
+            order="high" if high else "low",
+            doc_filter=doc,
+            alleged=store.alleged_fact_ids(case),
+            conflicts=store.conflicted_fact_ids(case),
+            **lookups(store),
+        )
+
+    @app.post("/cases/{case_id}/review", response_model=None)
+    async def bulk_review(request: Request, case_id: str) -> Response:
+        check_case(case_id)
+        user = require_user(request)
+        store = _store(request)
+        params = await _params(request)
+        action = params.get("action")
+        if action not in ("accept", "reject"):
+            raise HTTPException(422, "action must be accept or reject")
+        ids = params.getlist("fact_ids")
+        if not ids:
+            raise HTTPException(422, "select at least one fact")
+        reason = (params.get("reason") or "").strip() or None
+        facts = [get_fact_or_404(store, fid) for fid in ids]
+        with store_errors():
+            for fact in facts:
+                store.review_fact(fact.fact_id, action, reviewer=user, reason=reason)
+        if _wants_json(request):
+            return JSONResponse({"reviewed": [f.fact_id for f in facts], "action": action})
+        return _redirect(safe_next(params.get("next"), f"/cases/{case}/review"))
+
+    # ------------------------------------------------------------------ fact card
+
+    @app.get("/facts/{fact_id}", response_class=HTMLResponse)
+    def fact_card(request: Request, fact_id: str, partial: int = 0) -> HTMLResponse:
+        store = _store(request)
+        fact = get_fact_or_404(store, fact_id)
+        lk = lookups(store)
+        ctx: dict[str, Any] = {
+            "fact": fact,
+            "alleged": fact.fact_id in store.alleged_fact_ids(case),
+            "conflict": fact.fact_id in store.conflicted_fact_ids(case),
+            "notes": store.list_notes(fact_id),
+            **lk,
+        }
+        if partial:
+            return render(request, "_fact_summary.html", **ctx)
+        names = {t.tag_id: t.name for t in lk["tags"]}
+        names.update({w.witness_id: w.name for w in lk["witnesses"]})
+        history = [
+            {
+                **h,
+                "old_text": history_value(h["old"], names),
+                "new_text": history_value(h["new"], names),
+            }
+            for h in store.fact_history(fact_id)
+        ]
+        contradictions = []
+        for c in store.list_contradictions(case, fact_id=fact_id):
+            others = [x for x in store.get_facts(c.fact_ids) if x.fact_id != fact_id]
+            contradictions.append({"c": c, "others": others})
+        contradictions.sort(key=lambda v: v["c"].status != "open")
+        anchor = store.get_fact(fact.anchor_fact_id) if fact.anchor_fact_id else None
+        return render(
+            request,
+            "fact.html",
+            history=history,
+            contradictions=contradictions,
+            anchor=anchor,
+            witness_choices=[
+                w for w in lk["witnesses"] if w.confirmed or w.witness_id in fact.witness_ids
+            ],
+            **ctx,
+        )
+
+    async def _edit_fact(request: Request, fact_id: str) -> Response:
+        user = require_user(request)
+        store = _store(request)
+        get_fact_or_404(store, fact_id)
+        params = await _params(request)
+        with store_errors():
+            changes = fact_changes(params)
+            new_tag = (params.get("new_tag") or "").strip()
+            if new_tag:
+                tag = store.add_tag(case, new_tag, by=user)
+                current = changes.get("tag_ids")
+                if current is None:
+                    current = list(store.get_fact(fact_id).tag_ids)  # type: ignore[union-attr]
+                changes["tag_ids"] = [*current, tag.tag_id]
+            fact = store.update_fact(fact_id, changes, by=user)
+        if request.method == "PATCH" or _wants_json(request):
+            return JSONResponse(fact.model_dump(mode="json"))
+        return _redirect(safe_next(params.get("next"), fact_url(fact_id)))
+
+    @app.patch("/facts/{fact_id}", response_model=None)
+    async def patch_fact(request: Request, fact_id: str) -> Response:
+        return await _edit_fact(request, fact_id)
+
+    @app.post("/facts/{fact_id}", response_model=None)
+    async def post_fact(request: Request, fact_id: str) -> Response:
+        return await _edit_fact(request, fact_id)
+
+    @app.post("/facts/{fact_id}/review", response_model=None)
+    async def review_fact(request: Request, fact_id: str) -> Response:
+        user = require_user(request)
+        store = _store(request)
+        get_fact_or_404(store, fact_id)
+        params = await _params(request)
+        action = params.get("action")
+        if action not in ("accept", "reject", "edit"):
+            raise HTTPException(422, "action must be accept, edit or reject")
+        reason = (params.get("reason") or "").strip() or None
+        with store_errors():
+            changes = fact_changes(params) if action == "edit" else None
+            fact = store.review_fact(fact_id, action, reviewer=user, reason=reason, changes=changes)
+        if _is_htmx(request):
+            return render(request, "_review_state.html", fact=fact, reason=reason)
+        if _wants_json(request):
+            return JSONResponse(fact.model_dump(mode="json"))
+        return _redirect(safe_next(params.get("next"), fact_url(fact_id)))
+
+    @app.post("/facts/{fact_id}/evidence", response_model=None)
+    async def add_evidence(request: Request, fact_id: str) -> Response:
+        user = require_user(request)
+        store = _store(request)
+        get_fact_or_404(store, fact_id)
+        params = await _params(request)
+        kind = params.get("kind") or ("span" if params.get("char_start") else "")
+        with store_errors():
+            if kind == "span":
+                span = make_span(store, params)
+                ev = store.add_evidence(fact_id, kind="span", by=user, span=span)
+            elif kind == "document":
+                doc_id = params.get("doc_id") or ""
+                get_doc_or_404(store, doc_id)
+                ev = store.add_evidence(fact_id, kind="document", by=user, doc_id=doc_id)
+            elif kind == "external":
+                ev = store.add_evidence(
+                    fact_id,
+                    kind="external",
+                    by=user,
+                    reference=(params.get("reference") or "")[:2000],
+                )
+            else:
+                raise HTTPException(422, "kind must be span, document or external")
+        if _wants_json(request):
+            return JSONResponse(ev.model_dump(mode="json"), status_code=201)
+        default = fact_url(fact_id) + "#evidence"
+        if kind == "span":
+            default = doc_view_url(ev.doc_id or "", ev.evidence_id)
+        return _redirect(safe_next(params.get("next"), default))
+
+    @app.post("/evidence/{evidence_id}/review", response_model=None)
+    async def review_evidence(request: Request, evidence_id: str) -> Response:
+        user = require_user(request)
+        store = _store(request)
+        found = store.get_evidence(evidence_id)
+        if found is None:
+            raise HTTPException(404, "evidence not found")
+        fact_id, _ = found
+        get_fact_or_404(store, fact_id)
+        params = await _params(request)
+        action = params.get("action")
+        if action not in ("accept", "reject"):
+            raise HTTPException(422, "action must be accept or reject")
+        reason = (params.get("reason") or "").strip() or None
+        with store_errors():
+            ev = store.review_evidence(evidence_id, action, reviewer=user, reason=reason)
+        if _is_htmx(request):
+            return render(request, "_evidence_state.html", ev=ev)
+        if _wants_json(request):
+            return JSONResponse(ev.model_dump(mode="json"))
+        return _redirect(safe_next(params.get("next"), fact_url(fact_id) + "#evidence"))
+
+    @app.post("/facts/{fact_id}/notes", response_model=None)
+    async def add_note(request: Request, fact_id: str) -> Response:
+        user = require_user(request)
+        store = _store(request)
+        get_fact_or_404(store, fact_id)
+        params = await _params(request)
+        with store_errors():
+            note = store.add_note(fact_id, author=user, body=(params.get("body") or "")[:20000])
+        if _wants_json(request):
+            return JSONResponse(note.model_dump(mode="json"), status_code=201)
+        return _redirect(safe_next(params.get("next"), fact_url(fact_id) + "#notes"))
+
+    # ------------------------------------------------------------------ documents
+
+    def document_rows(store: Store) -> list[dict[str, Any]]:
+        cites: Counter[str] = Counter()
+        drafts: Counter[str] = Counter()
+        for fact in store.list_facts(case):
+            for doc_id in {e.doc_id for e in fact.evidence if e.doc_id}:
+                cites[doc_id] += 1
+                drafts[doc_id] += fact.review == "draft"
+        rows = []
+        for d in store.list_documents(case):
+            info = store.document_info(d.doc_id) or {}
+            rows.append(
+                {"doc": d, "info": info, "facts": cites[d.doc_id], "drafts": drafts[d.doc_id]}
+            )
+        return rows
+
+    @app.get("/cases/{case_id}/documents", response_class=HTMLResponse)
+    def documents(request: Request, case_id: str) -> HTMLResponse:
+        check_case(case_id)
+        store = _store(request)
+        return render(
+            request,
+            "documents.html",
+            rows=document_rows(store),
+            results=None,
+            job=store.latest_job(case),
+        )
+
+    @app.post("/cases/{case_id}/documents", response_class=HTMLResponse)
+    async def upload(
+        request: Request, case_id: str, files: Annotated[list[UploadFile], File()]
+    ) -> HTMLResponse:
+        check_case(case_id)
+        require_user(request)
         try:
-            inbox = inbox_dir(settings)
+            inbox = settings.inbox.resolve()
         except RuntimeError as exc:
             log.error("upload refused: %s", exc)
             raise HTTPException(500, str(exc)) from exc
@@ -390,10 +936,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             name = sanitize_filename(original)
             if name is None or Path(name).suffix.lower() not in ALLOWED_UPLOAD_SUFFIXES:
                 results.append({"name": original, "ok": False, "msg": "unsupported file type"})
+                await up.close()
                 continue
             dest = _unique_path(inbox, name)
             if dest.resolve().parent != inbox:
                 results.append({"name": original, "ok": False, "msg": "invalid filename"})
+                await up.close()
                 continue
             size = 0
             try:
@@ -411,158 +959,310 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await up.close()
             log.info("uploaded %s (%d bytes) to inbox", dest.name, size)
             results.append({"name": original, "saved_as": dest.name, "ok": True, "size": size})
-        return render(request, "upload.html", results=results)
+        job = queue_scan(request, "upload") if any(r["ok"] for r in results) else None
+        store = _store(request)
+        return render(
+            request,
+            "documents.html",
+            rows=document_rows(store),
+            results=results,
+            job=job or store.latest_job(case),
+        )
 
-    # ------------------------------------------------------------------ timeline / events
-
-    @app.get("/timeline", response_class=HTMLResponse)
-    def timeline(request: Request) -> HTMLResponse:
-        store = _deps(request).get_store()
-        events = sorted(store.list_events(settings.case_id), key=_sort_key)
-        conflicts = _conflict_ids(store.list_contradictions(settings.case_id))
-        return render(request, "timeline.html", events=events, conflicts=conflicts)
-
-    @app.get("/api/events")
-    def api_events(request: Request) -> JSONResponse:
-        store = _deps(request).get_store()
-        events = sorted(store.list_events(settings.case_id), key=_sort_key)
-        conflicts = _conflict_ids(store.list_contradictions(settings.case_id))
-        items = []
-        for ev in events:
-            end = None
-            if ev.date_start and ev.date_end and ev.date_end > ev.date_start:
-                end = (ev.date_end + timedelta(days=1)).isoformat()  # vis end is exclusive
-            classes = [f"cert-{ev.certainty.value}", f"status-{ev.status.value}"]
-            if ev.id in conflicts:
-                classes.append("conflict")
-            if ev.deadline_relevant:
-                classes.append("deadline")
-            items.append(
-                {
-                    "id": ev.id,
-                    "label": ev.description,
-                    "start": ev.date_start.isoformat() if ev.date_start else None,
-                    "end": end,
-                    "date_text": ev.date_text,
-                    "certainty": ev.certainty.value,
-                    "status": ev.status.value,
-                    "actors": ev.actors,
-                    "quote": ev.source.quote,
-                    "confidence": ev.confidence,
-                    "deadline_relevant": ev.deadline_relevant,
-                    "contradiction": ev.id in conflicts,
-                    "class_name": " ".join(classes),
-                    "source_url": source_url(ev),
-                }
-            )
-        return JSONResponse({"case_id": settings.case_id, "items": items})
-
-    @app.post("/events/{event_id}/status", response_model=None)
-    def event_status(
-        request: Request, event_id: str, status: Annotated[str, Form()]
-    ) -> HTMLResponse | RedirectResponse:
-        try:
-            new = EventStatus(status)
-        except ValueError as exc:
-            raise HTTPException(422, "status must be accepted or rejected") from exc
-        if new not in REVIEW_STATUSES:
-            raise HTTPException(422, "status must be accepted or rejected")
-        store = _deps(request).get_store()
-        if store.get_event(event_id) is None:
-            raise HTTPException(404, "event not found")
-        store.set_event_status(event_id, new)
-        log.info("event %s marked %s by reviewer", event_id, new.value)
-        if not _is_htmx(request):
-            return RedirectResponse("/timeline", status_code=303)
-        ev = store.get_event(event_id)
-        conflicts = _conflict_ids(store.list_contradictions(settings.case_id))
-        return render(request, "_event_row.html", e=ev, conflicts=conflicts)
-
-    # ------------------------------------------------------------------ source viewer
-
-    @app.get("/source/{doc_id}", response_class=HTMLResponse)
-    def source(
-        request: Request,
-        doc_id: str,
-        start: int | None = None,
-        end: int | None = None,
-        event: str | None = None,
-    ) -> HTMLResponse:
-        if not _DOC_ID_RE.match(doc_id):
-            raise HTTPException(404, "document not found")
-        store = _deps(request).get_store()
-        text, pages = _parsed_text(store.get_parsed_text(doc_id))
-        if text is None:
-            raise HTTPException(404, "document not found")
-        body, highlighted = highlight(text, start, end)
-        get_doc = getattr(store, "get_document", None)
-        doc = get_doc(doc_id) if callable(get_doc) else None
-        ev = store.get_event(event) if event else None
-        if ev is not None and ev.source.doc_id != doc_id:
-            ev = None
-        page = _page_for(pages, start) if highlighted and start is not None else None
-        conflicts = _conflict_ids(store.list_contradictions(settings.case_id)) if ev else set()
+    @app.get("/documents/{doc_id}/view", response_class=HTMLResponse)
+    def source_view(request: Request, doc_id: str, evidence: str | None = None) -> HTMLResponse:
+        store = _store(request)
+        doc = get_doc_or_404(store, doc_id)
+        parsed = store.get_parsed(doc_id)
+        ev, ev_fact = None, None
+        if evidence:
+            found = store.get_evidence(evidence)
+            if found is not None and found[1].doc_id == doc_id:
+                ev_fact = store.get_fact(found[0])
+                ev = found[1]
+        segments = []
+        if parsed is not None:
+            hl = (ev.char_start, ev.char_end) if ev and ev.kind == "span" else (None, None)
+            segments = source_segments(parsed, *hl)
+        citing = store.facts_citing_document(doc_id)
         return render(
             request,
             "source.html",
-            doc_id=doc_id,
             doc=doc,
-            body=body,
-            highlighted=highlighted,
-            requested=start is not None or end is not None,
-            page=page,
-            e=ev,
-            conflicts=conflicts,
+            info=store.document_info(doc_id) or {},
+            parsed=parsed,
+            segments=segments,
+            ev=ev,
+            ev_fact=ev_fact,
+            requested=evidence,
+            citing=citing,
+            alleged=store.alleged_fact_ids(case),
+            conflicts=store.conflicted_fact_ids(case),
+            all_facts=store.list_facts(case, FactQuery(sort="title")),
         )
+
+    @app.post("/documents/{doc_id}/kind", response_model=None)
+    async def set_kind(request: Request, doc_id: str) -> Response:
+        user = require_user(request)
+        store = _store(request)
+        get_doc_or_404(store, doc_id)
+        params = await _params(request)
+        with store_errors():
+            doc = store.set_document_kind(doc_id, params.get("kind") or "", by=user)
+        if _wants_json(request):
+            return JSONResponse(doc.model_dump(mode="json"))
+        return _redirect(safe_next(params.get("next"), doc_view_url(doc_id)))
+
+    @app.post("/documents/{doc_id}/reprocess", response_model=None)
+    async def reprocess(request: Request, doc_id: str) -> Response:
+        require_user(request)
+        store = _store(request)
+        get_doc_or_404(store, doc_id)
+        with store_errors():
+            removed = store.reset_document(doc_id)
+        job = queue_scan(request, "ui")
+        log.info("document %s reset for reprocessing (%d drafts removed)", doc_id, removed)
+        if _wants_json(request):
+            return JSONResponse({"job_id": job.job_id, "drafts_removed": removed})
+        return _redirect(f"/jobs/{quote(job.job_id, safe='')}")
+
+    # ------------------------------------------------------------------ witnesses
+
+    def witness_changes(params: ParamGetter) -> dict[str, Any]:
+        changes: dict[str, Any] = {}
+        declared = set(params.getlist("has"))
+        for key in ("name", "role", "notes"):
+            if params.has(key):
+                changes[key] = (params.get(key) or "").strip()
+        if params.has("aliases") or "aliases" in declared:
+            changes["aliases"] = params.getlist("aliases")
+        for key in ("flagged", "confirmed"):
+            if params.has(key) or key in declared:
+                raw = (params.get(key) or "").lower()
+                changes[key] = raw in ("1", "true", "on", "yes")
+        return changes
+
+    @app.get("/cases/{case_id}/witnesses", response_class=HTMLResponse)
+    def witnesses(request: Request, case_id: str) -> HTMLResponse:
+        check_case(case_id)
+        store = _store(request)
+        everyone = store.list_witnesses(case)
+        counts = {w.witness_id: len(store.witness_facts(w.witness_id)) for w in everyone}
+        return render(
+            request,
+            "witnesses.html",
+            confirmed=[w for w in everyone if w.confirmed],
+            suggested=[w for w in everyone if not w.confirmed],
+            fact_counts=counts,
+        )
+
+    @app.post("/cases/{case_id}/witnesses", response_model=None)
+    async def create_witness(request: Request, case_id: str) -> Response:
+        check_case(case_id)
+        user = require_user(request)
+        params = await _params(request)
+        ch = witness_changes(params)
+        with store_errors():
+            w = _store(request).add_witness(
+                case,
+                ch.get("name", ""),
+                by=user,
+                aliases=ch.get("aliases", ()),
+                role=ch.get("role") or None,
+                notes=ch.get("notes") or None,
+                flagged=bool(ch.get("flagged")),
+            )
+        if _wants_json(request):
+            return JSONResponse(w.model_dump(mode="json"), status_code=201)
+        return _redirect(f"/witnesses/{quote(w.witness_id, safe='')}")
+
+    @app.get("/witnesses/{witness_id}", response_class=HTMLResponse)
+    def witness_profile(request: Request, witness_id: str) -> HTMLResponse:
+        store = _store(request)
+        w = get_witness_or_404(store, witness_id)
+        return render(
+            request,
+            "witness.html",
+            w=w,
+            facts=store.witness_facts(witness_id),
+            documents=store.witness_documents(witness_id),
+            others=[x for x in store.list_witnesses(case) if x.witness_id != witness_id],
+            alleged=store.alleged_fact_ids(case),
+            conflicts=store.conflicted_fact_ids(case),
+        )
+
+    async def _change_witness(request: Request, witness_id: str) -> Response:
+        user = require_user(request)
+        store = _store(request)
+        get_witness_or_404(store, witness_id)
+        params = await _params(request)
+        action = params.get("action") or "update"
+        target = f"/witnesses/{quote(witness_id, safe='')}"
+        with store_errors():
+            if action == "dismiss":
+                store.delete_witness(witness_id, by=user)
+                result: Witness | None = None
+                target = f"/cases/{case}/witnesses"
+            elif action == "merge":
+                into = params.get("into") or ""
+                get_witness_or_404(store, into)
+                result = store.merge_witnesses(witness_id, into, by=user)
+                target = f"/witnesses/{quote(into, safe='')}"
+            elif action == "confirm":
+                result = store.update_witness(witness_id, {"confirmed": True}, by=user)
+            elif action == "update":
+                result = store.update_witness(witness_id, witness_changes(params), by=user)
+            else:
+                raise HTTPException(422, "unknown witness action")
+        if request.method == "PATCH" or _wants_json(request):
+            return JSONResponse(result.model_dump(mode="json") if result else {"deleted": True})
+        return _redirect(safe_next(params.get("next"), target))
+
+    @app.patch("/witnesses/{witness_id}", response_model=None)
+    async def patch_witness(request: Request, witness_id: str) -> Response:
+        return await _change_witness(request, witness_id)
+
+    @app.post("/witnesses/{witness_id}", response_model=None)
+    async def post_witness(request: Request, witness_id: str) -> Response:
+        return await _change_witness(request, witness_id)
+
+    # ------------------------------------------------------------------ tags
+
+    @app.get("/cases/{case_id}/tags", response_class=HTMLResponse)
+    def tags(request: Request, case_id: str) -> HTMLResponse:
+        check_case(case_id)
+        store = _store(request)
+        counts: Counter[str] = Counter()
+        for fact in store.list_facts(case):
+            counts.update(fact.tag_ids)
+        return render(request, "tags.html", tags=store.list_tags(case), tag_counts=counts)
+
+    @app.post("/cases/{case_id}/tags", response_model=None)
+    async def change_tags(request: Request, case_id: str) -> Response:
+        check_case(case_id)
+        user = require_user(request)
+        store = _store(request)
+        params = await _params(request)
+        action = params.get("action") or "create"
+        color_raw = params.get("color")
+        color = valid_color(color_raw)
+        if color_raw and color is None:
+            raise HTTPException(422, "color must look like #1a2b3c")
+        result: Any = None
+        with store_errors():
+            if action == "create":
+                result = store.add_tag(case, params.get("name") or "", by=user, color=color)
+            else:
+                tag_id = params.get("tag_id") or ""
+                tag = store.get_tag(tag_id)
+                if tag is None or tag.case_id != case:
+                    raise HTTPException(404, "tag not found")
+                if action == "update":
+                    result = store.update_tag(tag_id, by=user, name=params.get("name"), color=color)
+                elif action == "delete":
+                    store.delete_tag(tag_id, by=user)
+                else:
+                    raise HTTPException(422, "unknown tag action")
+        if _wants_json(request):
+            return JSONResponse(result.model_dump(mode="json") if result else {"deleted": True})
+        return _redirect(safe_next(params.get("next"), f"/cases/{case}/tags"))
 
     # ------------------------------------------------------------------ contradictions / alerts
 
-    def contradiction_view(store: Any, c: Contradiction) -> dict[str, Any]:
-        events = [ev for ev in (store.get_event(i) for i in c.event_ids) if ev is not None]
-        return {"c": c, "events": events}
+    @app.get("/cases/{case_id}/contradictions", response_class=HTMLResponse)
+    def contradictions(request: Request, case_id: str) -> HTMLResponse:
+        check_case(case_id)
+        store = _store(request)
+        order = {"open": 0, "confirmed": 1, "dismissed": 2}
+        items = []
+        for c in store.list_contradictions(case):
+            items.append({"c": c, "facts": store.get_facts(c.fact_ids)})
+        items.sort(key=lambda v: order.get(v["c"].status, 3))
+        return render(request, "contradictions.html", items=items, **lookups(store))
 
-    @app.get("/contradictions", response_class=HTMLResponse)
-    def contradictions(request: Request) -> HTMLResponse:
-        store = _deps(request).get_store()
-        items = [contradiction_view(store, c) for c in store.list_contradictions(settings.case_id)]
-        order = {ContradictionStatus.OPEN: 0, ContradictionStatus.CONFIRMED: 1}
-        items.sort(key=lambda v: order.get(v["c"].status, 2))
-        return render(request, "contradictions.html", items=items)
-
-    @app.post("/contradictions/{cid}/status", response_model=None)
-    def contradiction_status(
-        request: Request, cid: str, status: Annotated[str, Form()]
-    ) -> HTMLResponse | RedirectResponse:
-        try:
-            new = ContradictionStatus(status)
-        except ValueError as exc:
-            raise HTTPException(422, "invalid status") from exc
-        store = _deps(request).get_store()
-        setter = getattr(store, "set_contradiction_status", None)
-        if not callable(setter):
-            raise HTTPException(501, "store does not support contradiction review yet")
-        current = {c.id: c for c in store.list_contradictions(settings.case_id)}
-        if cid not in current:
+    @app.post("/contradictions/{contradiction_id}", response_model=None)
+    async def review_contradiction(request: Request, contradiction_id: str) -> Response:
+        user = require_user(request)
+        store = _store(request)
+        if store.contradiction_case(contradiction_id) != case:
             raise HTTPException(404, "contradiction not found")
-        setter(cid, new)
-        log.info("contradiction %s marked %s by reviewer", cid, new.value)
-        if not _is_htmx(request):
-            return RedirectResponse("/contradictions", status_code=303)
-        c = current[cid].model_copy(update={"status": new})
-        return render(request, "_contradiction_status.html", c=c)
+        params = await _params(request)
+        action = params.get("action")
+        if action not in ("confirm", "dismiss", "reopen"):
+            raise HTTPException(422, "action must be confirm, dismiss or reopen")
+        with store_errors():
+            c = store.review_contradiction(contradiction_id, action, reviewer=user)
+        if _wants_json(request):
+            return JSONResponse(c.model_dump(mode="json"))
+        return _redirect(
+            safe_next(
+                params.get("next"),
+                f"/cases/{case}/contradictions#{quote(contradiction_id, safe='')}",
+            )
+        )
 
-    @app.get("/alerts", response_class=HTMLResponse)
-    def alerts(request: Request) -> HTMLResponse:
-        items = _deps(request).get_store().list_alerts(settings.case_id)
-        items = sorted(items, key=lambda a: a.created_at, reverse=True)
-        return render(request, "alerts.html", alerts=items)
+    @app.get("/cases/{case_id}/alerts", response_class=HTMLResponse)
+    def alerts(request: Request, case_id: str) -> HTMLResponse:
+        check_case(case_id)
+        store = _store(request)
+        items = store.list_alerts(case)
+        fact_ids = list(dict.fromkeys(fid for a in items for fid in a.fact_ids))
+        facts = {f.fact_id: f for f in store.get_facts(fact_ids)}
+        return render(
+            request,
+            "alerts.html",
+            alerts=items,
+            facts=facts,
+            doc_map={d.doc_id: d for d in store.list_documents(case)},
+        )
 
-    @app.get("/cases/{case}/alerts/{alert_id}")
-    def alert_link(case: str, alert_id: str) -> RedirectResponse:
-        """Target of ``Alert.dashboard_url`` links sent over messaging."""
-        if case != settings.case_id:
-            raise HTTPException(404, "unknown case")
-        return RedirectResponse(f"/alerts#alert-{quote(alert_id, safe='')}", status_code=303)
+    @app.get("/cases/{case_id}/alerts/{alert_id}", include_in_schema=False)
+    def alert_link(case_id: str, alert_id: str) -> RedirectResponse:
+        """Content-free link target for alerts announced outside the UI."""
+        check_case(case_id)
+        return _redirect(f"/cases/{quote(case, safe='')}/alerts#{quote(alert_id, safe='')}")
+
+    # ------------------------------------------------------------------ export
+
+    @app.get("/cases/{case_id}/export", response_model=None)
+    def export(
+        request: Request, case_id: str, format: str = "xlsx", zoom: str = "month"
+    ) -> Response:
+        check_case(case_id)
+        if format not in EXPORT_TYPES:
+            raise HTTPException(422, "format must be xlsx, csv, svg or png")
+        store = _store(request)
+        params = ParamGetter(request.query_params)
+        f, errors = parse_filters(params)
+        if errors:
+            raise HTTPException(422, "; ".join(errors))
+        facts, search_error = run_filters(store, f)
+        if search_error:
+            raise HTTPException(422, search_error)
+        columns = [c for c in params.getlist("columns") if c in export_mod.COLUMNS]
+        columns = columns or list(export_mod.DEFAULT_COLUMNS)
+        if zoom not in export_mod.ZOOMS:
+            raise HTTPException(422, f"zoom must be one of {', '.join(export_mod.ZOOMS)}")
+        try:
+            if format == "csv":
+                body: bytes | str = export_mod.to_csv(store, case, facts, columns)
+            elif format == "xlsx":
+                body = export_mod.to_xlsx(store, case, facts, columns)
+            elif format == "svg":
+                body = export_mod.to_svg(store, case, facts, zoom)
+            else:
+                body = export_mod.to_png(store, case, facts, zoom)
+        except NotImplementedError as exc:
+            raise HTTPException(501, f"{format.upper()} export is not available yet") from exc
+        media, ext = EXPORT_TYPES[format]
+        return Response(
+            body.encode("utf-8") if isinstance(body, str) else body,
+            media_type=media,
+            headers={
+                "Content-Disposition": f'attachment; filename="{case}-timeline.{ext}"',
+                "Content-Security-Policy": EXPORT_CSP,
+            },
+        )
 
     # ------------------------------------------------------------------ chat
 
@@ -571,9 +1271,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if deps.chat_backend == "local" or exe is None or shutil.which(str(exe)) is None:
             return None
         message = (
-            f"[case-timeline case_id={settings.case_id}] Answer using the case-timeline "
-            "tools only, cite each fact with its source link, and flag deadlines as "
-            f"'needs attorney review'.\n\nQuestion: {question}"
+            f"[case-timeline case_id={case}] Answer using the case-timeline tools only. Cite "
+            "every fact with its fact ID like [F-0012] and its document and page; say when a "
+            "cited fact is an unreviewed draft, and flag deadlines as 'needs attorney "
+            f"review'.\n\nQuestion: {question}"
         )
         cmd = [str(exe), "agent", f"--message={message}", "--json"]
         if agent := os.environ.get("CT_OPENCLAW_AGENT"):
@@ -590,58 +1291,85 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return None
         return _extract_openclaw_text(proc.stdout)
 
-    def ask_local(deps: Deps, question: str) -> tuple[str, list[dict[str, Any]], str | None]:
-        events: list[Event] = deps.get_store().search_events(settings.case_id, question, CHAT_TOP_K)
-        citations = [
-            {"tag": f"E{i}", "event": ev, "url": source_url(ev)}
-            for i, ev in enumerate(events, start=1)
+    def chat_hits(store: Store, question: str) -> list[Fact]:
+        try:
+            ids = search_mod.search_facts(store, case, question, CHAT_TOP_K)
+        except Exception as exc:  # noqa: BLE001 - fall back to vectors, then nothing
+            log.warning("search_facts unavailable for chat (%s)", exc)
+            try:
+                ids = store.vector_fact_ids(case, question, CHAT_TOP_K)
+            except Exception:  # noqa: BLE001
+                ids = []
+        facts = [f for f in store.get_facts(ids) if f.case_id == case and f.review != "rejected"]
+        return facts[:CHAT_TOP_K]
+
+    def fact_context(store: Store, f: Fact, doc_map: dict[str, Document]) -> str:
+        lines = [
+            f"[{f.fact_id}] {f.title}",
+            f"date: {fact_date(f) or 'undated'}"
+            + (f" (as written: {f.date_text})" if f.date_text else ""),
+            f"review: {f.review}; statuses: {', '.join(f.statuses) or 'none'}",
         ]
-        if not events:
-            return "No matching events were found in this case.", [], None
-        context = "\n\n".join(
-            f"[{c['tag']}] date: {c['event'].date_text} "
-            f"({c['event'].date_start or 'unresolved'}, {c['event'].certainty.value})\n"
-            f"actors: {', '.join(c['event'].actors) or '-'}\n"
-            f"event: {c['event'].description}\n"
-            f'quote: "{c["event"].source.quote}"'
-            for c in citations
-        )
+        if f.details:
+            lines.append(f"details: {f.details}")
+        for e in f.evidence[:3]:
+            if e.kind == "span" and e.quote:
+                doc = doc_map.get(e.doc_id or "")
+                where = f"{doc.filename if doc else e.doc_id}, {evidence_cite(e)}".strip(", ")
+                lines.append(f'quote ({where}): "{e.quote}"')
+        return "\n".join(lines)
+
+    def ask_local(deps: Deps, question: str) -> tuple[str, list[Fact], str | None]:
+        store = deps.get_store()
+        facts = chat_hits(store, question)
+        if not facts:
+            return "No facts in this case match the question.", [], None
+        doc_map = {d.doc_id: d for d in store.list_documents(case)}
+        context = "\n\n".join(fact_context(store, f, doc_map) for f in facts)
         messages = [
             {"role": "system", "content": CHAT_SYSTEM},
-            {"role": "user", "content": f"Evidence excerpts:\n\n{context}\n\nQuestion: {question}"},
+            {"role": "user", "content": f"Case facts:\n\n{context}\n\nQuestion: {question}"},
         ]
         try:
             answer = deps.get_llm().chat(messages)
-        except Exception as exc:  # noqa: BLE001 - model may be offline; still show evidence
+        except Exception as exc:  # noqa: BLE001 - model may be offline; still show the facts
             log.warning("local LLM unavailable for chat: %s", exc)
-            return "", citations, "The local model is unavailable; matching events are listed."
-        return answer, citations, None
+            return "", facts, "The local model is unavailable; the matching facts are listed."
+        return answer, facts, None
 
-    @app.get("/chat", response_class=HTMLResponse)
-    def chat_form(request: Request) -> HTMLResponse:
+    @app.get("/cases/{case_id}/chat", response_class=HTMLResponse)
+    def chat_form(request: Request, case_id: str) -> HTMLResponse:
+        check_case(case_id)
         return render(request, "chat.html", result=None)
 
-    @app.post("/chat", response_class=HTMLResponse)
-    def chat(request: Request, question: Annotated[str, Form()]) -> HTMLResponse:
-        question = question.strip()[:4000]
+    @app.post("/cases/{case_id}/chat", response_class=HTMLResponse)
+    async def chat(request: Request, case_id: str) -> HTMLResponse:
+        check_case(case_id)
+        params = await _params(request)
+        question = (params.get("question") or "").strip()[:4000]
         if not question:
             raise HTTPException(422, "empty question")
         deps = _deps(request)
-        citations: list[dict[str, Any]] = []
+        store = deps.get_store()
+        facts: list[Fact] = []
         notice = None
         backend = "openclaw"
         answer = ask_openclaw(deps, question)
         if answer is None:
             if deps.chat_backend == "openclaw":
-                notice = "OpenClaw agent unavailable."
-                answer = ""
+                notice, answer = "The OpenClaw agent is unavailable.", ""
             else:
                 backend = "local"
-                answer, citations, notice = ask_local(deps, question)
+                answer, facts, notice = ask_local(deps, question)
+        known = known_fact(store)
+        cited = [fid for fid in fact_ids_in(answer) if known(fid)]
+        if not facts and cited:
+            facts = store.get_facts(cited)
         result = {
             "question": question,
-            "answer_html": linkify_answer(answer, citations),
-            "citations": citations,
+            "answer_html": linkify_fact_ids(answer, known),
+            "facts": facts,
+            "cited": set(cited),
             "notice": notice,
             "backend": backend,
         }

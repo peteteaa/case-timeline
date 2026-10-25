@@ -1,4 +1,10 @@
-"""Ground extracted events in the source text: locate each quote and record exact offsets."""
+"""Ground drafted facts in the source text (SPEC §6.1 step 2): no LLM here.
+
+Every quote the model wrote is located in the parsed text (exact, then normalized, then
+elision-aware, then fuzzy) and becomes a :class:`SpanIn` whose ``quote`` is exactly
+``parsed.text[char_start:char_end]``, the check the store repeats before writing evidence.
+Quotes that can't be located are dropped; drafts left without any span are discarded.
+"""
 
 from __future__ import annotations
 
@@ -8,13 +14,12 @@ import unicodedata
 
 from rapidfuzz import fuzz
 
-from pipeline.contracts import Event, EventStatus, Page, ParsedDocument, SourceRef
+from pipeline.schema import DraftFact, Line, Page, ParsedDocument, SpanIn
 
 log = logging.getLogger(__name__)
 
 FUZZY_THRESHOLD = 90.0
 MIN_FUZZY_LEN = 12  # shorter quotes match too easily by chance
-UNVERIFIED_PENALTY = 0.5
 
 _CHAR_MAP = {
     **dict.fromkeys("‘’‚‛′", "'"),
@@ -130,42 +135,83 @@ def locate_quote(text: str, quote: str) -> tuple[int, int] | None:
 
 
 def page_for_offset(pages: list[Page], offset: int) -> int | None:
-    """1-based page containing ``offset``; separator gaps count toward the next page."""
+    """1-based page containing ``offset``; separator gaps count toward the next page.
+
+    Text before the first page (e.g. a caption ahead of a ``[Page 14]`` marker) has no page.
+    """
     ordered = sorted((p for p in pages if p.char_end > p.char_start), key=lambda p: p.char_start)
+    if not ordered or offset < ordered[0].char_start:
+        return None
     for page in ordered:
         if offset < page.char_end:
             return page.number
-    return ordered[-1].number if ordered else None
+    return ordered[-1].number
 
 
-def verify_events(parsed: ParsedDocument, events: list[Event]) -> list[Event]:
-    """Attach verbatim quotes, offsets and pages; mark unlocatable events UNVERIFIED."""
+def lines_for_span(lines: list[Line], start: int, end: int) -> tuple[Line, Line] | None:
+    """First and last transcript line overlapping ``[start, end)``, or None."""
+    hits = [ln for ln in lines if ln.char_start < end and ln.char_end > start]
+    if not hits:
+        return None
+    hits.sort(key=lambda ln: ln.char_start)
+    return hits[0], hits[-1]
+
+
+def make_span(parsed: ParsedDocument, start: int, end: int) -> SpanIn:
+    """A span over ``parsed.text[start:end]`` with page and transcript lines filled."""
+    page = page_for_offset(parsed.pages, start)
+    line_start = line_end = None
+    if found := lines_for_span(parsed.lines, start, end):
+        first, last = found
+        line_start, line_end = first.number, last.number
+        page = page if page is not None else first.page
+    return SpanIn(
+        doc_id=parsed.doc.doc_id,
+        page=page,
+        char_start=start,
+        char_end=end,
+        line_start=line_start,
+        line_end=line_end,
+        quote=parsed.text[start:end],
+    )
+
+
+def verify_drafts(
+    parsed: ParsedDocument, drafts: list[DraftFact]
+) -> tuple[list[DraftFact], dict[str, int]]:
+    """Locate every quote; returns ``(drafts with spans, counts)``.
+
+    Counts: ``quotes_checked``, ``quotes_rejected`` (not found verbatim or near-verbatim) and
+    ``drafts_discarded`` (no quote survived). Inputs are not mutated.
+    """
     text = parsed.text
-    out: list[Event] = []
-    for ev in events:
-        span = locate_quote(text, ev.source.quote)
-        if span is None:
-            log.info("quote not found for event %s in %s", ev.id, parsed.doc.filename)
-            source = SourceRef(
-                doc_id=parsed.doc.id, page=None, char_start=0, char_end=0, quote=ev.source.quote
-            )
-            out.append(
-                ev.model_copy(
-                    update={
-                        "source": source,
-                        "status": EventStatus.UNVERIFIED,
-                        "confidence": ev.confidence * UNVERIFIED_PENALTY,
-                    }
-                )
-            )
+    counts = {"quotes_checked": 0, "quotes_rejected": 0, "drafts_discarded": 0}
+    out: list[DraftFact] = []
+    for draft in drafts:
+        spans: list[SpanIn] = []
+        seen: set[tuple[int, int]] = set()
+        for quote in draft.quotes:
+            if not quote.strip():
+                continue
+            counts["quotes_checked"] += 1
+            found = locate_quote(text, quote)
+            if found is not None:
+                start, end = found
+                while start < end and text[start].isspace():
+                    start += 1
+                while end > start and text[end - 1].isspace():
+                    end -= 1
+                found = (start, end) if end > start else None
+            if found is None:
+                counts["quotes_rejected"] += 1
+                log.info("quote not found in %s: %.80r", parsed.doc.filename, quote)
+                continue
+            if found in seen:
+                continue
+            seen.add(found)
+            spans.append(make_span(parsed, *found))
+        if not spans:
+            counts["drafts_discarded"] += 1
             continue
-        start, end = span
-        source = SourceRef(
-            doc_id=parsed.doc.id,
-            page=page_for_offset(parsed.pages, start),
-            char_start=start,
-            char_end=end,
-            quote=text[start:end],
-        )
-        out.append(ev.model_copy(update={"source": source}))
-    return out
+        out.append(draft.model_copy(update={"spans": spans}))
+    return out, counts

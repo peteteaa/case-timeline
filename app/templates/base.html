@@ -8,26 +8,46 @@
   <link rel="stylesheet" href="/static/app.css">
   {% block head %}{% endblock %}
   <script src="/static/vendor/htmx.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
 </head>
 <body>
+  {% set base = '/cases/' ~ quote(case_id) %}
+  {% set p = request.url.path %}
   <header class="topbar">
-    <a class="brand" href="/">Case Timeline</a>
+    <a class="brand" href="{{ base }}">Case Timeline</a>
     <span class="case-pill" title="Case">{{ case_id }}</span>
-    <nav>
-      {% set p = request.url.path %}
-      <a href="/" {% if p == '/' %}aria-current="page"{% endif %}>Dashboard</a>
-      <a href="/timeline" {% if p.startswith('/timeline') %}aria-current="page"{% endif %}>Timeline</a>
-      <a href="/contradictions" {% if p.startswith('/contradictions') %}aria-current="page"{% endif %}>Contradictions</a>
-      <a href="/alerts" {% if p.startswith('/alerts') %}aria-current="page"{% endif %}>Alerts</a>
-      <a href="/chat" {% if p.startswith('/chat') %}aria-current="page"{% endif %}>Ask</a>
-      <a href="/upload" {% if p.startswith('/upload') %}aria-current="page"{% endif %}>Upload</a>
+    <nav aria-label="Main">
+      <a href="{{ base }}" {% if p == base %}aria-current="page"{% endif %}>Today</a>
+      <a href="{{ base }}/facts" {% if p == base ~ '/facts' or p.startswith('/facts/') %}aria-current="page"{% endif %}>Timeline</a>
+      <a href="{{ base }}/review" {% if p == base ~ '/review' %}aria-current="page"{% endif %}>Needs review{% if nav and nav.drafts %} <span class="count">{{ nav.drafts }}</span>{% endif %}</a>
+      <a href="{{ base }}/documents" {% if p == base ~ '/documents' or p.startswith('/documents/') %}aria-current="page"{% endif %}>Documents</a>
+      <a href="{{ base }}/witnesses" {% if p == base ~ '/witnesses' or p.startswith('/witnesses/') %}aria-current="page"{% endif %}>Witnesses</a>
+      <a href="{{ base }}/tags" {% if p == base ~ '/tags' %}aria-current="page"{% endif %}>Tags</a>
+      <a href="{{ base }}/contradictions" {% if p == base ~ '/contradictions' %}aria-current="page"{% endif %}>Contradictions{% if nav and nav.conflicts %} <span class="count danger">{{ nav.conflicts }}</span>{% endif %}</a>
+      <a href="{{ base }}/alerts" {% if p == base ~ '/alerts' %}aria-current="page"{% endif %}>Alerts{% if nav and nav.alerts %} <span class="count warn">{{ nav.alerts }}</span>{% endif %}</a>
+      <a href="{{ base }}/chat" {% if p == base ~ '/chat' %}aria-current="page"{% endif %}>Ask</a>
     </nav>
+    <span class="user">
+      {% if user %}<span class="muted small">Signed in as</span> <strong>{{ user }}</strong> <a class="small" href="/name?next={{ quote(here) }}">change</a>
+      {% endif %}
+    </span>
     <span class="local-badge" title="All processing happens on this machine">Local only</span>
   </header>
+  {% if not user and p != '/name' %}
+  <div class="name-banner" role="note">
+    <form method="post" action="/name" class="inline-form">
+      <label for="banner-name">To make changes, enter the display name your edits and reviews will be recorded under:</label>
+      <input id="banner-name" name="name" maxlength="60" required autocomplete="name" placeholder="e.g. Jane Doe">
+      <input type="hidden" name="next" value="{{ here }}">
+      <button class="btn primary small">Continue</button>
+    </form>
+  </div>
+  {% endif %}
+  <div id="toast" class="toast" role="alert" hidden></div>
   <main>
     {% block content %}{% endblock %}
   </main>
-  <footer class="foot">Draft for human review. Extracted events are not evidence; always check the cited source.</footer>
+  <footer class="foot">Drafts are AI suggestions until a person accepts them. Always check the cited source before relying on a fact. Everything stays on this machine.</footer>
   {% block scripts %}{% endblock %}
 </body>
 </html>

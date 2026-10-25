@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Your name{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>Who is reviewing?</h1>
+  <p class="muted">There are no accounts. Your display name is kept in a cookie on this browser and recorded as the author of every fact, note and review you make.</p>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  <form method="post" action="/name" class="stack">
+    <label for="name">Display name</label>
+    <input id="name" name="name" maxlength="60" required autofocus autocomplete="name" value="{{ user or '' }}">
+    <input type="hidden" name="next" value="{{ next }}">
+    <div><button class="btn primary">Save name</button></div>
+  </form>
+</section>
+{% endblock %}

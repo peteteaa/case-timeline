@@ -1,4 +1,4 @@
-"""Run the review UI: ``uv run python -m ui``. Binds to loopback only."""
+"""Run the web UI and job worker: ``uv run python -m app``. Binds to loopback only."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ import sys
 
 import uvicorn
 
-from pipeline.config import get_settings
 from app.app import create_app, host_is_loopback
+from pipeline.config import get_settings
 
-log = logging.getLogger("ui")
+log = logging.getLogger("app")
 
 
 def main() -> int:

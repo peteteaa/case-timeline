@@ -1,40 +1,57 @@
-"""Turn a parsed document into proposed timeline events via the local LLM."""
+"""Draft facts from a parsed document with the local LLM (SPEC §6.1 step 1).
+
+The document is split into overlapping chunks; the model returns facts with verbatim quotes per
+chunk. Offsets are not the model's job: ``verify`` locates every quote afterwards.
+"""
 
 from __future__ import annotations
 
 import hashlib
-import importlib
 import logging
 import re
 
 from pydantic import BaseModel, Field
 
 from pipeline import prompts
-from pipeline.contracts import Event, EventStatus, ParsedDocument, SourceRef
+from pipeline.schema import DraftFact, ParsedDocument
 
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 6000
 CHUNK_OVERLAP = 500
+MAX_QUOTES = 4
+MAX_TITLE_CHARS = 200
 
 _WS = re.compile(r"\s+")
+_PRONOUNS = frozenset(
+    "i me my he him his she her hers they them their we us our you your it its someone somebody "
+    "nobody everyone anyone".split()
+)
+_ORG_HINT = re.compile(
+    r"\b(?:inc|llc|llp|ltd|corp|corporation|co|company|department|dept|division|police|court|"
+    r"agency|bureau|office|hr|freight|bank|university|county|city|state)\b\.?$",
+    re.IGNORECASE,
+)
 
 
-class ExtractedEvent(BaseModel):
-    """One event as returned by the model (offsets are computed later, not by the LLM)."""
+class ExtractedFact(BaseModel):
+    """One fact as returned by the model (offsets are computed later, not by the LLM)."""
 
-    quote: str = Field(description="Verbatim sentence or clause copied from the excerpt.")
-    date_text: str = Field(description="The date exactly as written in the excerpt.")
-    actors: list[str] = Field(default_factory=list, description="Named people/organizations.")
-    description: str = Field(description="One neutral sentence describing the event.")
-    deadline_relevant: bool = False
+    title: str = Field(description="Short, neutral headline for the fact.")
+    details: str = Field(default="", description="One or two neutral sentences, or empty.")
+    date_text: str = Field(default="", description="The date exactly as written, or empty.")
+    people: list[str] = Field(default_factory=list, description="Person names only.")
+    quotes: list[str] = Field(
+        default_factory=list, description="Verbatim sentences or clauses copied from the excerpt."
+    )
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    deadline_language: bool = False
 
 
 class ExtractionResult(BaseModel):
     """Structured-output schema for one chunk."""
 
-    events: list[ExtractedEvent] = Field(default_factory=list)
+    facts: list[ExtractedFact] = Field(default_factory=list)
 
 
 def chunk_text(
@@ -80,114 +97,122 @@ def _break_after(text: str, lo: int, hi: int) -> int:
     return lo
 
 
-def event_id(doc_id: str, quote: str, date_text: str) -> str:
-    """Deterministic 16-hex id from doc id, quote and date text (whitespace-normalized)."""
-    key = "\x1f".join((doc_id, _norm(quote), _norm(date_text)))
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-
-
 def _norm(s: str) -> str:
     return _WS.sub(" ", s).strip()
 
 
-def _chat_json(system: str, user: str, schema: type[BaseModel]) -> BaseModel:
-    """Resolve pipeline.llm lazily so this module imports even before llm.py exists."""
-    llm = importlib.import_module("pipeline.llm")
-    return llm.chat_json(system, user, schema)
+def draft_key(doc_id: str, first_quote: str, title: str) -> str:
+    """Deterministic 16-hex key from doc id, first quote and title (whitespace/case-insensitive)."""
+    raw = "\x1f".join((doc_id, _norm(first_quote).casefold(), _norm(title).casefold()))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _page_for(parsed: ParsedDocument, offset: int) -> int | None:
-    for page in parsed.pages:
-        if page.char_start <= offset < page.char_end:
-            return page.number
-    return None
+def clean_people(names: list[str]) -> list[str]:
+    """Person names only: drop blanks, pronouns and organization-like names; dedupe."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in names:
+        name = _norm(raw).strip(" ,;:")
+        low = name.casefold()
+        if len(name) < 2 or low in _PRONOUNS or _ORG_HINT.search(name):
+            continue
+        if not any(ch.isalpha() for ch in name) or low in seen:
+            continue
+        seen.add(low)
+        out.append(name)
+    return out
 
 
-def _to_event(
-    parsed: ParsedDocument, item: ExtractedEvent, chunk_start: int, chunk_end: int
-) -> Event | None:
-    quote = item.quote.strip()
-    date_text = item.date_text.strip()
-    if not quote or not item.description.strip():
+def _to_draft(parsed: ParsedDocument, item: ExtractedFact) -> DraftFact | None:
+    title = _norm(item.title)[:MAX_TITLE_CHARS].strip()
+    if not title:
         return None
-    chunk = parsed.text[chunk_start:chunk_end]
-    idx = chunk.find(quote)
-    if idx >= 0:
-        # Provisional document offsets; verify.locate_quote is authoritative.
-        char_start = chunk_start + idx
-        char_end = char_start + len(quote)
-        page = _page_for(parsed, char_start)
-    else:
-        # Not found verbatim: point at the chunk span as a search hint for verify.
-        char_start, char_end, page = chunk_start, chunk_end, None
-    actors: list[str] = []
-    for actor in item.actors:
-        actor = _norm(actor)
-        if actor and actor not in actors:
-            actors.append(actor)
-    doc_id = parsed.doc.id
-    return Event(
-        id=event_id(doc_id, quote, date_text),
-        case_id=parsed.doc.case_id,
-        date_text=date_text,
-        actors=actors,
-        description=_norm(item.description),
-        source=SourceRef(
-            doc_id=doc_id, page=page, char_start=char_start, char_end=char_end, quote=quote
-        ),
+    quotes: list[str] = []
+    for q in item.quotes:
+        q = q.strip()
+        if q and q not in quotes:
+            quotes.append(q)
+    quotes = quotes[:MAX_QUOTES]
+    return DraftFact(
+        key=draft_key(parsed.doc.doc_id, quotes[0] if quotes else "", title),
+        title=title,
+        details=_norm(item.details) or None,
+        date_text=_norm(item.date_text) or None,
+        people=clean_people(item.people),
+        quotes=quotes,
         confidence=min(1.0, max(0.0, item.confidence)),
-        status=EventStatus.PROPOSED,
-        deadline_relevant=item.deadline_relevant,
+        deadline_language=item.deadline_language,
     )
 
 
-def _merge_dup(a: Event, b: Event) -> Event:
-    """Combine two extractions of the same event (from overlapping chunks)."""
-
-    def rank(e: Event) -> tuple[bool, float]:
-        located = e.source.char_end - e.source.char_start == len(e.source.quote)
-        return (located, e.confidence)
-
-    best, other = (a, b) if rank(a) >= rank(b) else (b, a)
-    actors = list(best.actors) + [x for x in other.actors if x not in best.actors]
+def _merge_dup(a: DraftFact, b: DraftFact) -> DraftFact:
+    """Combine two sightings of the same fact (from overlapping chunks)."""
+    best, other = (a, b) if a.confidence >= b.confidence else (b, a)
     return best.model_copy(
         update={
-            "actors": actors,
+            "people": best.people + [p for p in other.people if p not in best.people],
+            "quotes": (best.quotes + [q for q in other.quotes if q not in best.quotes])[
+                :MAX_QUOTES
+            ],
+            "details": best.details or other.details,
+            "date_text": best.date_text or other.date_text,
             "confidence": max(a.confidence, b.confidence),
-            "deadline_relevant": a.deadline_relevant or b.deadline_relevant,
+            "deadline_language": a.deadline_language or b.deadline_language,
         }
     )
 
 
-def extract_events(parsed: ParsedDocument) -> list[Event]:
-    """Chunk the document, ask the LLM for events per chunk, and return deduped Events.
+def _sighting(d: DraftFact) -> tuple[str, str]:
+    """Overlap-duplicate signature: same first quote and same date as written."""
+    first = d.quotes[0] if d.quotes else ""
+    return _norm(first).casefold(), _norm(d.date_text or "").casefold()
 
-    A chunk whose LLM call fails is logged and skipped; if every chunk fails the last
-    error is re-raised so the caller can retry the document later.
+
+def draft_facts(parsed: ParsedDocument) -> list[DraftFact]:
+    """Chunk the document, ask the LLM for facts per chunk, return deduplicated drafts.
+
+    A chunk whose LLM call fails is logged and skipped; if every chunk fails the last error is
+    re-raised so the document stays queued for the next scan.
     """
+    from pipeline import llm
+
     spans = chunk_text(parsed.text, CHUNK_SIZE, CHUNK_OVERLAP)
-    events: dict[str, Event] = {}
+    drafts: dict[str, DraftFact] = {}
+    chunk_of: dict[str, int] = {}
+    by_sighting: dict[tuple[str, str], str] = {}
     failures = 0
     last_error: Exception | None = None
     for i, (start, end) in enumerate(spans, start=1):
         user = prompts.extraction_user(parsed.doc.filename, parsed.text[start:end], i, len(spans))
         try:
-            result = _chat_json(prompts.EXTRACTION_SYSTEM, user, ExtractionResult)
+            result = llm.chat_json(prompts.EXTRACTION_SYSTEM, user, ExtractionResult)
         except Exception as exc:  # one bad chunk must not sink the whole document
             failures += 1
             last_error = exc
             logger.warning(
-                "extraction failed for %s chunk %d/%d: %s", parsed.doc.id, i, len(spans), exc
+                "extraction failed for %s chunk %d/%d: %s", parsed.doc.doc_id, i, len(spans), exc
             )
             continue
         if not isinstance(result, ExtractionResult):
             result = ExtractionResult.model_validate(result, from_attributes=True)
-        for item in result.events:
-            ev = _to_event(parsed, item, start, end)
-            if ev is None:
+        for item in result.facts:
+            d = _to_draft(parsed, item)
+            if d is None:
                 continue
-            events[ev.id] = _merge_dup(events[ev.id], ev) if ev.id in events else ev
+            sig = _sighting(d)
+            key = d.key
+            if key not in drafts and sig[0] and sig in by_sighting:
+                other = by_sighting[sig]
+                if chunk_of[other] != i:  # same quote and date seen in an overlapping chunk
+                    key = other
+            if key in drafts:
+                drafts[key] = _merge_dup(drafts[key], d).model_copy(update={"key": key})
+            else:
+                drafts[key] = d
+                chunk_of[key] = i
+                if sig[0]:
+                    by_sighting.setdefault(sig, key)
     if spans and failures == len(spans) and last_error is not None:
         raise last_error
-    logger.info("extracted %d events from %s (%d chunks)", len(events), parsed.doc.id, len(spans))
-    return sorted(events.values(), key=lambda e: (e.source.char_start, e.id))
+    logger.info("drafted %d facts from %s (%d chunks)", len(drafts), parsed.doc.doc_id, len(spans))
+    return list(drafts.values())

@@ -1,0 +1,4 @@
+<span id="rv-{{ fact.fact_id }}" class="review-controls">
+  <span class="state state-{{ fact.review }}">{{ fact.review }}</span>
+  <span class="muted small">by {{ fact.updated_by }}{% if reason %} · “{{ reason }}”{% endif %}</span>
+</span>

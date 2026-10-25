@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Job {{ job.job_id }}{% endblock %}
+{% block content %}
+<section class="page-head"><h1>Processing job {{ job.job_id }}</h1></section>
+<section class="card">{% include "_job.html" %}</section>
+<p><a href="/cases/{{ quote(case_id) }}/documents">Documents</a> · <a href="/cases/{{ quote(case_id) }}/review">Needs review</a></p>
+{% endblock %}

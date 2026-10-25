@@ -1,27 +1,20 @@
-{% if error %}
-<div id="job-status" class="job job-failed" role="status">
-  <strong>Could not start processing:</strong> {{ error }}
-</div>
-{% elif job %}
-{% set active = job.state.value in ('queued', 'running') %}
-<div id="job-status" class="job job-{{ job.state.value }}" role="status"
-     {% if active %}hx-get="/jobs/{{ job.id | urlencode }}" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+{% if job %}
+{% set active = job.status in ('queued', 'running') %}
+<div id="job-status" class="job job-{{ job.status }}" role="status"
+     {% if active %}hx-get="/jobs/{{ quote(job.job_id) }}" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
   <div class="job-head">
-    <span class="state state-{{ job.state.value }}">{{ job.state.value }}</span>
-    <span class="muted">Job {{ job.id }}</span>
+    <span class="state state-{{ job.status }}">{{ job.status }}</span>
+    <a class="muted" href="/jobs/{{ quote(job.job_id) }}">Job {{ job.job_id }}</a>
+    <span class="muted small">({{ job.trigger }})</span>
   </div>
-  <div class="progress" aria-label="documents processed">
-    {% set pct = (100 * job.docs_done / job.docs_total) | round | int if job.docs_total else (100 if job.state.value == 'done' else 0) %}
-    <div class="bar" style="width: {{ pct }}%"></div>
-  </div>
+  {% if active %}<div class="progress indeterminate" aria-label="processing"><div class="bar"></div></div>{% endif %}
   <dl class="job-stats">
-    <div><dt>Documents</dt><dd>{{ job.docs_done }} / {{ job.docs_total }}</dd></div>
-    <div><dt>Events added</dt><dd>{{ job.events_added }}</dd></div>
-    <div><dt>Contradictions</dt><dd>{{ job.contradictions_added }}</dd></div>
-    {% if job.started_at %}<div><dt>Started</dt><dd>{{ job.started_at.strftime('%Y-%m-%d %H:%M:%S') }}</dd></div>{% endif %}
-    {% if job.finished_at %}<div><dt>Finished</dt><dd>{{ job.finished_at.strftime('%Y-%m-%d %H:%M:%S') }}</dd></div>{% endif %}
+    {% for key, label in COUNT_LABELS.items() %}{% if job.counts.get(key) %}<div><dt>{{ label }}</dt><dd>{{ job.counts[key] }}</dd></div>{% endif %}{% endfor %}
+    <div><dt>Queued</dt><dd>{{ fmt_dt(job.queued_at) }}</dd></div>
+    {% if job.finished_at %}<div><dt>Finished</dt><dd>{{ fmt_dt(job.finished_at) }}</dd></div>{% endif %}
   </dl>
-  {% if job.error %}<p class="error">{{ job.error }}</p>{% endif %}
+  {% if job.error %}<p class="error small">{{ job.error }}</p>{% endif %}
+  {% if job.status == 'done' and job.counts.get('facts_created') %}<p class="small"><a href="/cases/{{ quote(case_id) }}/review">Review the new drafts →</a></p>{% endif %}
 </div>
 {% else %}
 <div id="job-status" class="job muted">No processing job has run yet.</div>

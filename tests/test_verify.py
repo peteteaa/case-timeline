@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
-from pipeline.contracts import Document, Event, EventStatus, Page, ParsedDocument, SourceRef
-from pipeline.parse import discover, parse
-from pipeline.verify import locate_quote, page_for_offset, verify_events
+from pipeline.parse import parse_file
+from pipeline.schema import DraftFact, Line, Page, ParsedDocument
+from pipeline.verify import (
+    lines_for_span,
+    locate_quote,
+    page_for_offset,
+    verify_drafts,
+)
+from tests.pipeline_helpers import make_doc, make_parsed
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "case_demo"
@@ -26,27 +33,29 @@ def parsed_fixtures() -> dict[str, ParsedDocument]:
     mp = pytest.MonkeyPatch()
     mp.setenv("CT_DISABLE_DOCLING", "1")
     try:
-        return {d.filename: parse(d) for d in discover(FIXTURES, "demo", inbox_dirs=[])}
+        out = {}
+        for i, path in enumerate(sorted(FIXTURES.iterdir()), start=1):
+            sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            doc = make_doc(f"D-{i:04d}", path.name).model_copy(update={"sha256": sha})
+            out[path.name] = parse_file(path, doc)
+        return out
     finally:
         mp.undo()
 
 
-def _event(quote: str, *, confidence: float = 0.8, doc_id: str = "x") -> Event:
-    return Event(
-        id="e1",
-        case_id="demo",
-        date_text="March 12, 2024",
-        description="meeting",
-        source=SourceRef(doc_id=doc_id, char_start=0, char_end=0, quote=quote),
-        confidence=confidence,
-    )
+def _gold(*names: str) -> list[dict]:
+    """The eval's gold file (its name has changed over time); skip if it isn't there."""
+    for name in names:
+        if (GOLD / name).is_file():
+            return json.loads((GOLD / name).read_text(encoding="utf-8"))
+    pytest.skip(f"no gold file among {names}")
 
 
-def _parsed(text: str, pages: list[Page] | None = None) -> ParsedDocument:
-    doc = Document(
-        id="d1", case_id="demo", path="/x", filename="x.txt", mime="text/plain", sha256="0" * 64
-    )
-    return ParsedDocument(doc=doc, text=text, pages=pages or [])
+def _draft(*quotes: str, key: str = "k1") -> DraftFact:
+    return DraftFact(key=key, title="meeting", quotes=list(quotes), confidence=0.8)
+
+
+# --------------------------------------------------------------------------- locate_quote
 
 
 def test_exact_match() -> None:
@@ -74,15 +83,13 @@ def test_surrounding_quote_marks_are_ignored() -> None:
 
 
 def test_elided_quote() -> None:
-    q = "Ms. Rivera stated that ... threatened to fire her"
-    s, e = locate_quote(TEXT, q)
+    s, e = locate_quote(TEXT, "Ms. Rivera stated that ... threatened to fire her")
     assert TEXT[s:e].startswith("Ms. Rivera stated that")
     assert TEXT[s:e].endswith("threatened to fire her")
 
 
 def test_fuzzy_match_snaps_to_words() -> None:
-    q = "during a meting in Mr. Elison's ofice"
-    span = locate_quote(TEXT, q)
+    span = locate_quote(TEXT, "during a meting in Mr. Elison's ofice")
     assert span is not None
     s, e = span
     assert TEXT[s:e] == "during a meeting in Mr. Ellison’s office"
@@ -107,73 +114,93 @@ def test_page_for_offset() -> None:
     assert page_for_offset(pages, 15) == 2
     assert page_for_offset(pages, 20) == 2
     assert page_for_offset([], 3) is None
+    marker_pages = [Page(number=14, char_start=50, char_end=90)]
+    assert page_for_offset(marker_pages, 10) is None  # caption before the first page marker
+    assert page_for_offset(marker_pages, 60) == 14
 
 
-def test_verify_events_sets_offsets_and_page() -> None:
+def test_lines_for_span() -> None:
+    lines = [Line(page=3, number=n, char_start=10 * n, char_end=10 * n + 8) for n in range(1, 5)]
+    first, last = lines_for_span(lines, 15, 35)
+    assert (first.number, last.number) == (1, 3)
+    assert lines_for_span(lines, 0, 9) is None
+
+
+# --------------------------------------------------------------------------- verify_drafts
+
+
+def test_verify_drafts_sets_spans_and_page() -> None:
     text = "Page one text.\n\nOn page two the MEETING happened."
     pages = [
         Page(number=1, char_start=0, char_end=14),
         Page(number=2, char_start=16, char_end=len(text)),
     ]
-    parsed = _parsed(text, pages)
-    ev = _event("the meeting happened", confidence=0.9).model_copy(
-        update={"status": EventStatus.ACCEPTED}
+    parsed = make_parsed(text, pages)
+    draft = _draft("the meeting happened", "the meeting happened", "Page one text.")
+    (out,), counts = verify_drafts(parsed, [draft])
+    assert [s.quote for s in out.spans] == ["the MEETING happened", "Page one text."]
+    for s in out.spans:
+        assert text[s.char_start : s.char_end] == s.quote
+        assert s.doc_id == "D-0001"
+    assert [s.page for s in out.spans] == [2, 1]
+    assert counts == {"quotes_checked": 3, "quotes_rejected": 0, "drafts_discarded": 0}
+    assert draft.spans == []  # input not mutated
+    assert out.confidence == 0.8 and out.quotes == draft.quotes
+
+
+def test_verify_drops_bad_quotes_and_discards_empty_drafts() -> None:
+    parsed = make_parsed("Smith signed the lease on March 3, 2024. Nothing else happened.")
+    keep = _draft("Smith signed the lease", "a quote the model invented", key="a")
+    gone = _draft("another invented sentence about rent", key="b")
+    no_quotes = _draft(key="c")
+    out, counts = verify_drafts(parsed, [keep, gone, no_quotes])
+    assert [d.key for d in out] == ["a"]
+    assert [s.quote for s in out[0].spans] == ["Smith signed the lease"]
+    assert counts == {"quotes_checked": 3, "quotes_rejected": 2, "drafts_discarded": 2}
+
+
+def test_verify_fills_transcript_lines(parsed_fixtures: dict[str, ParsedDocument]) -> None:
+    parsed = parsed_fixtures["deposition_excerpt_ellison.txt"]
+    draft = _draft(
+        "A. Priya Nand from HR sat in. Nobody else.",
+        "Q. When was Ms. Rivera's employment terminated?\nA. April 5, 2024.",
+        "DEPOSITION OF MARK ELLISON",
     )
-    (out,) = verify_events(parsed, [ev])
-    assert out.source.quote == "the MEETING happened"
-    assert text[out.source.char_start : out.source.char_end] == out.source.quote
-    assert out.source.page == 2
-    assert out.source.doc_id == "d1"
-    assert out.status == EventStatus.ACCEPTED
-    assert out.confidence == 0.9
-    assert ev.source.char_end == 0  # input not mutated
-
-
-def test_verify_events_unverified() -> None:
-    parsed = _parsed("Nothing relevant here at all.")
-    (out,) = verify_events(parsed, [_event("a quote the model invented", confidence=0.8)])
-    assert out.status == EventStatus.UNVERIFIED
-    assert out.confidence == pytest.approx(0.4)
-    assert out.source.doc_id == "d1"
-    assert out.source.page is None
-    assert (out.source.char_start, out.source.char_end) == (0, 0)
-    assert out.source.quote == "a quote the model invented"
+    (out,), _ = verify_drafts(parsed, [draft])
+    refs = [(s.page, s.line_start, s.line_end) for s in out.spans]
+    assert refs == [(14, 4, 4), (15, 5, 6), (None, None, None)]
 
 
 def test_gold_quotes_ground_in_fixtures(parsed_fixtures: dict[str, ParsedDocument]) -> None:
-    gold = json.loads((GOLD / "demo.json").read_text(encoding="utf-8"))
-    assert 25 <= len(gold) <= 35
-    assert len({g["event_key"] for g in gold}) >= 15
-    assert any(g["deadline_relevant"] for g in gold)
-    certainties = {g["certainty"] for g in gold}
-    assert {"exact", "approximate", "relative"} <= certainties
+    gold = _gold("demo_timeline.json", "demo.json")
+    assert gold
     for g in gold:
         parsed = parsed_fixtures[g["doc"]]
-        events = [_event(g["quote"], doc_id=parsed.doc.id)]
-        (out,) = verify_events(parsed, events)
-        assert out.status != EventStatus.UNVERIFIED, g["quote"]
+        (out,), counts = verify_drafts(parsed, [_draft(g["quote"])])
+        assert counts["quotes_rejected"] == 0, g["quote"]
+        (span,) = out.spans
+        assert parsed.text[span.char_start : span.char_end] == span.quote
         if g["doc"].endswith(".pdf"):
-            assert out.source.page in (1, 2)
+            assert span.page in (1, 2)
+        if g["doc"].startswith("deposition") and span.char_start > parsed.pages[0].char_start:
+            assert span.page in (14, 15) and span.line_start is not None
 
 
 def test_pdf_quotes_land_on_right_page(parsed_fixtures: dict[str, ParsedDocument]) -> None:
     parsed = parsed_fixtures["incident_report.pdf"]
-    evs = [
-        _event("only he and Ms. Rivera were present in the office"),  # wraps a line in the PDF
-        _event("conducted a follow-up telephone interview with Tom Becker"),
+    drafts = [
+        _draft("only he and Ms. Rivera were present in the office", key="a"),  # wraps a line
+        _draft("conducted a follow-up telephone interview with Tom Becker", key="b"),
     ]
-    out = verify_events(parsed, evs)
-    assert [e.source.page for e in out] == [1, 2]
+    out, _ = verify_drafts(parsed, drafts)
+    assert [d.spans[0].page for d in out] == [1, 2]
 
 
 def test_contradiction_quotes_ground_in_fixtures(
     parsed_fixtures: dict[str, ParsedDocument],
 ) -> None:
-    items = json.loads((GOLD / "demo_contradictions.json").read_text(encoding="utf-8"))
-    assert sum(1 for c in items if c["planted"]) >= 2
-    assert {"date", "actor"} <= {c["field"] for c in items}
+    items = _gold("demo_disputes.json", "demo_contradictions.json")
     for c in items:
-        assert len(c["sides"]) >= 2
         for side in c["sides"]:
             text = parsed_fixtures[side["doc"]].text
             assert locate_quote(text, side["quote"]) is not None, side

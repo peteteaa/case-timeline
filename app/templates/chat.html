@@ -2,16 +2,19 @@
 {% block title %}Ask{% endblock %}
 {% block content %}
 <section class="page-head"><h1>Ask about the case</h1></section>
-<form method="post" action="/chat" class="card chat-form"
-      hx-post="/chat" hx-target="#answers" hx-swap="afterbegin" hx-disabled-elt="find button"
-      hx-indicator="#thinking">
-  <label for="question" class="muted small">Answers come only from the case evidence, with citations.</label>
-  <textarea id="question" name="question" rows="3" maxlength="4000" required
-            placeholder="e.g. When did the defendant first receive notice?"></textarea>
-  <div class="row"><button class="btn primary" type="submit">Ask</button>
-    <span id="thinking" class="htmx-indicator muted">Thinking…</span></div>
-</form>
-<div id="answers">
+<section class="card">
+  <form method="post" action="/cases/{{ quote(case_id) }}/chat" class="chat-form"
+        hx-post="/cases/{{ quote(case_id) }}/chat" hx-target="#answer" hx-swap="innerHTML" hx-disabled-elt="find button">
+    <label for="question">Question</label>
+    <textarea id="question" name="question" rows="3" maxlength="4000" required placeholder="e.g. When did the parties first discuss the termination?"></textarea>
+    <div class="row">
+      <button class="btn primary">Ask</button>
+      <span class="htmx-indicator muted">Thinking… (answers can take a minute)</span>
+    </div>
+  </form>
+  <p class="muted small">Questions go to the local agent, which answers from this case’s facts and cites fact IDs. Nothing leaves this machine.</p>
+</section>
+<section id="answer" aria-live="polite">
   {% if result %}{% include "_chat_answer.html" %}{% endif %}
-</div>
+</section>
 {% endblock %}

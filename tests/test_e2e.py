@@ -1,238 +1,303 @@
-"""End-to-end: run the full pipeline on the demo fixtures with a deterministic fake LLM."""
+"""End-to-end: scan the demo fixtures with a deterministic fake LLM and check the whole pipeline.
+
+The fake model returns canned drafts per document whose quotes are real sentences from the
+fixtures (plus one invented quote that verification must reject).
+"""
 
 from __future__ import annotations
 
-import asyncio
-import json
+import hashlib
 import re
-import time
+import shutil
+from datetime import date
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
-from pipeline import llm, runner
-from pipeline.config import get_settings
-from pipeline.contracts import EventStatus, JobState
+from pipeline import jobs, llm
+from pipeline.config import Settings
+from pipeline.digest import daily_digest
+from pipeline.extract import ExtractedFact, ExtractionResult
 from pipeline.store import Store
+from tests.pipeline_helpers import fake_embedder
 
 FIXTURES = Path(__file__).parent / "fixtures" / "case_demo"
+MEETING = "Meeting in Mark Ellison's office"
 
-_MONTH = (
-    r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
-)
-_DATE = re.compile(rf"{_MONTH} \d{{1,2}}, \d{{4}}|\b\w+ days after the meeting", re.IGNORECASE)
-_FRAGMENT = re.compile(r"[^\n.!?]+[.!?]?")
-_PEOPLE = {
-    "Rivera": "Dana Rivera",
-    "Dana": "Dana Rivera",
-    "Ellison": "Mark Ellison",
-    "Mark": "Mark Ellison",
-    "Becker": "Tom Becker",
-    "Nand": "Priya Nand",
-    "Ortiz": "Jamie Ortiz",
+
+def F(title, date_text, people, *quotes, deadline=False, confidence=0.8):  # noqa: N802
+    return ExtractedFact(
+        title=title,
+        date_text=date_text,
+        people=people,
+        quotes=list(quotes),
+        deadline_language=deadline,
+        confidence=confidence,
+    )
+
+
+CANNED: dict[str, list[ExtractedFact]] = {
+    "deposition_excerpt_ellison.txt": [
+        F(
+            MEETING,
+            "March 12, 2024",
+            ["Mark Ellison", "Dana Rivera", "Priya Nand"],
+            "Q. When did your meeting with Ms. Rivera take place?",
+            "A. March 12, 2024. In the afternoon, I believe.",
+        ),
+    ],
+    "email_thread.eml": [
+        F(
+            "Rivera reports failing forklift brakes to Ellison",
+            "March 4, 2024",
+            ["Dana Rivera", "Mark Ellison"],
+            "On March 4, 2024 I reported in writing to Mark Ellison that the brakes on forklift "
+            "#7 were failing.",
+        ),
+    ],
+    "hr_memo.md": [
+        F(
+            MEETING,
+            "March 12, 2024",
+            ["Priya Nand", "Mark Ellison", "Dana Rivera"],
+            "On March 12, 2024, I attended a meeting between Mark Ellison and Dana Rivera "
+            "regarding attendance concerns.",
+        ),
+        F(
+            "Rivera placed on unpaid administrative leave",
+            "March 14, 2024",
+            ["Ms. Rivera"],
+            "Ms. Rivera was placed on unpaid administrative leave on March 14, 2024 pending "
+            "review.",
+        ),
+        F(
+            "Deadline to appeal termination",
+            "May 6, 2024",
+            ["Ms. Rivera"],
+            "The appeal must be received by May 6, 2024.",
+            deadline=True,
+        ),
+        F(
+            "Company position statement due",
+            "July 1, 2024",
+            [],
+            "The company's position statement is due by July 1, 2024.",
+            deadline=True,
+        ),
+    ],
+    "incident_report.pdf": [
+        F(
+            MEETING,
+            "March 12, 2024",
+            ["Ms. Rivera", "Mr. Ellison"],
+            "Mr. Ellison stated that the March 12, 2024 meeting concerned Ms. Rivera's attendance",
+        ),
+        F(
+            "Police respond to parking lot altercation",
+            "March 14, 2024",
+            ["Officer Jamie Ortiz", "Dana Rivera", "Mark Ellison"],
+            "On March 14, 2024 at approximately 5:40 PM, Officer Jamie Ortiz responded",
+        ),
+        F(
+            "Police interview Becker by telephone",
+            "March 15, 2024",
+            ["Tom Becker", "Officer Ortiz"],
+            "On March 15, 2024, Officer Ortiz conducted a follow-up telephone interview with Tom "
+            "Becker",
+        ),
+        F(
+            "Ellison apologizes to Rivera",
+            "March 20, 2024",
+            ["Mark Ellison"],
+            "Mr. Ellison apologized to Ms. Rivera on March 20, 2024.",
+        ),  # invented: rejected
+    ],
+    "witness_statement_becker.docx": [
+        F(
+            MEETING,
+            "March 11, 2024",
+            ["Tom Becker", "Mark Ellison", "Dana Rivera"],
+            "The meeting in Mark Ellison's office took place on March 11, 2024.",
+        ),
+        F(
+            "Rivera sent home without pay",
+            "Two days after the meeting",
+            ["Dana"],
+            "Two days after the meeting, Dana was sent home without pay.",
+        ),
+        F(
+            "Becker affirms his statement",
+            "",
+            ["Tom Becker"],
+            "I make this statement freely and believe it to be true.",
+        ),
+    ],
+    "note_from_upload.txt": [
+        F(
+            "Becker calls HR",
+            "April 3, 2024",
+            ["Tom Becker"],
+            "Tom Becker called HR on April 3, 2024.",
+        ),
+    ],
 }
 
 
-def _fake_extract(user: str, schema):
-    """Every sentence fragment with a date becomes an event whose quote is copied verbatim."""
-    excerpt = user.split("<excerpt>\n", 1)[1].rsplit("\n</excerpt>", 1)[0]
-    events = []
-    for frag in _FRAGMENT.findall(excerpt):
-        quote = frag.strip()
-        m = _DATE.search(quote)
-        if not m or len(quote) < 12:
-            continue
-        actors = []
-        for key, name in _PEOPLE.items():
-            if re.search(rf"\b{key}\b", quote) and name not in actors:
-                actors.append(name)
-        lowered = quote.lower()
-        if "meeting" in lowered and "ellison" in lowered and "days after" not in lowered:
-            description = "Meeting in Mark Ellison's office with Dana Rivera"
-        else:
-            description = quote
-        events.append(
-            {
-                "quote": quote,
-                "date_text": m.group(0),
-                "actors": actors,
-                "description": description,
-                "deadline_relevant": "appeal" in lowered or "due" in lowered,
-                "confidence": 0.8,
-            }
-        )
-    return schema.model_validate({"events": events})
-
-
-def fake_chat_json(system, user, schema, *, temperature=0.0, **kw):
-    if schema.__name__ == "ConflictVerdict":
-        m = re.search(r"Suspected conflict type: (\w+)", user)
-        return schema(
-            is_contradiction=True, field=m.group(1) if m else "fact", explanation="fake verdict"
-        )
-    return _fake_extract(user, schema)
+def fake_chat_json(system, user, schema, **kw):
+    if schema is ExtractionResult:
+        filename = re.search(r"^Document: (.+)$", user, re.M).group(1)
+        return ExtractionResult(facts=CANNED.get(filename, []))
+    m = re.search(r"Suspected conflict type: (\w+)", user)
+    return schema(is_contradiction=True, field=m.group(1), explanation="Sources disagree.")
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
-    """Isolated settings (temp data dir, fixture evidence) and a fake, offline LLM."""
-    monkeypatch.setenv("CT_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("CT_EVIDENCE_DIR", str(FIXTURES))
-    monkeypatch.setenv("CT_CASE_ID", "demo")
+def settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.setenv("CT_DISABLE_DOCLING", "1")
-    monkeypatch.delenv("CT_DB_PATH", raising=False)
-    get_settings.cache_clear()
     monkeypatch.setattr(llm, "chat_json", fake_chat_json)
-    monkeypatch.setattr(llm, "embed", lambda texts: [llm.hashed_embedding(t) for t in texts])
-    settings = get_settings()
-    yield settings
-    get_settings.cache_clear()
+    monkeypatch.setattr(llm, "embed", fake_embedder)
+    return Settings(evidence_dir=FIXTURES, data_dir=tmp_path / "data", case_id="demo")
 
 
-def _evidence_snapshot() -> dict[str, tuple[int, int]]:
-    return {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in FIXTURES.iterdir()}
+def _snapshot(folder: Path) -> dict[str, str]:
+    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(folder.iterdir())}
 
 
-def test_full_pipeline(env):
-    before = _evidence_snapshot()
-    job = runner.scan_case_sync("demo")
-    assert job.state == JobState.DONE, job.error
+def test_full_scan_end_to_end(settings: Settings) -> None:
+    before = _snapshot(FIXTURES)
+    job = jobs.run_now("demo", settings=settings)
+    assert job.status == "done", job.error
+    c = job.counts
+    assert (c["docs_seen"], c["docs_new"], c["docs_parsed"], c["docs_failed"]) == (5, 5, 5, 0)
+    assert c["drafts"] == 13
+    assert (c["quotes_checked"], c["quotes_rejected"], c["drafts_discarded"]) == (14, 1, 1)
+    assert c["facts_created"] == 10 and c["evidence_attached"] == 2
+    assert c["contradictions"] == 1
+    assert c["alerts"] == 3  # 1 contradiction + 2 possible deadlines
     assert job.error is None
-    assert job.docs_total == job.docs_done == 5
-    assert job.events_added > 0
+    assert _snapshot(FIXTURES) == before  # evidence is read-only
 
-    with Store(env.db_path) as store:
-        events = store.list_events("demo")
-        assert events, "timeline should not be empty"
-        assert len(events) == job.events_added
-        assert any(e.date_start is not None for e in events)
+    with Store(settings.db_path) as store:
+        docs = {d.filename: d for d in store.list_documents("demo")}
+        assert {d.kind for d in docs.values()} >= {"transcript", "email", "other"}
+        assert docs["deposition_excerpt_ellison.txt"].kind == "transcript"
+        assert docs["deposition_excerpt_ellison.txt"].pages == 2
+        facts = store.list_facts("demo")
+        assert len(facts) == 10
+        assert all(f.review == "draft" and f.origin == "ai" for f in facts)
+        by_title: dict[str, list] = {}
+        for f in facts:
+            by_title.setdefault(f.title, []).append(f)
 
-        # Every event points at a verbatim slice of the stored normalized text.
-        for e in events:
-            assert e.status != EventStatus.UNVERIFIED
-            parsed = store.get_parsed_text(e.source.doc_id)
-            assert parsed is not None
-            assert parsed.text[e.source.char_start : e.source.char_end] == e.source.quote
-        pdf_events = [e for e in events if e.source.page is not None]
-        assert pdf_events and all(e.source.page in (1, 2) for e in pdf_events)
+        # Every piece of evidence is a verbatim span of its document.
+        for f in facts:
+            assert f.evidence
+            for e in f.evidence:
+                text = store.get_parsed(e.doc_id).text
+                assert text[e.char_start : e.char_end] == e.quote
+                assert e.origin == "ai" and e.review == "draft"
 
-        # Relative date resolved against the anchor meeting (Becker: March 11 + 2 days).
-        rel = [e for e in events if "days after the meeting" in e.date_text.lower()]
-        assert rel and rel[0].date_start is not None
+        # One March 12 meeting fact with quotes from three documents; Becker's March 11 apart.
+        meetings = sorted(by_title[MEETING], key=lambda f: f.date_start)
+        becker_meeting, meeting = meetings
+        assert becker_meeting.date_start == date(2024, 3, 11)
+        assert meeting.date_start == date(2024, 3, 12) and meeting.date_certainty == "exact"
+        cited = {e.doc_id for e in meeting.evidence}
+        assert cited == {
+            docs[n].doc_id
+            for n in ("deposition_excerpt_ellison.txt", "hr_memo.md", "incident_report.pdf")
+        }
+        depo = [
+            e for e in meeting.evidence if e.doc_id == docs["deposition_excerpt_ellison.txt"].doc_id
+        ]
+        assert [(e.page, e.line_start, e.line_end) for e in depo] == [(14, 1, 1), (14, 2, 2)]
+        pdf = [e for e in meeting.evidence if e.doc_id == docs["incident_report.pdf"].doc_id]
+        assert [e.page for e in pdf] == [1]
 
-        # The police report repeats the HR memo's March 12 meeting: linked as a duplicate.
-        all_events = store.list_events("demo", include_duplicates=True)
-        assert len(all_events) > len(events)
+        # Relative date anchored on Becker's own meeting date.
+        (home,) = by_title["Rivera sent home without pay"]
+        assert home.date_start == date(2024, 3, 13) and home.date_certainty == "relative"
+        assert home.anchor_fact_id == becker_meeting.fact_id
+        (undated,) = by_title["Becker affirms his statement"]
+        assert undated.date_start is None and undated.date_certainty == "unknown"
+        assert "Ellison apologizes to Rivera" not in by_title
 
-        # March 11 (Becker) vs March 12 meeting is flagged; alerts exist and carry no content.
-        contradictions = store.list_contradictions("demo")
-        assert job.contradictions_added == len(contradictions) >= 1
-        assert any(c.field == "date" for c in contradictions)
-        alerts = store.list_alerts("demo")
-        assert alerts
-        assert all(a.dashboard_url.startswith("http://127.0.0.1:") for a in alerts)
-        assert store.processed_doc_ids("demo") == {d.id for d in store.list_documents("demo")}
+        # Witnesses: suggestions, matched across name variants, no duplicates.
+        wits = {w.name: w for w in store.list_witnesses("demo")}
+        assert set(wits) == {
+            "Mark Ellison",
+            "Dana Rivera",
+            "Priya Nand",
+            "Jamie Ortiz",
+            "Tom Becker",
+        }
+        assert not any(w.confirmed for w in wits.values())
+        assert set(meeting.witness_ids) == {
+            wits[n].witness_id for n in ("Mark Ellison", "Dana Rivera", "Priya Nand")
+        }
+        assert home.witness_ids == [wits["Dana Rivera"].witness_id]
 
-    # Second scan is a no-op.
-    again = runner.scan_case_sync("demo")
-    assert again.state == JobState.DONE
-    assert again.docs_total == 0 and again.events_added == 0
-    with Store(env.db_path) as store:
-        assert len(store.list_events("demo", include_duplicates=True)) == len(all_events)
-        assert len(store.list_contradictions("demo")) == len(contradictions)
+        # The planted date contradiction, open for a reviewer.
+        (contra,) = store.list_contradictions("demo")
+        assert contra.field == "date" and contra.status == "open"
+        assert contra.fact_ids == sorted([meeting.fact_id, becker_meeting.fact_id])
 
-    digest = runner.daily_digest("demo")
-    assert digest["events_total"] == len(events)
-    assert digest["contradictions_open"] == len(contradictions)
-    assert digest["documents"] == 5
-    assert "description" not in json.dumps(digest)
+        alerts = store.list_alerts("demo", pending_only=True)
+        types = sorted(a.type for a in alerts)
+        assert types == ["contradiction", "possible_deadline", "possible_deadline"]
+        deadline_facts = {
+            fid for a in alerts if a.type == "possible_deadline" for fid in a.fact_ids
+        }
+        assert deadline_facts == {
+            by_title["Deadline to appeal termination"][0].fact_id,
+            by_title["Company position statement due"][0].fact_id,
+        }
 
-    assert _evidence_snapshot() == before, "evidence folder must never be modified"
-    assert not (FIXTURES / "scan.lock").exists()
+        digest = daily_digest(store, "demo")
+        assert digest["counts"]["new_drafts"] == 10 and digest["counts"]["contradictions"] == 1
+        assert meeting.fact_id in digest["text"]
 
+    # A second scan finds nothing new.
+    again = jobs.run_now("demo", settings=settings)
+    assert again.status == "done"
+    assert again.counts["docs_seen"] == 5 and again.counts["docs_new"] == 0
+    assert again.counts["drafts"] == 0 and again.counts["facts_created"] == 0
+    assert again.counts["alerts"] == 0
 
-def test_background_scan_and_consumers(env):
-    job = runner.scan_case("demo")
-    assert job.state == JobState.QUEUED
-    with Store(env.db_path) as store:
-        for _ in range(600):
-            current = store.get_job(job.id)
-            if current and current.state in (JobState.DONE, JobState.FAILED):
-                break
-            time.sleep(0.05)
-        assert current is not None and current.state == JobState.DONE, current
-        event = next(e for e in store.list_events("demo") if e.source.page is not None)
+    # A renamed copy uploaded to the inbox is recognized by content and not processed again.
+    shutil.copy(FIXTURES / "hr_memo.md", settings.inbox / "memo (copy).md")
+    copied = jobs.run_now("demo", settings=settings, trigger="upload")
+    assert copied.trigger == "upload"
+    assert copied.counts["docs_new"] == 0 and copied.counts["drafts"] == 0
 
-    # UI renders the timeline and the highlighted source.
-    from ui.app import create_app
-
-    client = TestClient(create_app(env), base_url="http://127.0.0.1:8080")
-    r = client.get("/timeline")
-    assert r.status_code == 200
-    r = client.get(
-        f"/source/{event.source.doc_id}",
-        params={"start": event.source.char_start, "end": event.source.char_end, "event": event.id},
-    )
-    assert r.status_code == 200
-    assert 'id="hl"' in r.text
-    r = client.get("/api/events")
-    assert r.status_code == 200 and len(r.json()) > 0
-
-    # MCP get_timeline over the real store.
-    from mcp_server import server as mcp_server
-
-    with Store(env.db_path) as store:
-        mcp_server.set_backend(
-            mcp_server.Backend(
-                store=store,
-                scan_case=runner.scan_case,
-                daily_digest=runner.daily_digest,
-                case_id="demo",
-                data_dir=Path(env.data_dir),
-            )
+    # A person flags Becker; a new upload that mentions him raises a flagged-witness alert.
+    with Store(settings.db_path) as store:
+        becker = store.find_witness("demo", "Tom Becker")
+        store.update_witness(becker.witness_id, {"flagged": True, "confirmed": True}, by="alice")
+    (settings.inbox / "note_from_upload.txt").write_text("Tom Becker called HR on April 3, 2024.\n")
+    third = jobs.run_now("demo", settings=settings, trigger="upload")
+    assert third.counts["docs_new"] == 1 and third.counts["facts_created"] == 1
+    with Store(settings.db_path) as store:
+        new_doc = store.get_document_by_sha(
+            "demo", hashlib.sha256(b"Tom Becker called HR on April 3, 2024.\n").hexdigest()
         )
-        try:
-            srv = mcp_server.build_server()
-            result = asyncio.run(srv.call_tool("get_timeline", {}))
-            payload = result.structured_content or json.loads(result.content[0].text)
-            assert payload["total"] > 0
-            assert all("source" in e for e in payload["events"])
-            digest = asyncio.run(srv.call_tool("daily_digest", {}))
-            assert not digest.is_error
-        finally:
-            mcp_server.set_backend(None)
+        assert new_doc.location == "inbox"
+        flagged = [a for a in store.list_alerts("demo") if a.type == "flagged_witness"]
+        assert len(flagged) == 1 and flagged[0].doc_ids == [new_doc.doc_id]
+        (note_fact,) = store.facts_citing_document(new_doc.doc_id)
+        assert note_fact.witness_ids == [becker.witness_id]
+        assert flagged[0].fact_ids == [note_fact.fact_id]
 
 
-def test_failed_document_does_not_stop_scan(env, monkeypatch):
-    from pipeline import extract
-
-    real = extract.extract_events
-
-    def flaky(parsed):
-        if parsed.doc.filename.endswith(".eml"):
-            raise RuntimeError("model unavailable")
-        return real(parsed)
-
-    monkeypatch.setattr(extract, "extract_events", flaky)
-    job = runner.scan_case_sync("demo")
-    assert job.state == JobState.DONE
-    assert job.docs_done == 5
-    assert job.error and "email_thread.eml" in job.error
-
-    # The failed document is retried next time and succeeds once the model is back.
-    monkeypatch.setattr(extract, "extract_events", real)
-    retry = runner.scan_case_sync("demo")
-    assert retry.docs_total == 1 and retry.error is None and retry.events_added > 0
-
-
-def test_refuses_data_dir_inside_evidence(env, monkeypatch, tmp_path):
-    evidence = tmp_path / "evidence"
-    evidence.mkdir()
-    monkeypatch.setenv("CT_EVIDENCE_DIR", str(evidence))
-    monkeypatch.setenv("CT_DATA_DIR", str(evidence / "data"))
-    from pipeline.config import Settings
-
-    with pytest.raises(RuntimeError):
-        runner.scan_case_sync("demo", settings=Settings())
-    assert not (evidence / "data").exists()
+@pytest.mark.llm
+def test_live_model_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real vLLM: every stored quote is verbatim and at least some facts are drafted."""
+    monkeypatch.setattr(llm, "embed", fake_embedder)
+    settings = Settings(evidence_dir=FIXTURES, data_dir=tmp_path / "data", case_id="demo")
+    job = jobs.run_now("demo", settings=settings)
+    assert job.status == "done", job.error
+    assert job.counts["facts_created"] > 0
+    with Store(settings.db_path) as store:
+        for f in store.list_facts("demo"):
+            for e in f.evidence:
+                assert store.get_parsed(e.doc_id).text[e.char_start : e.char_end] == e.quote

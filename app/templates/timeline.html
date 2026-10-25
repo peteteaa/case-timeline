@@ -1,41 +1,203 @@
 {% extends "base.html" %}
+{% import "_macros.html" as m with context %}
 {% block title %}Timeline{% endblock %}
-{% block head %}<link rel="stylesheet" href="/static/vendor/vis-timeline-graph2d.min.css">{% endblock %}
+{% block head %}{% if f.view == 'visual' %}<link rel="stylesheet" href="/static/vendor/vis-timeline-graph2d.min.css">{% endif %}{% endblock %}
 {% block content %}
+{% set base = '/cases/' ~ quote(case_id) %}
+{% set list_pairs = pairs | rejectattr(0, 'equalto', 'view') | list %}
 <section class="page-head">
-  <h1>Timeline</h1>
-  <div class="legend" aria-label="Legend">
-    <span class="swatch cert-exact">exact</span>
-    <span class="swatch cert-approximate">approximate</span>
-    <span class="swatch cert-relative">relative</span>
-    <span class="swatch cert-range">range</span>
-    <span class="swatch status-unverified">unverified</span>
-    <span class="swatch conflict">contradiction</span>
-    <span class="swatch deadline">attorney review</span>
+  <h1>Timeline <span class="muted">({{ total }} fact{{ '' if total == 1 else 's' }}{% if filtered %}, filtered{% endif %})</span></h1>
+  <div class="head-actions">
+    <div class="seg-toggle" role="group" aria-label="View">
+      <a href="{{ base }}/facts?{{ query_string(list_pairs) }}" {% if f.view == 'list' %}aria-current="true"{% endif %}>List</a>
+      <a href="{{ base }}/facts?{{ query_string(list_pairs, view='visual') }}" {% if f.view == 'visual' %}aria-current="true"{% endif %}>Visual</a>
+    </div>
+    <details class="popover">
+      <summary class="btn primary">New fact</summary>
+      <form method="post" action="{{ base }}/facts" class="stack popover-body">
+        <label>Title <span class="muted small">(required)</span><input name="title" required maxlength="500"></label>
+        <label>Details<textarea name="details" rows="3"></textarea></label>
+        <div class="row">
+          <label>Date<input type="date" name="date_start"></label>
+          <label>End date<input type="date" name="date_end"></label>
+        </div>
+        <label>Date as written<input name="date_text" placeholder="e.g. early March 2022"></label>
+        <p class="muted small">Add evidence later from the fact card, or select text in a document to create a fact with its quote.</p>
+        <div><button class="btn primary">Create fact</button></div>
+      </form>
+    </details>
   </div>
 </section>
-<div id="timeline" class="card timeline-box" data-src="/api/events">
-  <noscript>The interactive timeline needs JavaScript; the table below has every event.</noscript>
-</div>
-<p class="muted small">Click an item to open its source with the quote highlighted. Ctrl + scroll to zoom.</p>
 
+<form method="get" action="{{ base }}/facts" class="card filters" role="search">
+  <input type="hidden" name="view" value="{{ f.view }}">
+  <div class="search-row">
+    <label class="grow"><span class="sr-only">Search facts</span>
+      <input type="search" name="q" value="{{ f.q }}" placeholder="Search titles, details, notes and quotes (Westlaw-style)">
+    </label>
+    <button class="btn primary">Search</button>
+    {% if filtered %}<a class="btn" href="{{ base }}/facts{% if f.view == 'visual' %}?view=visual{% endif %}">Clear all</a>{% endif %}
+  </div>
+  <p class="syntax muted small"><strong>Syntax:</strong> {{ syntax_help }}</p>
+  {% if search_error %}<p class="error" role="alert">{{ search_error }}</p>{% endif %}
+  {% for e in errors %}<p class="error" role="alert">{{ e }}</p>{% endfor %}
+  <details class="filter-panel" {% if filtered and not f.q %}open{% endif %}>
+    <summary>Filters &amp; sort</summary>
+    <div class="filter-grid">
+      <fieldset>
+        <legend>Date range</legend>
+        <label>From <input type="date" name="date_from" value="{{ fmt_date(f.date_from) }}"></label>
+        <label>To <input type="date" name="date_to" value="{{ fmt_date(f.date_to) }}"></label>
+      </fieldset>
+      <fieldset>
+        <legend>Status</legend>
+        {% for s in STATUSES %}<label class="check"><input type="checkbox" name="status" value="{{ s }}" {% if s in f.status %}checked{% endif %}> {{ STATUS_LABELS[s] }}</label>{% endfor %}
+      </fieldset>
+      <fieldset>
+        <legend>Review state</legend>
+        {% for r in ('draft', 'accepted', 'rejected') %}<label class="check"><input type="checkbox" name="review" value="{{ r }}" {% if r in f.review %}checked{% endif %}> {{ r | capitalize }}</label>{% endfor %}
+        <label>Origin
+          <select name="origin">
+            <option value="">AI or person</option>
+            <option value="ai" {% if f.origin == 'ai' %}selected{% endif %}>AI drafted</option>
+            <option value="user" {% if f.origin == 'user' %}selected{% endif %}>Created by a person</option>
+          </select>
+        </label>
+      </fieldset>
+      <fieldset>
+        <legend>Tags</legend>
+        {% if tags %}<select name="tag" multiple size="{{ [tags | length, 5] | min }}">
+          {% for t in tags %}<option value="{{ t.tag_id }}" {% if t.tag_id in f.tag %}selected{% endif %}>{{ t.name }}</option>{% endfor %}
+        </select>{% else %}<p class="muted small">No tags yet.</p>{% endif %}
+      </fieldset>
+      <fieldset>
+        <legend>Witnesses</legend>
+        {% set ws = witnesses | selectattr('confirmed') | list %}
+        {% if ws %}<select name="witness" multiple size="{{ [ws | length, 5] | min }}">
+          {% for w in ws %}<option value="{{ w.witness_id }}" {% if w.witness_id in f.witness %}selected{% endif %}>{{ w.name }}</option>{% endfor %}
+        </select>{% else %}<p class="muted small">No confirmed witnesses yet.</p>{% endif %}
+      </fieldset>
+      <fieldset>
+        <legend>Document</legend>
+        {% if docs %}<select name="doc" multiple size="{{ [docs | length, 5] | min }}">
+          {% for d in docs %}<option value="{{ d.doc_id }}" {% if d.doc_id in f.doc %}selected{% endif %}>{{ d.filename }}</option>{% endfor %}
+        </select>{% else %}<p class="muted small">No documents yet.</p>{% endif %}
+      </fieldset>
+      <fieldset>
+        <legend>Document kind</legend>
+        <div class="check-cols">
+        {% for k in DOC_KINDS %}<label class="check"><input type="checkbox" name="kind" value="{{ k }}" {% if k in f.kind %}checked{% endif %}> {{ k }}</label>{% endfor %}
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Sort</legend>
+        <select name="sort" aria-label="Sort by">
+          {% for k in SORT_KEYS %}<option value="{{ k }}" {% if f.sort == k %}selected{% endif %}>{{ SORT_LABELS[k] }}</option>{% endfor %}
+        </select>
+        <select name="dir" aria-label="Direction">
+          <option value="asc" {% if f.dir == 'asc' %}selected{% endif %}>Ascending</option>
+          <option value="desc" {% if f.dir == 'desc' %}selected{% endif %}>Descending</option>
+        </select>
+      </fieldset>
+    </div>
+    <div class="filter-actions"><button class="btn primary">Apply</button></div>
+  </details>
+</form>
+
+<form method="get" action="{{ base }}/export" class="export-bar">
+  {% for k, v in list_pairs %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+  <span class="muted small">Export {{ 'these' if filtered else 'all' }} {{ total }} fact{{ '' if total == 1 else 's' }}:</span>
+  <button class="btn small" name="format" value="xlsx">XLSX</button>
+  <button class="btn small" name="format" value="csv">CSV</button>
+  <span class="sep"></span>
+  <label class="small">Image zoom
+    <select name="zoom">{% for z in export_zooms %}<option value="{{ z }}" {% if z == 'month' %}selected{% endif %}>{{ z }}</option>{% endfor %}</select>
+  </label>
+  <button class="btn small" name="format" value="svg">SVG</button>
+  <button class="btn small" name="format" value="png">PNG</button>
+</form>
+
+{% if f.view == 'visual' %}
+<div class="visual-wrap">
+  <section class="card visual-main">
+    <div class="vis-toolbar">
+      <div class="legend" aria-label="Legend">
+        <span class="swatch key">Key fact</span>
+        <span class="swatch draft">Draft</span>
+        <span class="swatch disputed">Disputed</span>
+        <span class="swatch conflict">Conflict</span>
+        <span class="swatch alleged">Alleged</span>
+      </div>
+      <div class="zoom-btns" role="group" aria-label="Zoom">
+        <button class="btn small" type="button" data-zoom="day">Days</button>
+        <button class="btn small" type="button" data-zoom="month">Months</button>
+        <button class="btn small" type="button" data-zoom="year">Years</button>
+        <button class="btn small" type="button" data-zoom="fit">Fit all</button>
+      </div>
+    </div>
+    <div id="timeline" class="timeline-box" data-src="{{ base }}/facts?{{ query_string(list_pairs, format='json') }}">
+      <noscript>The visual timeline needs JavaScript; switch to the list view.</noscript>
+    </div>
+    <div class="undated-lane">
+      <h3>Undated</h3>
+      <div id="undated-lane" class="lane-items"><span class="muted small">Loading…</span></div>
+    </div>
+    <p class="muted small">Click a fact to open its card. Drag to pan; Ctrl + scroll to zoom.</p>
+  </section>
+  <aside id="fact-panel" class="card fact-panel" aria-live="polite">
+    <p class="muted">Select a fact on the timeline to see its card here.</p>
+  </aside>
+</div>
+{% else %}
 <section class="card">
-  <h2>All events <span class="muted">({{ events | length }})</span></h2>
-  {% if events %}
+  {% if total %}
+  <form id="bulk-form" method="post" action="{{ base }}/review" class="bulk-bar">
+    <input type="hidden" name="next" value="{{ here }}">
+    <span class="muted small">Selected drafts:</span>
+    <input name="reason" maxlength="500" placeholder="Reason (optional)" aria-label="Reason for bulk review">
+    <button class="btn small ok" name="action" value="accept" data-needs-selection>Accept selected</button>
+    <button class="btn small danger" name="action" value="reject" data-needs-selection>Reject selected</button>
+  </form>
   <div class="table-wrap">
-  <table class="events">
-    <thead><tr><th>Date</th><th>Certainty</th><th>Event</th><th>Source</th><th>Review</th></tr></thead>
+  <table class="facts">
+    <thead>
+      <tr>
+        <th class="sel"><input type="checkbox" data-check-all="bulk-form" aria-label="Select all drafts"></th>
+        {% macro sort_th(key, label, cls='') -%}
+          {%- set active = f.sort == key -%}
+          {%- set nd = 'desc' if active and f.dir == 'asc' else 'asc' -%}
+          <th class="{{ cls }}" {% if active %}aria-sort="{{ 'ascending' if f.dir == 'asc' else 'descending' }}"{% endif %}>
+            <a href="{{ base }}/facts?{{ query_string(list_pairs | rejectattr(0, 'in', ['sort', 'dir']) | list, sort=key, dir=nd) }}">{{ label }}{% if active %} {{ '▲' if f.dir == 'asc' else '▼' }}{% endif %}</a>
+          </th>
+        {%- endmacro %}
+        {{ sort_th('date', 'Date', 'date') }}
+        {{ sort_th('title', 'Fact') }}
+        <th>Statuses</th>
+        {{ sort_th('evidence', 'Evidence', 'num') }}
+        {{ sort_th('tags', 'Tags', 'num') }}
+        {{ sort_th('witnesses', 'Witnesses', 'num') }}
+        {{ sort_th('notes', 'Notes', 'num') }}
+        <th>Review</th>
+      </tr>
+    </thead>
     <tbody>
-      {% for e in events %}{% include "_event_row.html" %}{% endfor %}
+      {% for x in dated %}{% include "_fact_row.html" %}{% endfor %}
+      {% if undated %}
+      <tr class="group-row"><th colspan="9">Undated <span class="muted">({{ undated | length }})</span></th></tr>
+      {% for x in undated %}{% include "_fact_row.html" %}{% endfor %}
+      {% endif %}
     </tbody>
   </table>
   </div>
   {% else %}
-  <p class="muted">No events yet. Upload documents or press “Process now” on the dashboard.</p>
+  <p class="muted">{% if filtered or search_error %}No facts match this search and these filters.{% else %}No facts yet. Upload documents and press “Process now”, or create a fact by hand.{% endif %}</p>
   {% endif %}
 </section>
+{% endif %}
 {% endblock %}
 {% block scripts %}
+{% if f.view == 'visual' %}
 <script src="/static/vendor/vis-timeline-graph2d.min.js"></script>
 <script src="/static/timeline.js"></script>
+{% endif %}
 {% endblock %}

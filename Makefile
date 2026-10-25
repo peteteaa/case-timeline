@@ -1,13 +1,26 @@
-# Case Timeline Agent - developer targets. Everything runs locally; services bind to 127.0.0.1.
+# Case Timeline Agent - developer targets (SPEC §10). Everything runs locally; services bind to
+# 127.0.0.1 (vLLM: the docker0 bridge 172.17.0.1).
 SHELL := /bin/bash
 UV    ?= uv
 PY    := $(UV) run python
 CASE  ?= demo
 
-.PHONY: help setup lint fmt test test-llm eval llm ui mcp scan fixtures ports preflight
+.PHONY: help setup lint fmt test test-llm eval fetch-eval llm app ui serve-mcp mcp scan \
+	fixtures ports preflight
 
 help:
-	@echo "targets: setup lint fmt test test-llm eval CASE=<id> llm ui mcp scan CASE=<id> fixtures ports preflight"
+	@echo "targets:"
+	@echo "  setup                uv sync (needs internet once)"
+	@echo "  test / test-llm      unit tests (no model) / live-model tests"
+	@echo "  lint / fmt           ruff check + format check / auto-fix"
+	@echo "  llm                  start vLLM on 172.17.0.1:8000"
+	@echo "  app (alias ui)       web UI + job worker on http://127.0.0.1:8080"
+	@echo "  serve-mcp (alias mcp) MCP server over stdio (normally spawned by OpenClaw)"
+	@echo "  scan CASE=<id>       queue a scan and run it inline (no app server needed)"
+	@echo "  eval CASE=<id>       metrics vs gold; report in data/eval_<id>.json"
+	@echo "  fetch-eval           download the public eval documents into eval/docs/"
+	@echo "  fixtures             rebuild the fictional demo case"
+	@echo "  ports / preflight    exposure check / host checks"
 
 setup:
 	$(UV) sync
@@ -29,34 +42,26 @@ test-llm:
 eval:
 	$(PY) -m eval --case $(CASE)
 
+fetch-eval:
+	$(PY) scripts/fetch_eval.py
+
 llm:
 	scripts/serve_llm.sh
 
-ui:
-	$(PY) -m ui
+# The app server: web UI plus the job worker that runs queued scans.
+app:
+	$(PY) -m app
 
-mcp:
+ui: app
+
+serve-mcp:
 	$(PY) -m mcp_server
 
-# Run one scan of the evidence folder and wait for the job to finish.
-define SCAN_PY
-import sys, time
-from pipeline.config import get_settings
-from pipeline.runner import scan_case
-from pipeline.store import Store
+mcp: serve-mcp
 
-job = scan_case(sys.argv[1])
-store = Store(get_settings().db_path)
-while str(job.state) not in ("done", "failed"):
-    time.sleep(2)
-    job = store.get_job(job.id) or job
-print(job.model_dump_json(indent=2))
-sys.exit(1 if str(job.state) == "failed" else 0)
-endef
-export SCAN_PY
-
+# Queue a scan and run the queue inline (same code path as the app server's worker).
 scan:
-	$(PY) -c "$$SCAN_PY" $(CASE)
+	$(PY) -m pipeline.jobs scan --case $(CASE)
 
 fixtures:
 	$(PY) scripts/make_fixtures.py

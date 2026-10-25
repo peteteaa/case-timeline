@@ -1,317 +1,673 @@
-"""Store tests: schema, upserts, review-status preservation, hybrid search, change feed."""
+"""Store tests (SPEC §6, §8.1): ids, documents, evidence, permissions, review, filters, sorts,
+witnesses, tags, contradictions, alerts, jobs, reprocessing, WAL and multi-process access."""
 
 from __future__ import annotations
 
-import threading
-from datetime import UTC, date, datetime, timedelta
+import re
+import time
+from datetime import date
+from pathlib import Path
 
 import pytest
 
-from pipeline.contracts import (
-    Alert,
-    AlertType,
-    Certainty,
-    ConflictField,
-    Contradiction,
-    ContradictionStatus,
-    Document,
-    Event,
-    EventStatus,
-    JobState,
-    Page,
-    SourceRef,
-)
-from pipeline.llm import hashed_embedding
+from pipeline import llm
+from pipeline.schema import AGENT, FactQuery, Line, Page, SpanIn
 from pipeline.store import Store
 
-CASE = "demo"
+CASE = "c1"
+TEXT = (
+    "On March 3, 2022 the board met in Austin. "
+    "John Smith signed the merger agreement. "
+    "The complaint alleges Acme hid the losses."
+)
 
 
-def fake_embed(texts: list[str]) -> list[list[float]]:
-    return [hashed_embedding(t) for t in texts]
-
-
-def make_doc(doc_id: str = "d1", case_id: str = CASE) -> Document:
-    return Document(
-        id=doc_id,
-        case_id=case_id,
-        path=f"/evidence/{doc_id}.txt",
-        filename=f"{doc_id}.txt",
-        mime="text/plain",
-        sha256=doc_id * 8,
-    )
-
-
-def make_event(
-    eid: str,
-    description: str,
-    *,
-    actors: list[str] | None = None,
-    quote: str | None = None,
-    day: date | None = None,
-    case_id: str = CASE,
-    status: EventStatus = EventStatus.PROPOSED,
-) -> Event:
-    quote = quote or description
-    return Event(
-        id=eid,
-        case_id=case_id,
-        date_text=day.isoformat() if day else "unknown",
-        date_start=day,
-        date_end=day,
-        certainty=Certainty.EXACT if day else Certainty.UNKNOWN,
-        actors=actors or [],
-        description=description,
-        source=SourceRef(doc_id="d1", page=1, char_start=0, char_end=len(quote), quote=quote),
-        confidence=0.9,
-        status=status,
-    )
+def _embed(texts: list[str]) -> list[list[float]]:
+    return [llm.hashed_embedding(t) for t in texts]
 
 
 @pytest.fixture
-def store(tmp_path):
-    s = Store(tmp_path / "case.db", embedder=fake_embed)
+def db(tmp_path: Path) -> Path:
+    return tmp_path / "case.db"
+
+
+@pytest.fixture
+def store(db: Path) -> Store:
+    s = Store(db, embedder=_embed)
     yield s
     s.close()
 
 
-def test_init_is_idempotent_and_wal(tmp_path):
-    s = Store(tmp_path / "x.db", embedder=fake_embed)
-    s.init()
-    mode = s._conn.execute("PRAGMA journal_mode").fetchone()[0]
-    assert mode.lower() == "wal"
-    s.close()
-    s2 = Store(tmp_path / "x.db", embedder=fake_embed)  # reopen existing db
-    assert s2.list_events(CASE) == []
-    s2.close()
+def _doc(
+    store: Store,
+    text: str = TEXT,
+    sha: str = "sha-1",
+    kind: str = "other",
+    case_id: str = CASE,
+    pages: list[Page] | None = None,
+    lines: list[Line] | None = None,
+) -> str:
+    doc, created = store.register_document(
+        case_id,
+        filename=f"{sha}.pdf",
+        rel_path=f"dir/{sha}.pdf",
+        sha256=sha,
+        location="evidence",
+        kind=kind,
+    )
+    assert created
+    store.save_parsed_text(doc.doc_id, text, pages or [], lines or [])
+    store.set_parse_result(doc.doc_id, "parsed", pages=len(pages or []) or 1)
+    return doc.doc_id
 
 
-def test_documents_and_parsed_text(store):
-    doc = make_doc()
-    store.upsert_document(doc)
-    store.upsert_document(doc)  # idempotent
-    assert [d.id for d in store.list_documents(CASE)] == ["d1"]
-    assert store.get_document("d1").ingested_at is not None
-    assert store.processed_doc_ids(CASE) == set()
-    assert store.get_parsed_text("d1") is None
-
-    store.add_parsed_text("d1", "hello world", [Page(number=1, char_start=0, char_end=11)])
-    parsed = store.get_parsed_text("d1")
-    assert parsed.text == "hello world"
-    assert parsed.pages[0].char_end == 11
-    assert parsed.doc.filename == "d1.txt"
-    assert store.processed_doc_ids(CASE) == {"d1"}
-
-    store.upsert_document(make_doc("d2"))
-    store.mark_processed("d2")
-    assert store.processed_doc_ids(CASE) == {"d1", "d2"}
-    assert store.processed_doc_ids("other") == set()
+def _span(doc_id: str, quote: str, text: str = TEXT) -> SpanIn:
+    start = text.index(quote)
+    return SpanIn(doc_id=doc_id, char_start=start, char_end=start + len(quote), quote=quote)
 
 
-def test_events_roundtrip_and_order(store):
-    events = [
-        make_event("e2", "Second", day=date(2024, 3, 5), actors=["Bob"]),
-        make_event("e0", "Undated thing"),
-        make_event("e1", "First", day=date(2024, 3, 1), actors=["Alice", "Bob"]),
+# --------------------------------------------------------------------------- basics
+
+
+def test_wal_mode(store: Store) -> None:
+    assert store._q1("PRAGMA journal_mode")[0].lower() == "wal"
+
+
+def test_two_instances_share_writes(db: Path) -> None:
+    a, b = Store(db, embedder=_embed), Store(db, embedder=_embed)
+    try:
+        fact = a.add_fact(CASE, "Written by A", by="alice")
+        assert b.get_fact(fact.fact_id).title == "Written by A"
+        b.review_fact(fact.fact_id, "reject", reviewer="bob")
+        assert a.get_fact(fact.fact_id).review == "rejected"
+        job, _ = b.request_job(CASE, "ui")
+        assert a.claim_next_job().job_id == job.job_id
+    finally:
+        a.close()
+        b.close()
+
+
+def test_short_id_formats(store: Store) -> None:
+    doc = _doc(store)
+    fact = store.add_fact(CASE, "A fact", by="alice", spans=[_span(doc, "the board met")])
+    other = store.add_fact(CASE, "Another", by="alice")
+    witness = store.add_witness(CASE, "John Smith", by="alice")
+    tag = store.add_tag(CASE, "Fraud", by="alice")
+    note = store.add_note(fact.fact_id, author="alice", body="hello")
+    contradiction, _ = store.add_contradiction(CASE, [fact.fact_id, other.fact_id], "date", "x")
+    alert = store.add_alert(CASE, "contradiction", fact_ids=[fact.fact_id])
+    job, _ = store.request_job(CASE, "agent")
+    for value, prefix in (
+        (doc, "D"),
+        (fact.fact_id, "F"),
+        (fact.evidence[0].evidence_id, "E"),
+        (witness.witness_id, "W"),
+        (tag.tag_id, "T"),
+        (note.note_id, "N"),
+        (contradiction.contradiction_id, "C"),
+        (alert.alert_id, "A"),
+        (job.job_id, "J"),
+    ):
+        assert re.fullmatch(rf"{prefix}-\d{{4}}", value), value
+    assert (fact.fact_id, other.fact_id) == ("F-0001", "F-0002")
+
+
+# --------------------------------------------------------------------------- documents
+
+
+def test_register_document_dedupes_by_sha(store: Store) -> None:
+    doc, created = store.register_document(
+        CASE, filename="a.pdf", rel_path="a.pdf", sha256="abc", location="evidence"
+    )
+    assert created and doc.parse_status == "pending" and doc.kind == "other"
+    again, created = store.register_document(
+        CASE,
+        filename="renamed.pdf",
+        rel_path="inbox/renamed.pdf",
+        sha256="abc",
+        location="inbox",
+    )
+    assert not created and again.doc_id == doc.doc_id and again.filename == "a.pdf"
+    other_case, created = store.register_document(
+        "c2", filename="a.pdf", rel_path="a.pdf", sha256="abc", location="evidence"
+    )
+    assert created and other_case.doc_id != doc.doc_id
+    with pytest.raises(ValueError):
+        store.register_document(
+            CASE, filename="b", rel_path="b", sha256="x", location="evidence", kind="memo"
+        )
+    assert store.get_document_by_sha(CASE, "abc").doc_id == doc.doc_id
+    assert [d.doc_id for d in store.documents_to_process(CASE)] == [doc.doc_id]
+
+
+def test_document_kind_set_by_person_wins(store: Store) -> None:
+    doc = _doc(store)
+    store.set_document_kind(doc, "pleading", by="alice")
+    store.set_parse_result(doc, "parsed", kind="email")
+    assert store.get_document(doc).kind == "pleading"
+    with pytest.raises(PermissionError):
+        store.set_document_kind(doc, "email", by=AGENT)
+
+
+# --------------------------------------------------------------------------- evidence
+
+
+def test_span_evidence_verbatim_check(store: Store) -> None:
+    doc = _doc(store)
+    fact = store.add_fact(CASE, "Board met", by="alice")
+    bad = SpanIn(doc_id=doc, char_start=0, char_end=5, quote="Later")
+    with pytest.raises(ValueError, match="verbatim"):
+        store.add_evidence(fact.fact_id, kind="span", by="alice", span=bad)
+    with pytest.raises(ValueError, match="range"):
+        store.add_evidence(
+            fact.fact_id,
+            kind="span",
+            by="alice",
+            span=SpanIn(doc_id=doc, char_start=0, char_end=10_000, quote="x"),
+        )
+    # a fact whose span fails is not created at all
+    with pytest.raises(ValueError):
+        store.add_fact(CASE, "Draft", by=AGENT, spans=[bad])
+    assert [f.title for f in store.list_facts(CASE)] == ["Board met"]
+
+
+def test_span_fills_page_and_lines(store: Store) -> None:
+    split = TEXT.index("John")
+    pages = [
+        Page(number=1, char_start=0, char_end=split),
+        Page(number=2, char_start=split, char_end=len(TEXT)),
     ]
-    assert store.add_events(events) == 3
-    listed = store.list_events(CASE)
-    assert [e.id for e in listed] == ["e1", "e2", "e0"]
-    assert store.get_event("e1") == events[2]
-    assert store.get_event("missing") is None
-    assert store.list_events("other") == []
-
-
-def test_human_status_preserved_on_reupsert(store):
-    ev = make_event("e1", "Meeting held", day=date(2024, 1, 2))
-    store.add_events([ev])
-    assert store.set_event_status("e1", EventStatus.ACCEPTED)
-    assert not store.set_event_status("nope", "accepted")
-    store.add_events([ev.model_copy(update={"description": "Meeting was held"})])
-    got = store.get_event("e1")
-    assert got.status == EventStatus.ACCEPTED
-    assert got.description == "Meeting was held"
-    assert [e.id for e in store.list_events(CASE, status="accepted")] == ["e1"]
-    assert store.list_events(CASE, status=EventStatus.PROPOSED) == []
-
-
-def test_duplicates_hidden_by_default(store):
-    store.add_events(
-        [
-            make_event("a", "Contract signed", day=date(2024, 2, 1)),
-            make_event("b", "Contract was signed", day=date(2024, 2, 1)),
-        ]
+    sentence_end = TEXT.index("The complaint")
+    lines = [
+        Line(page=2, number=7, char_start=split, char_end=split + 10),
+        Line(page=2, number=8, char_start=split + 10, char_end=sentence_end),
+    ]
+    doc = _doc(store, pages=pages, lines=lines)
+    fact = store.add_fact(
+        CASE, "Signed", by="alice", spans=[_span(doc, "John Smith signed the merger agreement")]
     )
-    store.link_duplicate("b", "a")
-    assert [e.id for e in store.list_events(CASE)] == ["a"]
-    assert {e.id for e in store.list_events(CASE, include_duplicates=True)} == {"a", "b"}
-    assert store.duplicates_of("a") == ["b"]
+    ev = fact.evidence[0]
+    assert (ev.page, ev.line_start, ev.line_end) == (2, 7, 8)
+    assert ev.quote == "John Smith signed the merger agreement"
+    first = store.add_evidence(
+        fact.fact_id, kind="span", by="alice", span=_span(doc, "the board met")
+    )
+    assert first.page == 1 and first.line_start is None
+
+
+def test_evidence_kinds_and_dedupe(store: Store) -> None:
+    doc = _doc(store)
+    fact = store.add_fact(CASE, "F", by="alice")
+    d1 = store.add_evidence(fact.fact_id, kind="document", by="alice", doc_id=doc)
+    d2 = store.add_evidence(fact.fact_id, kind="document", by="alice", doc_id=doc)
+    assert d1.evidence_id == d2.evidence_id
+    ext = store.add_evidence(
+        fact.fact_id, kind="external", by="alice", reference=" https://example.com/x "
+    )
+    assert ext.reference == "https://example.com/x" and ext.kind == "external"
     with pytest.raises(ValueError):
-        store.link_duplicate("a", "a")
-
-
-def test_fts_sync_and_search(store):
-    store.add_events(
-        [
-            make_event("e1", "Alice emailed the landlord about the leak", actors=["Alice Smith"]),
-            make_event("e2", "Bob signed the lease agreement", actors=["Bob Jones"]),
-            make_event("e3", "Inspection of the roof", quote="the roof was inspected by Carol"),
-        ]
-    )
-    assert [e.id for e in store.search_events(CASE, "leak", k=5)][0] == "e1"
-    assert store.search_events(CASE, "Jones", k=5)[0].id == "e2"  # actors indexed
-    assert store.search_events(CASE, "Carol", k=5)[0].id == "e3"  # quote indexed
-    assert store.search_events("other", "leak") == []
-    assert store.search_events(CASE, "   ") == []
-    # Punctuation / FTS syntax in user queries must not raise.
-    assert store.search_events(CASE, 'leak" OR (NEAR', k=5)[0].id == "e1"
-
-    # Updating the description keeps FTS in sync.
-    old = store.get_event("e1")
-    new_src = old.source.model_copy(update={"quote": "Alice phoned about mould"})
-    ev = old.model_copy(update={"description": "Alice phoned about mould", "source": new_src})
-    store.add_events([ev])
-    assert all(e.id != "e1" for e in store.search_events(CASE, "leak landlord", k=5))
-    assert store.search_events(CASE, "mould", k=5)[0].id == "e1"
-
-
-def test_vector_search_contributes(store):
-    if not store.vector_enabled:
-        pytest.skip("sqlite-vec not loadable here")
-    store.add_events([make_event("e1", "Payment of rent overdue"), make_event("e2", "Fire alarm")])
-    rows = store._conn.execute("SELECT count(*) FROM event_vec").fetchone()[0]
-    assert rows == 2
-    # Prefix-free stemmed FTS would match "rent"; vector match on identical tokens ranks e1 top.
-    assert store.search_events(CASE, "rent overdue payment", k=1)[0].id == "e1"
-
-
-def test_search_fts_only_when_vec_unavailable(tmp_path, monkeypatch):
-    monkeypatch.setattr(Store, "_load_vec", lambda self: False)
-    s = Store(tmp_path / "novec.db", embedder=fake_embed)
-    assert not s.vector_enabled
-    s.add_events([make_event("e1", "Alice called Bob")])
-    assert s.search_events(CASE, "Bob")[0].id == "e1"
-    s.close()
-
-
-def test_embedder_failure_degrades(tmp_path):
-    def broken(texts):
-        raise RuntimeError("no model")
-
-    s = Store(tmp_path / "b.db", embedder=broken)
-    s.add_events([make_event("e1", "Alice called Bob")])
-    assert s.search_events(CASE, "Alice")[0].id == "e1"
-    s.close()
-
-
-def test_unchanged_events_not_reembedded(tmp_path):
-    calls: list[int] = []
-
-    def counting(texts):
-        calls.append(len(texts))
-        return fake_embed(texts)
-
-    s = Store(tmp_path / "c.db", embedder=counting)
-    if not s.vector_enabled:
-        pytest.skip("sqlite-vec not loadable here")
-    ev = make_event("e1", "Alice called Bob")
-    s.add_events([ev])
-    s.add_events([ev])
-    assert calls == [1]
-    s.close()
-
-
-def test_contradictions_and_alerts(store):
-    c = Contradiction(
-        id="c1", case_id=CASE, event_ids=["e1", "e2"], field=ConflictField.DATE, explanation="x"
-    )
-    store.add_contradictions([c])
-    assert store.set_contradiction_status("c1", ContradictionStatus.DISMISSED)
-    store.add_contradictions([c.model_copy(update={"explanation": "y"})])  # re-detected
-    [got] = store.list_contradictions(CASE)
-    assert got.status == ContradictionStatus.DISMISSED and got.explanation == "y"
-    assert store.list_contradictions(CASE, status="open") == []
-
-    a = Alert(
-        id="a1",
-        case_id=CASE,
-        type=AlertType.NEW_CONTRADICTION,
-        created_at=datetime(2024, 1, 1, tzinfo=UTC),
-        dashboard_url="http://127.0.0.1:8080/cases/demo/alerts/a1",
-        ref_ids=["c1"],
-    )
-    assert store.add_alerts([a]) == 1
-    assert store.add_alerts([a]) == 0
-    assert store.list_alerts(CASE) == [a]
-
-
-def test_jobs(store):
-    job = store.create_job(CASE, docs_total=3)
-    assert job.state == JobState.QUEUED
-    now = datetime.now(UTC)
-    job = store.update_job(job.id, state=JobState.RUNNING, started_at=now)
-    job = store.update_job(job, docs_done=3, events_added=7, state=JobState.DONE)
-    got = store.get_job(job.id)
-    assert got == job
-    assert got.started_at == now and got.events_added == 7
-    assert store.latest_job(CASE).id == job.id
-    assert store.get_job("missing") is None
+        store.add_evidence(fact.fact_id, kind="external", by="alice", reference="  ")
     with pytest.raises(ValueError):
-        store.update_job(job.id, bogus=1)
+        store.add_evidence(fact.fact_id, kind="document", by="alice", doc_id="D-9999")
+    assert len(store.get_fact(fact.fact_id).evidence) == 2
+
+
+# --------------------------------------------------------------------------- permissions (§6.2)
+
+
+def test_agent_facts_are_drafts_people_facts_accepted(store: Store) -> None:
+    doc = _doc(store)
+    draft = store.add_fact(
+        CASE, "Draft", by=AGENT, confidence=0.7, spans=[_span(doc, "the board met")]
+    )
+    assert (draft.origin, draft.review, draft.confidence) == ("ai", "draft", 0.7)
+    assert draft.evidence[0].origin == "ai" and draft.evidence[0].review == "draft"
+    mine = store.add_fact(
+        CASE, "Mine", by="alice", confidence=0.7, spans=[_span(doc, "the board met")]
+    )
+    assert (mine.origin, mine.review, mine.confidence) == ("user", "accepted", None)
+    assert mine.evidence[0].review == "accepted"
+    with pytest.raises(ValueError):
+        store.add_fact(CASE, "Nobody", by="  ")
+    with pytest.raises(ValueError):
+        store.add_fact(CASE, "   ", by="alice")
+
+
+def test_agent_permission_rules(store: Store) -> None:
+    tag = store.add_tag(CASE, "Fraud", by="alice")
+    with pytest.raises(PermissionError):
+        store.add_fact(CASE, "x", by=AGENT, statuses=["key_fact"])
+    with pytest.raises(PermissionError):
+        store.add_fact(CASE, "x", by=AGENT, tag_ids=[tag.tag_id])
+    draft = store.add_fact(CASE, "Draft", by=AGENT)
+    with pytest.raises(PermissionError):
+        store.update_fact(draft.fact_id, {"statuses": ["disputed"]}, by=AGENT)
+    with pytest.raises(PermissionError):
+        store.update_fact(draft.fact_id, {"tag_ids": [tag.tag_id]}, by=AGENT)
+    # the agent may still edit its own unreviewed draft (stays a draft)
+    edited = store.update_fact(draft.fact_id, {"details": "more"}, by=AGENT)
+    assert edited.review == "draft" and edited.details == "more"
+    store.review_fact(draft.fact_id, "accept", reviewer="alice")
+    with pytest.raises(PermissionError):
+        store.update_fact(draft.fact_id, {"title": "changed"}, by=AGENT)
+    with pytest.raises(PermissionError):
+        store.review_fact(draft.fact_id, "reject", reviewer=AGENT)
+    with pytest.raises(PermissionError):
+        store.add_note(draft.fact_id, author=AGENT, body="hi")
+    with pytest.raises(PermissionError):
+        store.add_tag(CASE, "New", by=AGENT)
+    with pytest.raises(PermissionError):
+        store.review_contradiction("C-0001", "confirm", reviewer=AGENT)
+    with pytest.raises(PermissionError):
+        store.update_witness("W-0001", {"name": "x"}, by=AGENT)
+    # but it may attach draft evidence to any fact and suggest witnesses
+    doc = _doc(store)
+    ev = store.add_evidence(draft.fact_id, kind="document", by=AGENT, doc_id=doc)
+    assert ev.review == "draft" and ev.origin == "ai"
+    suggested = store.add_witness(CASE, "Jane Roe", by=AGENT, flagged=True)
+    assert suggested.confirmed is False and suggested.flagged is False
+    with pytest.raises(PermissionError):
+        store.review_evidence(ev.evidence_id, "accept", reviewer=AGENT)
+
+
+# --------------------------------------------------------------------------- review
+
+
+def test_editing_a_draft_accepts_it(store: Store) -> None:
+    doc = _doc(store)
+    draft = store.add_fact(CASE, "Board met", by=AGENT, spans=[_span(doc, "the board met")])
+    fact = store.update_fact(draft.fact_id, {"title": "Board met in Austin"}, by="alice")
+    assert fact.review == "accepted" and fact.title == "Board met in Austin"
+    assert fact.updated_by == "alice"
+    assert fact.evidence[0].review == "accepted"
+    events = store.list_review_events(CASE)
+    assert [(e.action, e.reviewer, e.fact_id) for e in events] == [("edit", "alice", draft.fact_id)]
+    history = store.fact_history(draft.fact_id)
+    assert {"field": "title", "old": "Board met", "new": "Board met in Austin"}.items() <= (
+        history[0].items()
+    )
+    assert any(h["field"] == "review" and h["new"] == "accepted" for h in history)
+
+
+def test_review_edit_with_reason(store: Store) -> None:
+    draft = store.add_fact(CASE, "Board met", by=AGENT)
+    store.review_fact(
+        draft.fact_id, "edit", reviewer="alice", reason="typo", changes={"title": "Board meets"}
+    )
+    (event,) = store.list_review_events(CASE)
+    assert (event.action, event.reason) == ("edit", "typo")
+    with pytest.raises(ValueError):
+        store.review_fact(draft.fact_id, "edit", reviewer="alice")
+
+
+def test_review_accept_and_reject(store: Store) -> None:
+    doc = _doc(store)
+    a = store.add_fact(CASE, "A", by=AGENT, spans=[_span(doc, "the board met")])
+    b = store.add_fact(CASE, "B", by=AGENT)
+    accepted = store.review_fact(a.fact_id, "accept", reviewer="alice")
+    assert accepted.review == "accepted"
+    assert accepted.evidence[0].review == "accepted"
+    rejected = store.review_fact(b.fact_id, "reject", reviewer="bob", reason="not a fact")
+    assert rejected.review == "rejected"
+    events = store.list_review_events(CASE)
+    assert [(e.action, e.reason) for e in events] == [("accept", None), ("reject", "not a fact")]
+    assert [f.fact_id for f in store.list_facts(CASE)] == [a.fact_id]
+    assert store.review_counts(CASE) == {"draft": 0, "accepted": 1, "rejected": 1}
+    with pytest.raises(ValueError):
+        store.review_fact(a.fact_id, "maybe", reviewer="alice")
     with pytest.raises(KeyError):
-        store.update_job("missing", docs_done=1)
+        store.review_fact("F-9999", "accept", reviewer="alice")
 
 
-def test_changes_since_and_cursor(store):
-    t0 = datetime.now(UTC)
-    store.add_events([make_event("e1", "One")])
-    full = store.changes_since(CASE, None)
-    assert [e.id for e in full.new_events] == ["e1"]
-    assert [e.id for e in store.changes_since(CASE, t0).new_events] == ["e1"]
-    assert store.changes_since(CASE, datetime.now(UTC) + timedelta(seconds=1)).new_events == []
-    # Naive datetimes are treated as UTC.
-    assert len(store.changes_since(CASE, t0.replace(tzinfo=None)).new_events) == 1
+def test_evidence_review(store: Store) -> None:
+    doc = _doc(store)
+    fact = store.add_fact(CASE, "Mine", by="alice")
+    ev = store.add_evidence(fact.fact_id, kind="span", by=AGENT, span=_span(doc, "the board met"))
+    assert ev.review == "draft"
+    rejected = store.review_evidence(ev.evidence_id, "reject", reviewer="alice", reason="wrong")
+    assert rejected.review == "rejected"
+    assert store.get_fact(fact.fact_id).evidence == []
+    assert len(store.get_fact(fact.fact_id, rejected_evidence=True).evidence) == 1
+    (event,) = store.list_review_events(CASE)
+    assert (event.evidence_id, event.action, event.reason) == (ev.evidence_id, "reject", "wrong")
+    # a rejected quote no longer matches keyword search
+    assert store.fts_fact_ids(CASE, '"board"') == []
 
-    assert store.get_cursor("mcp", CASE) is None
-    first = store.get_changes(CASE, "mcp")
-    assert [e.id for e in first.new_events] == ["e1"] and first.since is None
-    assert store.get_changes(CASE, "mcp").new_events == []
 
-    store.add_events([make_event("e1", "One (re-extracted)"), make_event("e2", "Two")])
-    store.add_contradictions(
-        [
-            Contradiction(
-                id="c1", case_id=CASE, event_ids=["e1", "e2"], field="fact", explanation="z"
-            )
-        ]
+# --------------------------------------------------------------------------- list_facts
+
+
+@pytest.fixture
+def world(store: Store) -> dict[str, str]:
+    pleading = _doc(store, sha="p", kind="pleading")
+    email = _doc(store, sha="e", kind="email")
+    fraud = store.add_tag(CASE, "Fraud", by="alice")
+    damages = store.add_tag(CASE, "Damages", by="alice")
+    smith = store.add_witness(CASE, "John Smith", by="alice")
+    jones = store.add_witness(CASE, "Mary Jones", by="alice")
+    ids: dict[str, str] = {
+        "pleading": pleading,
+        "email": email,
+        "fraud": fraud.tag_id,
+        "damages": damages.tag_id,
+        "smith": smith.witness_id,
+        "jones": jones.witness_id,
+    }
+    ids["jan"] = store.add_fact(
+        CASE,
+        "beta January",
+        by="alice",
+        date_start=date(2022, 1, 10),
+        statuses=["key_fact"],
+        tag_ids=[fraud.tag_id],
+        witness_ids=[smith.witness_id],
+        spans=[_span(pleading, "the board met")],
+    ).fact_id
+    time.sleep(0.002)
+    ids["range"] = store.add_fact(
+        CASE,
+        "alpha range",
+        by="alice",
+        date_start=date(2022, 2, 1),
+        date_end=date(2022, 4, 30),
+        tag_ids=[fraud.tag_id, damages.tag_id],
+        doc_ids=[email],
+    ).fact_id
+    time.sleep(0.002)
+    ids["draft"] = store.add_fact(
+        CASE,
+        "Gamma draft",
+        by=AGENT,
+        date_start=date(2022, 6, 1),
+        confidence=0.4,
+        witness_ids=[jones.witness_id],
+        spans=[_span(email, "John Smith signed")],
+    ).fact_id
+    time.sleep(0.002)
+    ids["undated"] = store.add_fact(
+        CASE, "delta undated", by="alice", statuses=["disputed", "case_impact"]
+    ).fact_id
+    store.add_note(ids["undated"], author="alice", body="n1")
+    store.add_note(ids["undated"], author="alice", body="n2")
+    time.sleep(0.002)
+    ids["rejected"] = store.add_fact(
+        CASE, "epsilon rejected", by=AGENT, date_start=date(2022, 1, 1)
+    ).fact_id
+    store.review_fact(ids["rejected"], "reject", reviewer="alice")
+    store.add_fact("other", "other case", by="alice")
+    return ids
+
+
+def _ids(store: Store, **kw: object) -> list[str]:
+    return [f.fact_id for f in store.list_facts(CASE, FactQuery(**kw))]
+
+
+def test_list_default_is_date_order_undated_last_no_rejected(
+    store: Store, world: dict[str, str]
+) -> None:
+    w = world
+    assert _ids(store) == [w["jan"], w["range"], w["draft"], w["undated"]]
+    assert _ids(store, descending=True) == [w["draft"], w["range"], w["jan"], w["undated"]]
+    assert _ids(store, include_undated=False) == [w["jan"], w["range"], w["draft"]]
+
+
+def test_list_filters(store: Store, world: dict[str, str]) -> None:
+    w = world
+    # date range overlaps ranges and drops undated facts
+    assert _ids(store, date_from=date(2022, 3, 1), date_to=date(2022, 5, 1)) == [w["range"]]
+    assert _ids(store, date_from=date(2022, 5, 1)) == [w["draft"]]
+    assert _ids(store, date_to=date(2022, 1, 31)) == [w["jan"]]
+    assert _ids(store, statuses=["disputed"]) == [w["undated"]]
+    assert _ids(store, statuses=["key_fact", "case_impact"]) == [w["jan"], w["undated"]]
+    assert _ids(store, tag_ids=[w["damages"]]) == [w["range"]]
+    assert _ids(store, tag_ids=[w["fraud"]]) == [w["jan"], w["range"]]
+    assert _ids(store, witness_ids=[w["jones"]]) == [w["draft"]]
+    assert _ids(store, witness_ids=[w["smith"], w["jones"]]) == [w["jan"], w["draft"]]
+    assert _ids(store, doc_ids=[w["email"]]) == [w["range"], w["draft"]]
+    assert _ids(store, doc_kinds=["pleading"]) == [w["jan"]]
+    assert _ids(store, doc_kinds=["email", "pleading"]) == [w["jan"], w["range"], w["draft"]]
+    assert _ids(store, reviews=["draft"]) == [w["draft"]]
+    assert _ids(store, reviews=["rejected"]) == [w["rejected"]]
+    assert _ids(store, reviews=[]) == [
+        w["rejected"],
+        w["jan"],
+        w["range"],
+        w["draft"],
+        w["undated"],
+    ]
+    assert _ids(store, origins=["ai"]) == [w["draft"]]
+    assert _ids(store, origins=["user"]) == [w["jan"], w["range"], w["undated"]]
+    assert _ids(store, fact_ids=[w["undated"], w["jan"], w["rejected"]]) == [w["jan"], w["undated"]]
+    assert _ids(store, fact_ids=[]) == []
+    assert _ids(store, limit=2) == [w["jan"], w["range"]]
+    # rejected evidence no longer counts for document filters
+    ev = store.get_fact(w["draft"]).evidence[0]
+    store.review_evidence(ev.evidence_id, "reject", reviewer="alice")
+    assert _ids(store, doc_ids=[w["email"]]) == [w["range"]]
+
+
+def test_list_sorts(store: Store, world: dict[str, str]) -> None:
+    w = world
+    assert _ids(store, sort="title") == [w["range"], w["jan"], w["undated"], w["draft"]]
+    assert _ids(store, sort="title", descending=True) == [
+        w["draft"],
+        w["undated"],
+        w["jan"],
+        w["range"],
+    ]
+    assert _ids(store, sort="tags", descending=True)[0] == w["range"]
+    assert _ids(store, sort="notes", descending=True)[0] == w["undated"]
+    assert _ids(store, sort="evidence")[0] == w["undated"]
+    assert _ids(store, sort="witnesses", descending=True)[:2] == [w["jan"], w["draft"]]
+    assert _ids(store, sort="created") == [w["jan"], w["range"], w["draft"], w["undated"]]
+    assert _ids(store, sort="created", descending=True) == [
+        w["undated"],
+        w["draft"],
+        w["range"],
+        w["jan"],
+    ]
+    time.sleep(0.002)
+    store.update_fact(w["jan"], {"details": "touched"}, by="alice")
+    assert _ids(store, sort="updated", descending=True)[0] == w["jan"]
+    assert _ids(store, sort="confidence")[0] == w["draft"]
+
+
+def test_counts_and_alleged(store: Store, world: dict[str, str]) -> None:
+    w = world
+    counts = store.fact_counts([w["jan"], w["range"], w["undated"]])
+    assert counts[w["jan"]] == {"evidence": 1, "tags": 1, "witnesses": 1, "notes": 0}
+    assert counts[w["range"]] == {"evidence": 1, "tags": 2, "witnesses": 0, "notes": 0}
+    assert counts[w["undated"]]["notes"] == 2
+    # only pleading evidence -> alleged; no evidence -> not alleged
+    assert store.alleged_fact_ids(CASE) == {w["jan"]}
+    store.add_evidence(w["jan"], kind="external", by="alice", reference="Ex. 4")
+    assert store.alleged_fact_ids(CASE) == set()
+
+
+# --------------------------------------------------------------------------- witnesses & tags
+
+
+def test_witness_find_merge_delete(store: Store) -> None:
+    smith = store.add_witness(CASE, "John  Smith", by="alice", aliases=["J. Smith"])
+    assert smith.name == "John Smith"
+    guess = store.add_witness(CASE, "Mr. Smith", by=AGENT)
+    assert store.find_witness(CASE, "j.  smith").witness_id == smith.witness_id
+    assert store.find_witness(CASE, "mr. smith").witness_id == guess.witness_id
+    assert store.find_witness(CASE, "Nobody") is None
+    a = store.add_fact(CASE, "A", by="alice", witness_ids=[smith.witness_id])
+    b = store.add_fact(CASE, "B", by="alice", witness_ids=[guess.witness_id])
+    merged = store.merge_witnesses(guess.witness_id, smith.witness_id, by="alice")
+    assert set(merged.aliases) == {"J. Smith", "Mr. Smith"}
+    assert store.get_witness(guess.witness_id) is None
+    assert store.get_fact(b.fact_id).witness_ids == [smith.witness_id]
+    assert [f.fact_id for f in store.witness_facts(smith.witness_id)] == [a.fact_id, b.fact_id]
+    assert store.find_witness(CASE, "Mr. Smith").witness_id == smith.witness_id
+    with pytest.raises(ValueError):
+        store.merge_witnesses(smith.witness_id, smith.witness_id, by="alice")
+    store.delete_witness(smith.witness_id, by="alice")
+    assert store.get_fact(a.fact_id).witness_ids == []
+    assert store.list_witnesses(CASE) == []
+
+
+def test_tags_unique_case_insensitive(store: Store) -> None:
+    fraud = store.add_tag(CASE, "Fraud", by="alice", color="#f00")
+    again = store.add_tag(CASE, "  fraud ", by="bob")
+    assert again.tag_id == fraud.tag_id
+    other_case = store.add_tag("c2", "Fraud", by="alice")
+    assert other_case.tag_id != fraud.tag_id
+    assert [t.name for t in store.list_tags(CASE)] == ["Fraud"]
+    store.add_tag(CASE, "Damages", by="alice")
+    assert [t.name for t in store.list_tags(CASE)] == ["Damages", "Fraud"]
+    with pytest.raises(ValueError):
+        store.add_fact(CASE, "x", by="alice", tag_ids=[other_case.tag_id])  # wrong case
+
+
+# --------------------------------------------------------------------------- contradictions
+
+
+def test_contradictions_dedupe_and_confirm(store: Store) -> None:
+    a = store.add_fact(CASE, "Met on March 3", by=AGENT, date_start=date(2022, 3, 3))
+    b = store.add_fact(
+        CASE, "Met on March 5", by="alice", date_start=date(2022, 3, 5), statuses=["key_fact"]
     )
-    nxt = store.get_changes(CASE, "mcp")
-    assert [e.id for e in nxt.new_events] == ["e2"]  # updates are not "new"
-    assert [c.id for c in nxt.new_contradictions] == ["c1"]
-    # Independent consumers have independent cursors.
-    assert len(store.get_changes(CASE, "ui").new_events) == 2
-    stamp = store.advance_cursor("ui", CASE, t0)
-    assert store.get_cursor("ui", CASE) == stamp
-    store.set_cursor(case_id=CASE, consumer="ui", ts=t0)
-    assert store.get_cursor(case_id=CASE, consumer="ui") == t0
+    c1, created = store.add_contradiction(CASE, [a.fact_id, b.fact_id], "date", "3 vs 5")
+    assert created and c1.status == "open"
+    c2, created = store.add_contradiction(CASE, [b.fact_id, a.fact_id], "date", "again")
+    assert not created and c2.contradiction_id == c1.contradiction_id
+    _, created = store.add_contradiction(CASE, [a.fact_id, b.fact_id], "actor", "who")
+    assert created
+    with pytest.raises(ValueError):
+        store.add_contradiction(CASE, [a.fact_id], "date", "one fact")
+    assert store.conflicted_fact_ids(CASE) == {a.fact_id, b.fact_id}
+    confirmed = store.review_contradiction(c1.contradiction_id, "confirm", reviewer="alice")
+    assert confirmed.status == "confirmed"
+    assert store.get_fact(a.fact_id).statuses == ["disputed"]
+    assert store.get_fact(a.fact_id).review == "draft"  # confirming a dispute isn't a review
+    assert store.list_review_events(CASE) == []
+    assert store.get_fact(b.fact_id).statuses == ["key_fact", "disputed"]
+    assert [c.contradiction_id for c in store.list_contradictions(CASE, "confirmed")] == [
+        c1.contradiction_id
+    ]
+    assert len(store.list_contradictions(CASE, fact_id=a.fact_id)) == 2
 
 
-def test_thread_safety(store):
-    errors: list[BaseException] = []
+# --------------------------------------------------------------------------- alerts & jobs
 
-    def worker(n: int) -> None:
-        try:
-            for i in range(10):
-                store.add_events([make_event(f"t{n}-{i}", f"thread {n} event {i}")])
-                store.list_events(CASE)
-                store.search_events(CASE, f"thread {n}")
-        except BaseException as exc:  # noqa: BLE001
-            errors.append(exc)
 
-    threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert not errors
-    assert len(store.list_events(CASE)) == 40
+def test_alerts_pending_and_delivered(store: Store) -> None:
+    a1 = store.add_alert(CASE, "contradiction", fact_ids=["F-0001", "F-0001"], doc_ids=["D-1"])
+    a2 = store.add_alert(CASE, "possible_deadline", fact_ids=["F-0002"])
+    assert a1.fact_ids == ["F-0001"]
+    with pytest.raises(ValueError):
+        store.add_alert(CASE, "gossip")
+    assert {a.alert_id for a in store.list_alerts(CASE, pending_only=True)} == {
+        a1.alert_id,
+        a2.alert_id,
+    }
+    assert store.mark_alerts_delivered([a1.alert_id, a1.alert_id]) == 1
+    assert store.mark_alerts_delivered([a1.alert_id]) == 0
+    assert store.mark_alerts_delivered([]) == 0
+    assert [a.alert_id for a in store.list_alerts(CASE, pending_only=True)] == [a2.alert_id]
+    assert store.get_alert(a1.alert_id).delivered_at is not None
+    assert len(store.list_alerts(CASE)) == 2
+
+
+def test_jobs_lifecycle(store: Store) -> None:
+    j1, created = store.request_job(CASE, "agent")
+    assert created and j1.status == "queued"
+    same, created = store.request_job(CASE, "ui")
+    assert not created and same.job_id == j1.job_id
+    with pytest.raises(ValueError):
+        store.request_job(CASE, "cron")
+    other, _ = store.request_job("c2", "upload")
+
+    running = store.claim_next_job()
+    assert running.job_id == j1.job_id and running.status == "running"
+    assert running.started_at is not None
+    # a new job for the busy case can be queued but isn't claimed while one runs
+    j2, created = store.request_job(CASE, "ui")
+    assert created
+    assert store.claim_next_job().job_id == other.job_id
+    assert store.claim_next_job() is None
+
+    # crash recovery: running jobs go back to the queue
+    assert store.requeue_running() == 2
+    assert store.get_job(j1.job_id).status == "queued"
+    assert store.get_job(j1.job_id).started_at is None
+
+    again = store.claim_next_job()
+    assert again.job_id == j1.job_id
+    done = store.finish_job(j1.job_id, "done", counts={"docs_seen": 3, "drafts": 2})
+    assert done.status == "done" and done.counts == {"docs_seen": 3, "drafts": 2}
+    assert done.finished_at is not None
+    with pytest.raises(ValueError):
+        store.finish_job(j1.job_id, "running")
+    failed = store.finish_job(store.claim_next_job().job_id, "failed", error="boom")
+    assert (failed.status, failed.error) == ("failed", "boom")
+    assert store.latest_job(CASE).job_id == j2.job_id
+
+
+# --------------------------------------------------------------------------- reprocessing
+
+
+def test_reset_document_removes_only_unreviewed_ai_drafts(store: Store) -> None:
+    doc = _doc(store)
+    other_doc = _doc(store, sha="sha-2")
+    only_here = store.add_fact(CASE, "draft here", by=AGENT, spans=[_span(doc, "the board met")])
+    reviewed = store.add_fact(CASE, "accepted", by=AGENT, spans=[_span(doc, "board met")])
+    store.review_fact(reviewed.fact_id, "accept", reviewer="alice")
+    mixed = store.add_fact(
+        CASE, "two docs", by=AGENT, spans=[_span(doc, "John Smith"), _span(other_doc, "John Smith")]
+    )
+    person = store.add_fact(CASE, "mine", by="alice", spans=[_span(doc, "Austin")])
+    store.add_evidence(person.fact_id, kind="span", by=AGENT, span=_span(doc, "met in Austin"))
+    survivor = store.add_fact(CASE, "survivor", by=AGENT, spans=[_span(other_doc, "Acme")])
+    c, _ = store.add_contradiction(CASE, [only_here.fact_id, survivor.fact_id], "date", "x")
+    store.mark_drafted(doc)
+
+    assert store.reset_document(doc) == 1
+    assert store.get_fact(only_here.fact_id) is None
+    assert store.get_contradiction(c.contradiction_id) is None
+    assert store.get_fact(reviewed.fact_id).review == "accepted"
+    assert len(store.get_fact(reviewed.fact_id).evidence) == 1
+    assert [e.doc_id for e in store.get_fact(mixed.fact_id).evidence] == [other_doc]
+    assert [e.origin for e in store.get_fact(person.fact_id).evidence] == ["user"]
+    assert store.get_fact(survivor.fact_id) is not None
+    assert store.get_document(doc).parse_status == "pending"
+    assert doc in [d.doc_id for d in store.documents_to_process(CASE)]
+    assert store.fts_fact_ids(CASE, '"draft"') == []
+
+
+# --------------------------------------------------------------------------- search indexes
+
+
+def test_fts_index_and_vectors(store: Store) -> None:
+    doc = _doc(store)
+    a = store.add_fact(
+        CASE,
+        "Board meeting",
+        by="alice",
+        details="held in Austin",
+        spans=[_span(doc, "merger agreement")],
+    )
+    b = store.add_fact(CASE, "Something happened", by="alice")
+    store.add_note(b.fact_id, author="alice", body="ask about the losses")
+    assert store.fts_fact_ids(CASE, '"austin"') == [a.fact_id]
+    assert store.fts_fact_ids(CASE, '"merger"') == [a.fact_id]
+    assert store.fts_fact_ids(CASE, '"losses"') == [b.fact_id]
+    store.update_fact(a.fact_id, {"details": "held in Dallas"}, by="alice")
+    assert store.fts_fact_ids(CASE, '"austin"') == []
+    if store.vector_enabled:
+        assert store.refresh_vectors(CASE) == 2
+        assert store.refresh_vectors(CASE) == 0
+        assert store.vector_fact_ids(CASE, "something happened", 5)[0] == b.fact_id
+
+
+def test_search_survives_zero_vectors(store: Store) -> None:
+    store.add_fact(CASE, "Something happened", by="alice")
+    store.add_fact(CASE, "!!!", by="alice")  # embeds to a zero vector
+    store.refresh_vectors(CASE)
+    assert store.vector_fact_ids(CASE, "??!", 5) == []
+    assert store.vector_fact_ids(CASE, "   ", 5) == []
+    if store.vector_enabled:
+        assert store.vector_fact_ids(CASE, "something happened", 5)[0] == "F-0001"

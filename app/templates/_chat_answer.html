@@ -1,21 +1,18 @@
-<div class="answer card">
-  <div class="q"><span class="muted small">Question</span><p>{{ result.question }}</p></div>
+<div class="card answer">
+  <div class="q"><span class="muted small">You asked</span><p>{{ result.question }}</p></div>
   {% if result.notice %}<p class="notice">{{ result.notice }}</p>{% endif %}
   {% if result.answer_html %}<div class="a">{{ result.answer_html }}</div>{% endif %}
-  {% if result.citations %}
-  <h3>Cited events</h3>
+  <p class="muted small">Answered by {{ 'the OpenClaw agent' if result.backend == 'openclaw' else 'the local model over matching facts' }}. Check every cited fact against its source.</p>
+  {% if result.facts %}
+  <h3>Facts {{ 'cited' if result.backend == 'openclaw' else 'consulted' }}</h3>
   <ol class="cites">
-    {% for c in result.citations %}
-    {% set e = c.event %}
-    <li id="cite-{{ c.tag }}"><strong>[{{ c.tag }}]</strong>
-      {{ e.date_start.isoformat() if e.date_start else e.date_text }} · {{ e.description }}
-      {% if e.deadline_relevant %}<span class="badge deadline">Needs attorney review</span>{% endif %}
-      {% if e.status.value == 'unverified' %}<span class="badge unverified">Unverified</span>{% endif %}
-      <blockquote>{{ e.source.quote }}</blockquote>
-      <a href="{{ c.url }}">Open source</a>
+    {% for x in result.facts %}
+    <li><a href="{{ fact_url(x.fact_id) }}">{{ x.fact_id }}</a> {{ x.title }}
+      <span class="muted small">{{ fact_date(x) or 'Undated' }}{% if x.review == 'draft' %} · unreviewed draft{% endif %}{% if 'disputed' in x.statuses %} · disputed{% endif %}</span>
+      {% set q = x.evidence | selectattr('kind', 'equalto', 'span') | first %}
+      {% if q %}<blockquote><a href="{{ doc_view_url(q.doc_id, q.evidence_id) }}">“{{ q.quote }}”</a></blockquote>{% endif %}
     </li>
     {% endfor %}
   </ol>
   {% endif %}
-  <p class="muted small">Answered by {{ 'OpenClaw agent' if result.backend == 'openclaw' else 'local model' }}. Verify every citation.</p>
 </div>

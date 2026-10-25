@@ -1,7 +1,20 @@
-"""Discover evidence files and turn them into normalized text with page offsets.
+"""Discover case files and turn them into normalized text with page (and transcript line) offsets.
 
-Evidence files are only ever opened for reading. All offsets index into the
-normalized text (NFC, ``\\n`` line endings, no NUL characters).
+Evidence files are only ever opened for reading. All offsets index into the normalized text
+(NFC, ``\\n`` line endings, no NUL characters), which is what the store keeps and what evidence
+spans cite.
+
+Pages:
+- PDFs: one page per PDF page, joined with a blank line (``PAGE_SEPARATOR``).
+- Text files: form feeds split pages (numbered 1..n), or ``[Page N]`` marker lines start page N
+  (text before the first marker belongs to no page).
+
+Transcript lines (page:line citations):
+- Printed line numbers ("  12  Q. Where were you?") are kept as printed, per page.
+- A transcript with ``[Page N]`` markers but no printed numbers (e.g. a deposition excerpt typed
+  into a .txt) gets its non-empty lines numbered 1..n within each page, skipping the marker
+  line itself. That is our convention, not the court reporter's, and only applies to documents
+  that look like transcripts (Q./A. lines, or "deposition"/"transcript" in the name).
 """
 
 from __future__ import annotations
@@ -15,13 +28,15 @@ import logging
 import os
 import re
 import unicodedata
+from dataclasses import dataclass
 from datetime import date
 from email.message import EmailMessage, Message
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Literal
 
-from pipeline.contracts import Document, Page, ParsedDocument
+from pipeline.schema import DocKind, Document, Line, Page, ParsedDocument
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +66,7 @@ def _hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _hash_file(path: Path) -> str:
+def hash_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -62,77 +77,58 @@ def _hash_file(path: Path) -> str:
 # --------------------------------------------------------------------------- discovery
 
 
-def _default_inbox(case_id: str) -> list[tuple[Path, bool]]:
-    """Settings inbox as (root, recursive): loose ``inbox/`` files plus all of ``inbox/<case>``."""
-    try:
-        from pipeline.config import get_settings, valid_case_id
+@dataclass(frozen=True)
+class FoundFile:
+    """A supported file found by :func:`discover`."""
 
-        valid_case_id(case_id)
-        inbox = Path(get_settings().inbox)
-    except Exception:  # settings unavailable or misconfigured: no inbox
-        log.debug("no inbox from settings", exc_info=True)
-        return []
-    # The bare inbox is scanned flat so other cases' subfolders are not picked up.
-    return [(inbox, False), (inbox / case_id, True)]
+    path: Path
+    rel_path: str  # POSIX path relative to its root folder
+    location: Literal["evidence", "inbox"]
+    sha256: str
 
 
-def _candidate_files(root: Path, recursive: bool) -> list[Path]:
+def _candidate_files(root: Path) -> list[Path]:
     if not root.is_dir():
         return []
-    entries = root.rglob("*") if recursive else root.iterdir()
     out = []
-    for p in entries:
+    for p in root.rglob("*"):
         rel_parts = p.relative_to(root).parts
         if any(part.startswith((".", "~$")) for part in rel_parts):
-            continue  # hidden files, Office lock files
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
+            continue  # hidden files and folders, Office lock files
+        if p.suffix.lower() in SUPPORTED_EXTENSIONS and p.is_file():
             out.append(p)
     return sorted(out)
 
 
-def discover(
-    evidence_dir: Path, case_id: str, *, inbox_dirs: list[Path] | None = None
-) -> list[Document]:
-    """Hash every supported file under ``evidence_dir`` and the upload inbox.
+def discover(evidence_dir: Path, inbox_dir: Path | None) -> list[FoundFile]:
+    """Hash every supported file in the evidence folder and the inbox (both recursive).
 
-    ``inbox_dirs`` (scanned recursively) defaults to the settings inbox: loose files in
-    ``inbox/`` plus everything in ``inbox/<case_id>/``. Identical files are listed once.
+    Identical content is listed once, preferring the evidence folder.
     """
     evidence_dir = Path(evidence_dir)
     if not evidence_dir.is_dir():
         log.warning("evidence dir %s does not exist", evidence_dir)
-    roots: list[tuple[Path, bool]] = [(evidence_dir, True)]
-    if inbox_dirs is None:
-        roots += _default_inbox(case_id)
-    else:
-        roots += [(Path(d), True) for d in inbox_dirs]
-
-    docs: list[Document] = []
+    roots: list[tuple[Path, Literal["evidence", "inbox"]]] = [(evidence_dir, "evidence")]
+    if inbox_dir is not None:
+        roots.append((Path(inbox_dir), "inbox"))
+    found: list[FoundFile] = []
     seen: set[str] = set()
-    for root, recursive in roots:
-        for path in _candidate_files(root, recursive):
+    for root, location in roots:
+        for path in _candidate_files(root):
             try:
-                sha = _hash_file(path)
+                sha = hash_file(path)
             except OSError:
                 log.warning("cannot read %s; skipping", path, exc_info=True)
                 continue
             if sha in seen:
                 continue
             seen.add(sha)
-            docs.append(
-                Document(
-                    id=sha[:16],
-                    case_id=case_id,
-                    path=str(path.resolve()),
-                    filename=path.name,
-                    mime=MIME_TYPES[path.suffix.lower()],
-                    sha256=sha,
-                )
-            )
-    return docs
+            rel = path.relative_to(root).as_posix()
+            found.append(FoundFile(path=path, rel_path=rel, location=location, sha256=sha))
+    return found
 
 
-# --------------------------------------------------------------------------- parsing
+# --------------------------------------------------------------------------- format readers
 
 
 def _join_pages(page_texts: list[str]) -> tuple[str, list[Page]]:
@@ -282,31 +278,198 @@ def _decode_text(data: bytes) -> str:
     return data.decode("latin-1")
 
 
-def parse(doc: Document) -> ParsedDocument:
-    """Extract normalized text (and PDF page offsets) from a discovered document."""
-    path = Path(doc.path)
+# --------------------------------------------------------------------------- pages and lines
+
+_PAGE_MARKER_RE = re.compile(r"^[ \t]*\[\s*page\s+(\d{1,5})\s*\][ \t]*$", re.IGNORECASE | re.M)
+_NUMBERED_LINE_RE = re.compile(r"^[ \t]*(\d{1,2})(?:[ \t]+(\S.*))?$")
+_QA_LINE_RE = re.compile(r"^[ \t]*(?:\d{1,2}[ \t]+)?(?:Q|A)[.:][ \t]", re.M)
+_MIN_NUMBERED_LINES = 5  # per page, before we trust printed line numbers
+
+
+def _line_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
+    """``(start, end)`` of each line (without its newline) in ``text[start:end]``."""
+    spans = []
+    pos = start
+    while pos < end:
+        nl = text.find("\n", pos, end)
+        stop = end if nl < 0 else nl
+        spans.append((pos, stop))
+        pos = stop + 1
+    return spans
+
+
+def _printed_lines(text: str, page: Page) -> list[Line]:
+    """Lines with printed line numbers on one page ("  12  Q. ...", or "12" then the line)."""
+    candidates: list[tuple[int, int, int]] = []  # (number, char_start, char_end)
+    pending: int | None = None
+    for s, e in _line_spans(text, page.char_start, page.char_end):
+        raw = text[s:e]
+        if not raw.strip():
+            continue
+        m = _NUMBERED_LINE_RE.match(raw)
+        if m and m.group(2) is None:  # a bare number: the content follows on the next line
+            pending = int(m.group(1))
+            continue
+        if m:
+            candidates.append((int(m.group(1)), s, e))
+        elif pending is not None:
+            candidates.append((pending, s, e))
+        pending = None
+    kept: list[tuple[int, int, int]] = []
+    expected = 1
+    for number, s, e in candidates:
+        skipped_ok = bool(kept) and 0 < number - expected <= 2  # a missing line or two
+        if number == expected or (not kept and number == 2) or skipped_ok:
+            kept.append((number, s, e))
+            expected = number + 1
+    if len(kept) < _MIN_NUMBERED_LINES:
+        return []
+    return [Line(page=page.number, number=n, char_start=s, char_end=e) for n, s, e in kept]
+
+
+def _counted_lines(text: str, page: Page) -> list[Line]:
+    """Non-empty lines of a page numbered 1..n (no printed numbers; marker lines skipped)."""
+    out: list[Line] = []
+    for s, e in _line_spans(text, page.char_start, page.char_end):
+        raw = text[s:e]
+        if not raw.strip() or _PAGE_MARKER_RE.fullmatch(raw):
+            continue
+        out.append(Line(page=page.number, number=len(out) + 1, char_start=s, char_end=e))
+    return out
+
+
+def looks_like_transcript(filename: str, text: str) -> bool:
+    name = filename.lower()
+    if any(w in name for w in ("depo", "transcript", "hearing", "trial")):
+        return True
+    return len(_QA_LINE_RE.findall(text[:20000])) >= 3
+
+
+def _marker_pages(text: str) -> list[Page]:
+    """Pages from ``[Page N]`` marker lines; each page runs to the next marker (or the end)."""
+    marks = list(_PAGE_MARKER_RE.finditer(text))
+    pages: list[Page] = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        stop = end
+        while stop > m.start() and text[stop - 1] in "\n \t":
+            stop -= 1
+        pages.append(Page(number=int(m.group(1)), char_start=m.start(), char_end=stop))
+    return pages
+
+
+def transcript_lines(text: str, pages: list[Page], *, count_if_unnumbered: bool) -> list[Line]:
+    """Printed line numbers per page; else (optionally) non-empty lines counted per page."""
+    printed = [ln for p in pages for ln in _printed_lines(text, p)]
+    if printed:
+        return printed
+    if count_if_unnumbered:
+        return [ln for p in pages for ln in _counted_lines(text, p)]
+    return []
+
+
+# --------------------------------------------------------------------------- parse
+
+
+def parse_file(path: Path, doc: Document) -> ParsedDocument:
+    """Extract normalized text, page offsets and transcript lines from one file (read-only)."""
+    path = Path(path)
     data = path.read_bytes()  # read-only access to evidence
     if _hash_bytes(data) != doc.sha256:
         log.warning("%s changed since discovery (sha256 mismatch)", doc.filename)
     ext = path.suffix.lower()
     pages: list[Page] = []
+    lines: list[Line] = []
     if not data:  # zero-byte file: nothing to parse (and not a corrupt PDF/DOCX)
         text = ""
     elif ext == ".pdf":
-        page_texts = _parse_pdf_docling(path) or _parse_pdf_pymupdf(data)
-        text, pages = _join_pages(page_texts)
-        doc = doc.model_copy(update={"num_pages": len(pages)})
+        raw_pages = _parse_pdf_pymupdf(data)
+        text, pages = _join_pages(raw_pages)
+        lines = transcript_lines(text, pages, count_if_unnumbered=False)
+        if not lines:  # Docling's markdown loses printed line numbers; keep PyMuPDF for those
+            docling_pages = _parse_pdf_docling(path)
+            if docling_pages:
+                text, pages = _join_pages(docling_pages)
     elif ext == ".docx":
         text = normalize_text(_parse_docx(data))
     elif ext == ".eml":
         text = normalize_text(_parse_eml(data))
     elif ext in {".txt", ".md"}:
-        text = normalize_text(_decode_text(data))
+        decoded = _decode_text(data)
+        if "\f" in decoded.strip("\f\n\r \t"):
+            text, pages = _join_pages(decoded.split("\f"))
+        else:
+            text = normalize_text(decoded)
+            pages = _marker_pages(text)
+        if pages:
+            lines = transcript_lines(
+                text, pages, count_if_unnumbered=looks_like_transcript(doc.filename, text)
+            )
     else:
         raise ValueError(f"unsupported file type: {doc.filename}")
     if not text.strip():
         log.warning("%s produced no text (scanned PDF without OCR?)", doc.filename)
-    return ParsedDocument(doc=doc, text=text, pages=pages)
+    if pages:
+        doc = doc.model_copy(update={"pages": len(pages)})
+    return ParsedDocument(doc=doc, text=text, pages=pages, lines=lines)
+
+
+# --------------------------------------------------------------------------- document kind
+
+_KIND_TEXT_RULES: tuple[tuple[str, DocKind], ...] = (
+    (r"\b(?:deposition|transcript) of\b|\breporter'?s transcript\b", "transcript"),
+    (r"^\s*(?:(?:verified|amended|first amended|second amended)\s+)?(?:complaint|petition)\b"
+     r"|^\s*(?:defendants?'?s?\s+)?answer\b|^\s*counterclaims?\b", "pleading"),
+    (r"^\s*(?:notice of\s+)?motion\b|\bmotion (?:to|for|in limine)\b", "motion"),
+    (r"^\s*(?:\[proposed\]\s*)?order\b|\bit is (?:hereby )?ordered\b|\bso ordered\b", "order"),
+    (r"^\s*exhibit\s+[a-z0-9-]+\s*$", "exhibit"),
+)  # fmt: skip
+_EMAIL_HEADER_RE = re.compile(r"^(from|to|subject|sent|date|cc):[ \t]*\S", re.I | re.M)
+_SALUTATION_RE = re.compile(r"^[ \t]*dear\s+\S", re.I | re.M)
+
+
+def _token_kind(t: str) -> DocKind | None:
+    if "depo" in t or "transcript" in t:
+        return "transcript"
+    if any(w in t for w in ("complaint", "counterclaim", "petition", "pleading")) or t == "answer":
+        return "pleading"
+    if "motion" in t or t in ("mtn", "msj", "mtd"):
+        return "motion"
+    if t in ("order", "ruling", "judgment", "decree"):
+        return "order"
+    if "exhibit" in t or t in ("ex", "exh") or re.fullmatch(r"exh?\d+", t):
+        return "exhibit"
+    if "email" in t or t == "mail":
+        return "email"
+    if "letter" in t or t in ("ltr", "correspondence"):
+        return "letter"
+    return None
+
+
+def _kind_from_name(filename: str) -> DocKind | None:
+    """The kind named first in the filename ("order_granting_msj" is an order)."""
+    for t in re.split(r"[^a-z0-9]+", Path(filename).stem.lower()):
+        if t and (kind := _token_kind(t)):
+            return kind
+    return None
+
+
+def detect_kind(filename: str, text: str) -> DocKind:
+    """Guess the document kind from the filename, then the first page (SPEC §6.5)."""
+    if Path(filename).suffix.lower() == ".eml":
+        return "email"
+    if kind := _kind_from_name(filename):
+        return kind
+    head = text[:3000]
+    first_lines = "\n".join(head.split("\n")[:15]).lower()
+    for pattern, kind in _KIND_TEXT_RULES:
+        if re.search(pattern, first_lines, re.M):
+            return kind
+    if len({m.lower() for m in _EMAIL_HEADER_RE.findall(head[:1500])}) >= 3:
+        return "email"
+    if _SALUTATION_RE.search(head):
+        return "letter"
+    return "other"
 
 
 # --------------------------------------------------------------------------- document date

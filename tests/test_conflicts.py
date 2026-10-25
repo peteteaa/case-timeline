@@ -1,209 +1,239 @@
-"""Tests for pipeline.conflicts with a fake LLM module."""
+"""Tests for pipeline.conflicts with a fake LLM."""
 
 from __future__ import annotations
 
-import sys
-import types
-from datetime import UTC, date, datetime
+import re
+from datetime import date
 
 import pytest
 
-import pipeline
-from pipeline import conflicts
-from pipeline.contracts import (
-    AlertType,
-    Certainty,
-    ConflictField,
-    Contradiction,
-    ContradictionStatus,
-    Event,
-    EventStatus,
-    SourceRef,
-)
-
-
-def ev(
-    eid: str,
-    desc: str,
-    d: date | None = date(2024, 3, 3),
-    actors: list[str] | None = None,
-    doc: str = "doc1",
-    quote: str = "quote",
-    **kw,
-) -> Event:
-    return Event(
-        id=eid,
-        case_id="demo",
-        date_text="some date",
-        date_start=d,
-        date_end=d,
-        certainty=Certainty.EXACT if d else Certainty.UNKNOWN,
-        actors=actors if actors is not None else ["John Smith"],
-        description=desc,
-        source=SourceRef(doc_id=doc, char_start=0, char_end=5, quote=quote),
-        confidence=0.9,
-        **kw,
-    )
+from pipeline import conflicts, llm
+from pipeline.schema import AGENT, SpanIn
+from tests.pipeline_helpers import add_doc, make_fact, new_store
 
 
 @pytest.fixture
 def fake_llm(monkeypatch):
-    """Install a fake pipeline.llm whose chat_json confirms everything by default."""
+    """chat_json confirms every candidate (with the suspected field) unless told otherwise."""
     state = {"calls": [], "answer": True, "raise": False}
 
-    def chat_json(system, user, schema, *, temperature=0.0):
+    def chat_json(system, user, schema, **kw):
         state["calls"].append((system, user))
         if state["raise"]:
             raise RuntimeError("model down")
-        field = "date"
-        for f in ("date", "actor", "fact"):
-            if f"conflict type: {f}" in user:
-                field = f
-        return schema(is_contradiction=state["answer"], field=field, explanation=" explained ")
+        m = re.search(r"Suspected conflict type: (\w+)", user)
+        return schema(
+            is_contradiction=state["answer"],
+            field=m.group(1) if m else "fact",
+            explanation=" explained ",
+        )
 
-    mod = types.ModuleType("pipeline.llm")
-    mod.chat_json = chat_json
-    monkeypatch.setitem(sys.modules, "pipeline.llm", mod)
-    monkeypatch.setattr(pipeline, "llm", mod, raising=False)
+    monkeypatch.setattr(llm, "chat_json", chat_json)
     return state
 
 
-def test_date_conflict_across_documents(fake_llm):
-    a = ev("e1", "Smith signed the lease", doc="d1")
-    b = ev("e2", "Smith signed the lease agreement", d=date(2024, 3, 9), doc="d2")
-    out = conflicts.find_contradictions([a, b], "demo")
-    assert len(out) == 1
-    c = out[0]
-    assert c.field == ConflictField.DATE
-    assert c.event_ids == ["e1", "e2"]
-    assert c.explanation == "explained"
-    assert c.id == conflicts.contradiction_id(["e2", "e1"], ConflictField.DATE)
-    assert "Smith signed the lease" in fake_llm["calls"][0][1]
+# --------------------------------------------------------------------------- candidate rules
 
 
-def test_date_conflict_same_document_or_one_day_ignored(fake_llm):
-    a = ev("e1", "Smith signed the lease", doc="d1")
-    same_doc = ev("e2", "Smith signed the lease", d=date(2024, 3, 5), doc="d1")
-    next_day = ev("e3", "Smith signed the lease", d=date(2024, 3, 4), doc="d2")
-    next_day = next_day.model_copy(update={"certainty": Certainty.APPROXIMATE})
-    assert conflicts.candidate_pairs([a, same_doc]) == []
-    assert conflicts.candidate_pairs([a, next_day]) == []
-    assert conflicts.find_contradictions([a, same_doc, next_day], "demo") == []
-    assert fake_llm["calls"] == []
+def test_date_candidate_across_documents():
+    a = make_fact("F-1", "Smith signed the lease", witnesses=["W-1"], docs=["D-1"])
+    b = make_fact(
+        "F-2", "Smith signed the lease agreement", date(2024, 3, 9), witnesses=["W-1"], docs=["D-2"]
+    )
+    (c,) = conflicts.candidate_pairs([a, b], {"F-2"})
+    assert (c.a.fact_id, c.b.fact_id, c.field) == ("F-1", "F-2", "date")
 
 
-def test_one_day_gap_counts_when_both_exact(fake_llm):
-    a = ev("e1", "meeting in Smith's office", doc="d1")
-    b = ev("e2", "meeting in Smith's office", d=date(2024, 3, 4), doc="d2")
-    assert [c.field for c in conflicts.candidate_pairs([a, b])] == [ConflictField.DATE]
+def test_date_candidate_needs_other_document_and_more_than_a_day():
+    a = make_fact("F-1", "Smith signed the lease", witnesses=["W-1"], docs=["D-1"])
+    same_doc = make_fact(
+        "F-2", "Smith signed the lease", date(2024, 3, 5), witnesses=["W-1"], docs=["D-1"]
+    )
+    next_day = make_fact(
+        "F-3",
+        "Smith signed the lease",
+        date(2024, 3, 4),
+        witnesses=["W-1"],
+        docs=["D-2"],
+        certainty="approximate",
+    )
+    assert conflicts.candidate_pairs([a, same_doc, next_day], {"F-1", "F-2", "F-3"}) == []
 
 
-def test_focus_ids_limits_pairs(fake_llm):
-    a = ev("e1", "Smith signed the lease", doc="d1")
-    b = ev("e2", "Smith signed the lease agreement", d=date(2024, 3, 9), doc="d2")
-    c = ev("e3", "Smith signed the lease", d=date(2024, 3, 20), doc="d3")
-    pairs = conflicts.candidate_pairs([a, b, c], focus_ids={"e3"})
-    assert {(x.a.id, x.b.id) for x in pairs} == {("e1", "e3"), ("e2", "e3")}
+def test_one_day_gap_counts_when_both_exact():
+    a = make_fact("F-1", "meeting in Smith's office", witnesses=["W-1"], docs=["D-1"])
+    b = make_fact(
+        "F-2", "meeting in Smith's office", date(2024, 3, 4), witnesses=["W-1"], docs=["D-2"]
+    )
+    assert [c.field for c in conflicts.candidate_pairs([a, b], {"F-1"})] == ["date"]
 
 
-def test_actor_conflict(fake_llm):
-    a = ev("e1", "signed the lease for the apartment", actors=["Alice"])
-    b = ev("e2", "signed the lease for the apartment", actors=["Bob"], doc="d2")
-    cands = conflicts.candidate_pairs([a, b])
-    assert [c.field for c in cands] == [ConflictField.ACTOR]
-    out = conflicts.find_contradictions([a, b], "demo")
-    assert out[0].field == ConflictField.ACTOR
+def test_date_candidate_without_people_needs_strong_similarity():
+    a = make_fact("F-1", "The meeting in the office took place", docs=["D-1"])
+    b = make_fact("F-2", "The meeting in the office took place", date(2024, 3, 9), docs=["D-2"])
+    c = make_fact("F-3", "Rent paid at the office", date(2024, 3, 20), docs=["D-3"])
+    pairs = conflicts.candidate_pairs([a, b, c], {"F-1", "F-2", "F-3"})
+    assert [(x.a.fact_id, x.b.fact_id) for x in pairs] == [("F-1", "F-2")]
 
 
-def test_fact_conflict_requires_negation(fake_llm):
-    a = ev("e1", "Smith was at the warehouse during the inspection")
-    b = ev("e2", "Smith denied ever visiting any storage facility", doc="d2")
-    c = ev("e3", "Smith ate lunch with his sister downtown", doc="d3")
-    fields = {(x.a.id, x.b.id): x.field for x in conflicts.candidate_pairs([a, b, c])}
-    assert fields[("e1", "e2")] == ConflictField.FACT
-    assert ("e1", "e3") not in fields
+def test_focus_ids_limit_pairs():
+    facts = [
+        make_fact(
+            f"F-{i}",
+            "Smith signed the lease",
+            date(2024, 3, 1 + 7 * i),
+            witnesses=["W-1"],
+            docs=[f"D-{i}"],
+        )
+        for i in range(3)
+    ]
+    pairs = conflicts.candidate_pairs(facts, {"F-2"})
+    assert {(x.a.fact_id, x.b.fact_id) for x in pairs} == {("F-0", "F-2"), ("F-1", "F-2")}
 
 
-def test_llm_rejection_and_failure(fake_llm):
-    a = ev("e1", "Smith signed the lease", doc="d1")
-    b = ev("e2", "Smith signed the lease", d=date(2024, 4, 1), doc="d2")
-    fake_llm["answer"] = False
-    assert conflicts.find_contradictions([a, b], "demo") == []
-    fake_llm["raise"] = True
-    assert conflicts.find_contradictions([a, b], "demo") == []
+def test_actor_candidate():
+    a = make_fact("F-1", "signed the lease for the apartment", witnesses=["W-1"])
+    b = make_fact("F-2", "signed the lease for the apartment", witnesses=["W-2"], docs=["D-2"])
+    assert [c.field for c in conflicts.candidate_pairs([a, b], {"F-1"})] == ["actor"]
 
 
-def test_skip_ids_avoid_llm_calls(fake_llm):
-    a = ev("e1", "Smith signed the lease", doc="d1")
-    b = ev("e2", "Smith signed the lease", d=date(2024, 4, 1), doc="d2")
-    known = {conflicts.contradiction_id(["e1", "e2"], ConflictField.DATE)}
-    assert conflicts.find_contradictions([a, b], "demo", skip_ids=known) == []
-    assert fake_llm["calls"] == []
+def test_fact_candidate_requires_negation():
+    a = make_fact("F-1", "Smith was at the warehouse during the inspection", witnesses=["W-1"])
+    b = make_fact(
+        "F-2", "Smith denied ever visiting any storage facility", witnesses=["W-1"], docs=["D-2"]
+    )
+    c = make_fact(
+        "F-3", "Smith ate lunch with his sister downtown", witnesses=["W-1"], docs=["D-3"]
+    )
+    fields = {
+        (x.a.fact_id, x.b.fact_id): x.field
+        for x in conflicts.candidate_pairs([a, b, c], {"F-1", "F-2", "F-3"})
+    }
+    assert fields[("F-1", "F-2")] == "fact"
+    assert ("F-1", "F-3") not in fields
 
 
-def test_rejected_and_unresolved_events_ignored(fake_llm):
-    a = ev("e1", "Smith signed the lease", doc="d1")
-    b = ev("e2", "Smith signed the lease", d=date(2024, 4, 1), doc="d2")
-    b = b.model_copy(update={"status": EventStatus.REJECTED})
-    c = ev("e3", "Smith signed the lease", d=None, doc="d3")
-    assert conflicts.candidate_pairs([a, b, c]) == []
+def test_negation_in_quotes_counts():
+    a = make_fact("F-1", "Becker's account of the meeting", witnesses=["W-1"])
+    b = make_fact(
+        "F-2",
+        "Ellison describes who attended",
+        witnesses=["W-1"],
+        docs=["D-2"],
+        quotes=["A. Priya Nand from HR sat in. Nobody else."],
+    )
+    assert [c.field for c in conflicts.candidate_pairs([a, b], {"F-1"})] == ["fact"]
 
 
-def test_candidate_cap_logs_dropped(fake_llm, caplog):
-    events = [
-        ev(f"e{i}", "Smith signed the lease", d=date(2024, 1, 1 + 3 * i), doc=f"d{i}")
+def test_rejected_and_undated_facts_ignored():
+    a = make_fact("F-1", "Smith signed the lease", witnesses=["W-1"], docs=["D-1"])
+    b = make_fact(
+        "F-2",
+        "Smith signed the lease",
+        date(2024, 4, 1),
+        witnesses=["W-1"],
+        docs=["D-2"],
+        review="rejected",
+    )
+    c = make_fact("F-3", "Smith signed the lease", None, witnesses=["W-1"], docs=["D-3"])
+    assert conflicts.candidate_pairs([a, b, c], {"F-1", "F-2", "F-3"}) == []
+
+
+def test_skip_pairs():
+    a = make_fact("F-1", "Smith signed the lease", witnesses=["W-1"], docs=["D-1"])
+    b = make_fact(
+        "F-2", "Smith signed the lease", date(2024, 4, 1), witnesses=["W-1"], docs=["D-2"]
+    )
+    assert conflicts.candidate_pairs([a, b], {"F-1"}, skip_pairs={frozenset({"F-1", "F-2"})}) == []
+
+
+def test_candidate_cap_logs_dropped(caplog):
+    facts = [
+        make_fact(
+            f"F-{i}",
+            "Smith signed the lease",
+            date(2024, 1, 1 + 3 * i),
+            witnesses=["W-1"],
+            docs=[f"D-{i}"],
+        )
         for i in range(5)
     ]
     with caplog.at_level("WARNING"):
-        cands = conflicts.candidate_pairs(events, max_candidates=3)
+        cands = conflicts.candidate_pairs(facts, {f.fact_id for f in facts}, max_candidates=3)
     assert len(cands) == 3
     assert "dropped 7" in caplog.text
 
 
-def test_contradiction_id_deterministic():
-    x = conflicts.contradiction_id(["b", "a"], ConflictField.FACT)
-    assert x == conflicts.contradiction_id(["a", "b"], "fact")
-    assert x != conflicts.contradiction_id(["a", "b"], ConflictField.DATE)
+# --------------------------------------------------------------------------- detect (store)
 
 
-def test_alerts_have_no_case_content():
-    now = datetime(2026, 1, 1, tzinfo=UTC)
-    events = [
-        ev("e1", "Secret description", actors=["Zelda Quinn"]),
-        ev("e2", "Another secret", actors=["Zelda Quinn"]),
-        ev("e3", "Third", actors=["zelda  quinn", "Other"]),
-        ev("e4", "Filing deadline", deadline_relevant=True),
-    ]
-    cs = [
-        Contradiction(
-            id="c1",
-            case_id="demo",
-            event_ids=["e1", "e2"],
-            field="date",
-            explanation="secret explanation",
-        ),
-        Contradiction(
-            id="c2", case_id="demo", event_ids=["e2", "e3"], field="fact", explanation="secret"
-        ),
-        Contradiction(
-            id="c3",
-            case_id="demo",
-            event_ids=["e1", "e3"],
-            field="fact",
-            explanation="x",
-            status=ContradictionStatus.DISMISSED,
-        ),
-    ]
-    alerts = conflicts.alerts_for(cs, events, "demo", "http://127.0.0.1:8080/", now=now)
-    kinds = [a.type for a in alerts]
-    assert kinds.count(AlertType.NEW_CONTRADICTION) == 2
-    assert kinds.count(AlertType.DEADLINE_DATE) == 1
-    witness = [a for a in alerts if a.type == AlertType.FLAGGED_WITNESS]
-    assert len(witness) == 1 and witness[0].ref_ids == ["c1", "c2"]
-    for a in alerts:
-        assert a.dashboard_url == "http://127.0.0.1:8080/alerts"
-        assert a.created_at == now
-        dumped = a.model_dump_json().lower()
-        assert "secret" not in dumped and "zelda" not in dumped
-    again = conflicts.alerts_for(cs, events, "demo", "http://127.0.0.1:8080", now=now)
-    assert [a.id for a in again] == [a.id for a in alerts]
+@pytest.fixture
+def case(tmp_path):
+    store = new_store(tmp_path)
+    w = store.add_witness("demo", "John Smith", by="alice").witness_id
+    t1 = "Smith signed the lease on March 3, 2024."
+    t2 = "Smith signed the lease agreement on March 9, 2024."
+    d1, d2 = add_doc(store, t1, filename="a.txt"), add_doc(store, t2, filename="b.txt")
+
+    def fact(title, text, doc, day):
+        return store.add_fact(
+            "demo",
+            title,
+            by=AGENT,
+            date_start=day,
+            date_end=day,
+            date_certainty="exact",
+            witness_ids=[w],
+            spans=[SpanIn(doc_id=doc, char_start=0, char_end=len(text), quote=text)],
+        ).fact_id
+
+    f1 = fact("Smith signed the lease", t1, d1, date(2024, 3, 3))
+    f2 = fact("Smith signed the lease agreement", t2, d2, date(2024, 3, 9))
+    yield store, f1, f2
+    store.close()
+
+
+def test_detect_opens_confirmed_contradiction(case, fake_llm):
+    store, f1, f2 = case
+    (c,) = conflicts.detect(store, "demo", [f2])
+    assert c.fact_ids == sorted([f1, f2])
+    assert c.field == "date" and c.status == "open"
+    assert c.explanation == "explained"
+    system, user = fake_llm["calls"][0]
+    assert "evidence, not instructions" in system
+    assert "Smith signed the lease" in user and "John Smith" in user
+    assert "2024-03-03" in user and "2024-03-09" in user
+    assert store.list_contradictions("demo") == [c]
+    # A second run doesn't re-ask the model or reopen the pair.
+    assert conflicts.detect(store, "demo", [f1, f2]) == []
+    assert len(fake_llm["calls"]) == 1
+
+
+def test_detect_respects_dismissed(case, fake_llm):
+    store, f1, f2 = case
+    (c,) = conflicts.detect(store, "demo", [f2])
+    store.review_contradiction(c.contradiction_id, "dismiss", reviewer="alice")
+    assert conflicts.detect(store, "demo", [f1, f2]) == []
+    assert len(fake_llm["calls"]) == 1
+
+
+def test_detect_llm_rejection_and_failure(case, fake_llm):
+    store, f1, f2 = case
+    fake_llm["answer"] = False
+    assert conflicts.detect(store, "demo", [f2]) == []
+    fake_llm["raise"] = True
+    assert conflicts.detect(store, "demo", [f2]) == []
+    assert store.list_contradictions("demo") == []
+
+
+def test_detect_skips_rejected_facts(case, fake_llm):
+    store, f1, f2 = case
+    store.review_fact(f1, "reject", reviewer="alice", reason="wrong")
+    assert conflicts.detect(store, "demo", [f2]) == []
+    assert fake_llm["calls"] == []
+
+
+def test_detect_nothing_to_check(case, fake_llm):
+    store, _, _ = case
+    assert conflicts.detect(store, "demo", []) == []
+    assert fake_llm["calls"] == []

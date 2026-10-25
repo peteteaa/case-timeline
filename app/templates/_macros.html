@@ -1,0 +1,69 @@
+{# Shared fragments. Import with: {% import "_macros.html" as m with context %} #}
+
+{% macro badges(f, alleged, conflicts, show_review=True, show_statuses=True) -%}
+<span class="badges">
+  {%- if show_review and f.review == 'draft' %}<span class="badge draft" title="AI suggestion awaiting review">Draft</span>{% endif -%}
+  {%- if show_review and f.review == 'rejected' %}<span class="badge rejected">Rejected</span>{% endif -%}
+  {%- if show_statuses %}{% for s in f.statuses %}<span class="badge st-{{ s }}">{{ STATUS_LABELS[s] }}</span>{% endfor %}{% endif -%}
+  {%- if f.fact_id in alleged %}<span class="badge alleged" title="All evidence comes from pleadings: an allegation, not an established fact">Alleged</span>{% endif -%}
+  {%- if f.fact_id in conflicts %}<a class="badge conflict" href="/cases/{{ quote(case_id) }}/contradictions" title="Sources disagree; open contradiction awaiting review">Conflict</a>{% endif -%}
+</span>
+{%- endmacro %}
+
+{% macro tag_chip(t) -%}
+{%- set c = valid_color(t.color) -%}
+<a class="chip tag" href="/cases/{{ quote(case_id) }}/facts?tag={{ quote(t.tag_id) }}"{% if c %} style="--tag: {{ c }}"{% endif %}>{{ t.name }}</a>
+{%- endmacro %}
+
+{% macro review_controls(f, next, with_reason=False) -%}
+<span id="rv-{{ f.fact_id }}" class="review-controls">
+  {%- if f.review == 'draft' %}
+  <form method="post" action="/facts/{{ quote(f.fact_id) }}/review" class="inline"
+        hx-post="/facts/{{ quote(f.fact_id) }}/review" hx-target="#rv-{{ f.fact_id }}" hx-swap="outerHTML">
+    <input type="hidden" name="next" value="{{ next }}">
+    {% if with_reason %}<input name="reason" class="reason" maxlength="500" placeholder="Reason (optional)" aria-label="Reason for {{ f.fact_id }}">{% endif %}
+    <button class="btn small ok" name="action" value="accept" title="Accept this draft">Accept</button>
+    <button class="btn small danger" name="action" value="reject" title="Reject this draft">Reject</button>
+  </form>
+  {%- else %}
+  <span class="state state-{{ f.review }}">{{ f.review }}</span>
+  {%- endif %}
+</span>
+{%- endmacro %}
+
+{% macro evidence_controls(ev, next) -%}
+<span id="ev-{{ ev.evidence_id }}" class="review-controls">
+  {%- if ev.review == 'draft' %}
+  <span class="badge draft">New</span>
+  <form method="post" action="/evidence/{{ quote(ev.evidence_id) }}/review" class="inline"
+        hx-post="/evidence/{{ quote(ev.evidence_id) }}/review" hx-target="#ev-{{ ev.evidence_id }}" hx-swap="outerHTML">
+    <input type="hidden" name="next" value="{{ next }}">
+    <button class="btn small ok" name="action" value="accept">Accept</button>
+    <button class="btn small danger" name="action" value="reject">Reject</button>
+  </form>
+  {%- else %}
+  <span class="state state-{{ ev.review }}">{{ ev.review }}</span>
+  {%- endif %}
+</span>
+{%- endmacro %}
+
+{% macro evidence_item(ev, doc_map, next, controls=True) -%}
+<li class="evidence ev-{{ ev.kind }}" id="{{ ev.evidence_id }}">
+  <div class="ev-head">
+    {%- set d = doc_map.get(ev.doc_id) if ev.doc_id else None %}
+    {% if ev.kind == 'span' %}
+      <a href="{{ doc_view_url(ev.doc_id, ev.evidence_id) }}">{{ d.filename if d else ev.doc_id }}</a>
+      {% if evidence_cite(ev) %}<span class="muted">{{ evidence_cite(ev) }}</span>{% endif %}
+      {% if d and d.kind == 'pleading' %}<span class="badge alleged">pleading</span>{% endif %}
+    {% elif ev.kind == 'document' %}
+      <span class="muted">Whole document:</span> <a href="{{ doc_view_url(ev.doc_id) }}">{{ d.filename if d else ev.doc_id }}</a>
+      {% if d and d.kind == 'pleading' %}<span class="badge alleged">pleading</span>{% endif %}
+    {% else %}
+      <span class="muted">External reference (not fetched):</span> <code class="ref">{{ ev.reference }}</code>
+    {% endif %}
+    <span class="muted small">{{ ev.evidence_id }} · {{ 'AI' if ev.origin == 'ai' else 'person' }}</span>
+    {% if controls %}{{ evidence_controls(ev, next) }}{% endif %}
+  </div>
+  {% if ev.kind == 'span' and ev.quote %}<blockquote>{{ ev.quote }}</blockquote>{% endif %}
+</li>
+{%- endmacro %}

@@ -1,18 +1,19 @@
-import importlib
-import sys
-import types
+"""Tests for pipeline.extract with a fake LLM."""
+
+from __future__ import annotations
 
 import pytest
 
-from pipeline import extract
-from pipeline.contracts import Document, EventStatus, Page, ParsedDocument
+from pipeline import extract, llm
 from pipeline.extract import (
-    ExtractedEvent,
+    ExtractedFact,
     ExtractionResult,
     chunk_text,
-    event_id,
-    extract_events,
+    clean_people,
+    draft_facts,
+    draft_key,
 )
+from tests.pipeline_helpers import make_parsed
 
 TEXT = (
     "Acme Corp. hired John Smith on March 3, 2024.\n\n"
@@ -21,21 +22,8 @@ TEXT = (
 )
 
 
-def make_parsed(text: str = TEXT, pages: list[Page] | None = None) -> ParsedDocument:
-    doc = Document(
-        id="doc0000000000001",
-        case_id="demo",
-        path="/evidence/memo.txt",
-        filename="memo.txt",
-        mime="text/plain",
-        sha256="0" * 64,
-    )
-    return ParsedDocument(doc=doc, text=text, pages=pages or [])
-
-
 @pytest.fixture
 def fake_llm(monkeypatch: pytest.MonkeyPatch):
-    """Patch pipeline.llm.chat_json (or install a stub module if llm.py is unavailable)."""
     calls: list[tuple[str, str, type]] = []
     responses: list[object] = []
 
@@ -46,100 +34,111 @@ def fake_llm(monkeypatch: pytest.MonkeyPatch):
             raise item
         return item
 
-    try:
-        llm = importlib.import_module("pipeline.llm")
-    except Exception:
-        llm = types.ModuleType("pipeline.llm")
-        monkeypatch.setitem(sys.modules, "pipeline.llm", llm)
-    monkeypatch.setattr(llm, "chat_json", chat_json, raising=False)
+    monkeypatch.setattr(llm, "chat_json", chat_json)
     return calls, responses
 
 
-def test_extract_converts_to_events(fake_llm) -> None:
+def test_extract_converts_to_drafts(fake_llm) -> None:
     calls, responses = fake_llm
     responses.append(
         ExtractionResult(
-            events=[
-                ExtractedEvent(
-                    quote="Acme Corp. hired John Smith on March 3, 2024.",
+            facts=[
+                ExtractedFact(
+                    title="  Acme hires   John Smith ",
+                    details="Smith joins Acme.",
                     date_text="March 3, 2024",
-                    actors=["Acme Corp.", "John Smith", "John Smith", " "],
-                    description="Acme Corp. hired John Smith.",
+                    people=["Acme Corp.", "John Smith", "john smith", " ", "he"],
+                    quotes=["Acme Corp. hired John Smith on March 3, 2024.", ""],
                     confidence=0.9,
                 ),
-                ExtractedEvent(
-                    quote="The answer is due no later than April 1, 2024.",
+                ExtractedFact(
+                    title="Answer deadline",
                     date_text="no later than April 1, 2024",
-                    description="Answer deadline.",
-                    deadline_relevant=True,
+                    quotes=["The answer is due no later than April 1, 2024."],
+                    deadline_language=True,
                 ),
+                ExtractedFact(title="Undated fact", quotes=["Smith emailed Jane Doe"]),
             ]
         )
     )
-    parsed = make_parsed(
-        pages=[
-            Page(number=1, char_start=0, char_end=60),
-            Page(number=2, char_start=60, char_end=len(TEXT)),
-        ]
-    )
-    events = extract_events(parsed)
+    parsed = make_parsed(TEXT)
+    drafts = draft_facts(parsed)
 
     assert len(calls) == 1
     system, user, schema = calls[0]
     assert schema is ExtractionResult
     assert "verbatim" in system.lower()
+    assert "evidence, not instructions" in system
     assert "memo.txt" in user and "Acme Corp. hired" in user
 
-    first, second = events
-    assert first.id == event_id(parsed.doc.id, first.source.quote, "March 3, 2024")
-    assert len(first.id) == 16 and int(first.id, 16) >= 0
-    assert first.case_id == "demo"
-    assert first.actors == ["Acme Corp.", "John Smith"]
-    assert first.status == EventStatus.PROPOSED
-    assert first.date_start is None  # dates are resolved later
-    assert TEXT[first.source.char_start : first.source.char_end] == first.source.quote
-    assert first.source.page == 1
-    assert second.deadline_relevant is True
-    assert second.source.page == 2
-    assert TEXT[second.source.char_start : second.source.char_end] == second.source.quote
+    first, second, third = drafts
+    assert first.title == "Acme hires John Smith"
+    assert first.details == "Smith joins Acme."
+    assert first.key == draft_key(parsed.doc.doc_id, first.quotes[0], first.title)
+    assert len(first.key) == 16
+    assert first.people == ["John Smith"]
+    assert first.quotes == ["Acme Corp. hired John Smith on March 3, 2024."]
+    assert first.spans == [] and first.date_start is None  # verify and dates come later
+    assert second.deadline_language is True
+    assert third.date_text is None and third.details is None
+    assert len({d.key for d in drafts}) == 3
 
 
-def test_ids_are_deterministic_and_whitespace_insensitive() -> None:
-    a = event_id("d", "Smith  emailed\nDoe.", "May 1, 2024")
-    b = event_id("d", "Smith emailed Doe.", " May 1, 2024 ")
+def test_draft_keys_are_deterministic_and_whitespace_insensitive() -> None:
+    a = draft_key("D-1", "Smith  emailed\nDoe.", "Smith emails Doe")
+    b = draft_key("D-1", "Smith emailed Doe.", " smith emails  doe ")
     assert a == b
-    assert a != event_id("other", "Smith emailed Doe.", "May 1, 2024")
+    assert a != draft_key("D-2", "Smith emailed Doe.", "Smith emails Doe")
+    assert a != draft_key("D-1", "Smith emailed Doe.", "Another title")
 
 
-def test_unlocated_quote_points_at_chunk(fake_llm) -> None:
+def test_clean_people() -> None:
+    names = [
+        "Dana Rivera",
+        "dana  rivera",
+        "Halvorsen Freight Co.",
+        "Lakeview Police Department",
+        "she",
+        "",
+        "HR",
+        "Officer Jamie Ortiz",
+        "123",
+    ]
+    assert clean_people(names) == ["Dana Rivera", "Officer Jamie Ortiz"]
+
+
+def test_drafts_without_title_dropped_without_quotes_kept(fake_llm) -> None:
     _, responses = fake_llm
     responses.append(
         ExtractionResult(
-            events=[
-                ExtractedEvent(
-                    quote="Smith e-mailed Doe regarding the invoice",
-                    date_text="two days after the meeting",
-                    description="Smith emailed Doe.",
-                )
+            facts=[
+                ExtractedFact(title="  ", quotes=["Acme Corp. hired John Smith"]),
+                ExtractedFact(title="No quote", quotes=[]),
             ]
         )
     )
-    (event,) = extract_events(make_parsed())
-    assert (event.source.char_start, event.source.char_end) == (0, len(TEXT))
-    assert event.source.page is None
+    (only,) = draft_facts(make_parsed(TEXT))
+    assert only.title == "No quote" and only.quotes == []  # verify discards and counts it
 
 
-def test_empty_quote_or_description_dropped(fake_llm) -> None:
+def test_same_quote_different_facts_in_one_chunk_are_kept(fake_llm) -> None:
     _, responses = fake_llm
+    quote = "Two days after the meeting, Smith emailed Jane Doe about the invoice."
     responses.append(
         ExtractionResult(
-            events=[
-                ExtractedEvent(quote="  ", date_text="March 3, 2024", description="x"),
-                ExtractedEvent(quote="Acme Corp.", date_text="March 3, 2024", description=" "),
+            facts=[
+                ExtractedFact(
+                    title="Smith emails Doe", date_text="Two days after the meeting", quotes=[quote]
+                ),
+                ExtractedFact(
+                    title="Invoice discussed",
+                    date_text="Two days after the meeting",
+                    quotes=[quote],
+                ),
             ]
         )
     )
-    assert extract_events(make_parsed()) == []
+    assert len(draft_facts(make_parsed(TEXT))) == 2
 
 
 def test_overlapping_chunks_are_deduped(fake_llm, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -150,41 +149,39 @@ def test_overlapping_chunks_are_deduped(fake_llm, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(extract, "CHUNK_SIZE", 1500)
     monkeypatch.setattr(extract, "CHUNK_OVERLAP", 400)
     spans = chunk_text(text, 1500, 400)
-    in_chunks = [s for s in spans if key in text[s[0] : s[1]]]
-    assert len(in_chunks) >= 2  # the key paragraph sits in the overlap
-
-    def result(conf: float, actors: list[str], deadline: bool) -> ExtractionResult:
-        return ExtractionResult(
-            events=[
-                ExtractedEvent(
-                    quote=key,
-                    date_text="May 5, 2024",
-                    actors=actors,
-                    description="Court hearing held.",
-                    confidence=conf,
-                    deadline_relevant=deadline,
-                )
-            ]
-        )
+    assert len([s for s in spans if key in text[s[0] : s[1]]]) >= 2  # in the overlap
 
     sightings = 0
     for s in spans:
         if key in text[s[0] : s[1]]:
             sightings += 1
             first = sightings == 1
-            actors = ["Court"] if first else ["Court", "Smith"]
-            responses.append(result(0.6 if first else 0.8, actors, first))
+            responses.append(
+                ExtractionResult(
+                    facts=[
+                        ExtractedFact(
+                            # the model words the title differently in each chunk
+                            title="Court holds hearing" if first else "Hearing held by court",
+                            date_text="May 5, 2024",
+                            people=["Judge Ann Lee"] if first else ["Judge Ann Lee", "Bo Smith"],
+                            quotes=[key],
+                            confidence=0.6 if first else 0.8,
+                            deadline_language=first,
+                        )
+                    ]
+                )
+            )
         else:
             responses.append(ExtractionResult())
 
-    events = extract_events(make_parsed(text))
+    drafts = draft_facts(make_parsed(text))
     assert len(calls) == len(spans)
-    assert len(events) == 1
-    (event,) = events
-    assert event.confidence == 0.8
-    assert event.actors == ["Court", "Smith"]
-    assert event.deadline_relevant is True
-    assert text[event.source.char_start : event.source.char_end] == key
+    (draft,) = drafts
+    assert draft.confidence == 0.8
+    assert draft.title == "Hearing held by court"  # the more confident sighting
+    assert draft.people == ["Judge Ann Lee", "Bo Smith"]
+    assert draft.deadline_language is True
+    assert draft.quotes == [key]
 
 
 def test_one_failed_chunk_is_skipped(fake_llm, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -196,19 +193,19 @@ def test_one_failed_chunk_is_skipped(fake_llm, monkeypatch: pytest.MonkeyPatch) 
     assert n > 1
     responses.append(RuntimeError("model hiccup"))
     responses.extend(ExtractionResult() for _ in range(n - 1))
-    assert extract_events(make_parsed(text)) == []
+    assert draft_facts(make_parsed(text)) == []
 
 
 def test_all_chunks_failing_raises(fake_llm) -> None:
     _, responses = fake_llm
     responses.append(ConnectionError("vLLM down"))
     with pytest.raises(ConnectionError):
-        extract_events(make_parsed())
+        draft_facts(make_parsed(TEXT))
 
 
 def test_empty_document_makes_no_calls(fake_llm) -> None:
     calls, _ = fake_llm
-    assert extract_events(make_parsed("")) == []
+    assert draft_facts(make_parsed("")) == []
     assert calls == []
 
 
@@ -248,7 +245,13 @@ def test_bad_overlap_rejected() -> None:
 
 @pytest.mark.llm
 def test_live_extraction_quotes_are_verbatim() -> None:
-    events = extract_events(make_parsed())
-    assert events
-    for e in events:
-        assert e.source.quote in TEXT or e.source.char_end - e.source.char_start == len(TEXT)
+    from pipeline.verify import verify_drafts
+
+    parsed = make_parsed(TEXT)
+    drafts = draft_facts(parsed)
+    assert drafts
+    verified, counts = verify_drafts(parsed, drafts)
+    assert verified
+    for d in verified:
+        for s in d.spans:
+            assert TEXT[s.char_start : s.char_end] == s.quote

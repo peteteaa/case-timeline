@@ -1,20 +1,99 @@
 {% extends "base.html" %}
-{% block title %}Source{% endblock %}
+{% import "_macros.html" as m with context %}
+{% block title %}{{ doc.filename }}{% endblock %}
 {% block content %}
+{% set base = '/cases/' ~ quote(case_id) %}
+{% set durl = doc_view_url(doc.doc_id) %}
+<p class="crumbs"><a href="{{ base }}/documents">← Documents</a></p>
 <section class="page-head">
-  <h1>Source: {{ doc.filename if doc and doc.filename else doc_id }}</h1>
-  <a class="btn" href="/timeline">Back to timeline</a>
+  <div>
+    <h1>{{ doc.filename }}</h1>
+    <p class="muted small">{{ doc.doc_id }} · {{ doc.location }} · {{ doc.pages or '?' }} page{{ '' if doc.pages == 1 else 's' }} · {{ doc.parse_status }}
+      {% if info.kind_set_by %}· kind set by {{ info.kind_set_by }}{% endif %}</p>
+  </div>
+  <div class="head-actions">
+    <form method="post" action="/documents/{{ quote(doc.doc_id) }}/kind" class="inline-form">
+      <input type="hidden" name="next" value="{{ here }}">
+      <label class="small">Kind
+        <select name="kind" data-autosubmit>{% for k in DOC_KINDS %}<option value="{{ k }}" {% if doc.kind == k %}selected{% endif %}>{{ k }}</option>{% endfor %}</select>
+      </label>
+      <button class="btn small">Save kind</button>
+    </form>
+    <form method="post" action="/documents/{{ quote(doc.doc_id) }}/reprocess" data-confirm="Draft facts from this document again? Unreviewed AI drafts that cite only this document are replaced; reviewed facts are kept.">
+      <button class="btn small">Reprocess</button>
+    </form>
+  </div>
 </section>
-{% if e %}
-<section class="card">
-  <table class="events"><tbody>{% include "_event_row.html" %}</tbody></table>
-</section>
-{% endif %}
-{% if requested and not highlighted %}
-<p class="notice">The cited span could not be located in this document; showing full text.</p>
-{% elif highlighted %}
-<p class="muted small">Highlighted quote{% if page %} on page {{ page }}{% endif %}. <a href="#hl">Jump to quote</a></p>
-{% endif %}
-<article class="card doc-text" id="doc-text"><pre>{{ body }}</pre></article>
+{% if doc.kind == 'pleading' %}<p class="notice">This is a pleading: facts supported only by pleadings are labeled “alleged”.</p>{% endif %}
+{% if requested and not ev %}<p class="notice">The requested evidence {{ requested }} does not point into this document.</p>{% endif %}
+
+<div class="source-layout">
+  <section class="card doc-text" id="doc-text">
+    {% if ev %}
+    <div class="cited-bar">
+      <span>Cited for <a href="{{ fact_url(ev_fact.fact_id) }}">{{ ev_fact.fact_id }} {{ ev_fact.title }}</a>{% if evidence_cite(ev) %} · {{ evidence_cite(ev) }}{% endif %}</span>
+      <button type="button" class="btn small" data-scroll-to="hl">Show quote</button>
+    </div>
+    {% endif %}
+    {% if parsed is none %}
+      <p class="muted">This document has no parsed text yet ({{ doc.parse_status }}).</p>
+      {% if info.parse_error %}<p class="error">{{ info.parse_error }}</p>{% endif %}
+    {% else %}
+    <div id="doc-body" class="doc-body" data-doc-id="{{ doc.doc_id }}" data-length="{{ parsed.text | length }}">
+      {%- for s in segments -%}
+        {%- if s.page %}<div class="page-marker" aria-hidden="true" data-page="{{ s.page }}">Page {{ s.page }}</div>{% endif -%}
+        <pre class="page-text">{{ s.html }}</pre>
+      {%- endfor -%}
+    </div>
+    {% endif %}
+  </section>
+
+  <aside class="source-side">
+    {% if parsed is not none %}
+    <section class="card selection-panel" id="selection-panel">
+      <h2>From a selection</h2>
+      <p class="muted small" id="sel-hint">Select text in the document to quote it as evidence.</p>
+      <blockquote id="sel-preview" hidden></blockquote>
+      <form method="post" action="{{ base }}/facts" class="stack" id="add-fact-form">
+        <input type="hidden" name="doc_id" value="{{ doc.doc_id }}">
+        <input type="hidden" name="char_start" data-sel="start">
+        <input type="hidden" name="char_end" data-sel="end">
+        <input type="hidden" name="quote" data-sel="quote">
+        <label>New fact title<input name="title" required maxlength="500" placeholder="What does this passage establish?"></label>
+        <div><button class="btn primary small" data-needs-span disabled>Add fact</button></div>
+      </form>
+      <form method="post" action="/facts/_/evidence" class="stack" id="add-evidence-form">
+        <input type="hidden" name="kind" value="span">
+        <input type="hidden" name="doc_id" value="{{ doc.doc_id }}">
+        <input type="hidden" name="char_start" data-sel="start">
+        <input type="hidden" name="char_end" data-sel="end">
+        <input type="hidden" name="quote" data-sel="quote">
+        <label>…or add as evidence to fact
+          <input name="fact_id" list="fact-options" required placeholder="F-0001" pattern="F-[0-9]+" data-fact-target>
+        </label>
+        <datalist id="fact-options">{% for x in all_facts %}<option value="{{ x.fact_id }}">{{ x.title[:80] }}</option>{% endfor %}</datalist>
+        <div><button class="btn small" data-needs-span disabled>Add as evidence</button></div>
+      </form>
+    </section>
+    {% endif %}
+
+    <section class="card">
+      <h2>Facts citing this document <span class="muted">({{ citing | length }})</span></h2>
+      {% for x in citing %}
+      <div class="side-fact review-{{ x.review }}{% if ev_fact and ev_fact.fact_id == x.fact_id %} current{% endif %}">
+        <a href="{{ fact_url(x.fact_id) }}">{{ x.title }}</a> <span class="muted small">{{ x.fact_id }}{% if x.date_start %} · {{ fact_date(x) }}{% endif %}</span>
+        {{ m.badges(x, alleged, conflicts, show_review=False) }}
+        <ul class="plain small spans">
+          {% for e in x.evidence if e.doc_id == doc.doc_id and e.kind == 'span' %}
+          <li><a href="{{ doc_view_url(doc.doc_id, e.evidence_id) }}" {% if ev and ev.evidence_id == e.evidence_id %}aria-current="true"{% endif %}>{{ evidence_cite(e) or e.evidence_id }}: “{{ e.quote[:90] }}{% if e.quote | length > 90 %}…{% endif %}”</a>{% if e.review == 'draft' and x.review != 'draft' %} <span class="badge draft">New</span>{% endif %}</li>
+          {% endfor %}
+        </ul>
+        {{ m.review_controls(x, here, with_reason=True) }}
+      </div>
+      {% else %}<p class="muted">No facts cite this document yet.</p>{% endfor %}
+      {% if citing | selectattr('review', 'equalto', 'draft') | list %}<p class="small"><a href="{{ base }}/review?doc={{ quote(doc.doc_id) }}">Review this document’s drafts in bulk</a></p>{% endif %}
+    </section>
+  </aside>
+</div>
 {% endblock %}
 {% block scripts %}<script src="/static/source.js"></script>{% endblock %}

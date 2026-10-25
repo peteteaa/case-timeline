@@ -485,8 +485,7 @@ class Store:
     def document_info(self, doc_id: str) -> dict[str, Any] | None:
         """Bookkeeping columns not in the Document contract (parse error, drafted time)."""
         row = self._q1(
-            "SELECT parse_error, drafted_at, kind_set_by, rel_path FROM documents "
-            "WHERE doc_id = ?",
+            "SELECT parse_error, drafted_at, kind_set_by, rel_path FROM documents WHERE doc_id = ?",
             (doc_id,),
         )
         if row is None:
@@ -499,7 +498,7 @@ class Store:
         }
 
     def documents_to_process(self, case_id: str) -> list[Document]:
-        """Documents never parsed, or parsed but not yet drafted (failed ones wait for reprocess)."""
+        """Documents not yet parsed, or parsed but not drafted; failed ones wait for reprocess."""
         rows = self._q(
             """SELECT * FROM documents WHERE case_id = ? AND (parse_status = 'pending'
                    OR (parse_status = 'parsed' AND drafted_at IS NULL))
@@ -793,9 +792,7 @@ class Store:
             )
             params.extend(q.doc_kinds)
         if q.fact_ids is not None:
-            where.append(
-                f"f.fact_id IN (SELECT value FROM json_each(?))"
-            )
+            where.append("f.fact_id IN (SELECT value FROM json_each(?))")
             params.append(json.dumps(q.fact_ids))
 
         direction = "DESC" if q.descending else "ASC"
@@ -818,14 +815,26 @@ class Store:
         for chunk in _chunks(list(fact_ids)):
             m = _marks(len(chunk))
             for name, sql in (
-                ("evidence", f"SELECT fact_id, COUNT(*) n FROM evidence WHERE fact_id IN ({m}) "
-                 "AND review != 'rejected' GROUP BY fact_id"),
-                ("tags", f"SELECT fact_id, COUNT(*) n FROM fact_tags WHERE fact_id IN ({m}) "
-                 "GROUP BY fact_id"),
-                ("witnesses", f"SELECT fact_id, COUNT(*) n FROM fact_witnesses "
-                 f"WHERE fact_id IN ({m}) GROUP BY fact_id"),
-                ("notes", f"SELECT fact_id, COUNT(*) n FROM notes WHERE fact_id IN ({m}) "
-                 "GROUP BY fact_id"),
+                (
+                    "evidence",
+                    f"SELECT fact_id, COUNT(*) n FROM evidence WHERE fact_id IN ({m}) "
+                    "AND review != 'rejected' GROUP BY fact_id",
+                ),
+                (
+                    "tags",
+                    f"SELECT fact_id, COUNT(*) n FROM fact_tags WHERE fact_id IN ({m}) "
+                    "GROUP BY fact_id",
+                ),
+                (
+                    "witnesses",
+                    f"SELECT fact_id, COUNT(*) n FROM fact_witnesses "
+                    f"WHERE fact_id IN ({m}) GROUP BY fact_id",
+                ),
+                (
+                    "notes",
+                    f"SELECT fact_id, COUNT(*) n FROM notes WHERE fact_id IN ({m}) "
+                    "GROUP BY fact_id",
+                ),
             ):
                 for r in self._q(sql, chunk):
                     out[r["fact_id"]][name] = r["n"]
@@ -915,8 +924,9 @@ class Store:
             if hits:
                 line_start, line_end = hits[0]["number"], hits[-1]["number"]
                 page = page if page is not None else hits[0]["page"]
-        return span.model_copy(update={"page": page, "line_start": line_start,
-                                       "line_end": line_end})
+        return span.model_copy(
+            update={"page": page, "line_start": line_start, "line_end": line_end}
+        )
 
     def _insert_evidence(
         self,
@@ -941,12 +951,22 @@ class Store:
                    AND doc_id = ? AND char_start = ? AND char_end = ?""",
                 (fact_id, span.doc_id, span.char_start, span.char_end),
             ).fetchone()
-            values = (span.doc_id, span.page, span.char_start, span.char_end, span.line_start,
-                      span.line_end, span.quote, None)
+            values = (
+                span.doc_id,
+                span.page,
+                span.char_start,
+                span.char_end,
+                span.line_start,
+                span.line_end,
+                span.quote,
+                None,
+            )
         elif kind == "document":
-            if not doc_id or c.execute(
-                "SELECT 1 FROM documents WHERE doc_id = ?", (doc_id,)
-            ).fetchone() is None:
+            if (
+                not doc_id
+                or c.execute("SELECT 1 FROM documents WHERE doc_id = ?", (doc_id,)).fetchone()
+                is None
+            ):
                 raise ValueError("document evidence needs an existing doc_id")
             dup = c.execute(
                 "SELECT evidence_id FROM evidence WHERE fact_id = ? AND kind = 'document' "
@@ -995,8 +1015,10 @@ class Store:
             if bad:
                 raise ValueError(f"unknown statuses {sorted(bad)}")
             fields["statuses"] = [s for s in STATUSES if s in fields["statuses"]]
-        for key, table, col in (("tag_ids", "tags", "tag_id"),
-                                ("witness_ids", "witnesses", "witness_id")):
+        for key, table, col in (
+            ("tag_ids", "tags", "tag_id"),
+            ("witness_ids", "witnesses", "witness_id"),
+        ):
             if key in fields:
                 ids = _dedupe(fields[key])
                 for chunk in _chunks(ids):
@@ -1012,9 +1034,12 @@ class Store:
                         raise ValueError(f"unknown {key}: {sorted(missing)}")
                 fields[key] = ids
         if fields.get("anchor_fact_id"):
-            if c.execute(
-                "SELECT 1 FROM facts WHERE fact_id = ?", (fields["anchor_fact_id"],)
-            ).fetchone() is None:
+            if (
+                c.execute(
+                    "SELECT 1 FROM facts WHERE fact_id = ?", (fields["anchor_fact_id"],)
+                ).fetchone()
+                is None
+            ):
                 raise ValueError("unknown anchor_fact_id")
 
     def add_fact(
@@ -1296,8 +1321,9 @@ class Store:
             if row is None:
                 raise KeyError(evidence_id)
             c.execute("UPDATE evidence SET review = ? WHERE evidence_id = ?", (new, evidence_id))
-            self._history(c, row["fact_id"], f"evidence {evidence_id}", row["review"], new,
-                          reviewer)
+            self._history(
+                c, row["fact_id"], f"evidence {evidence_id}", row["review"], new, reviewer
+            )
             self._review_event(
                 c, row["case_id"], row["fact_id"], action, reviewer, reason, evidence_id
             )
@@ -1354,14 +1380,20 @@ class Store:
             )
             self._history(c, fact_id, "note", None, note_id, author)
             self._reindex(c, fact_id)
-        return Note(note_id=note_id, fact_id=fact_id, author=author, body=body,
-                    created_at=_dt(stamp))
+        return Note(
+            note_id=note_id, fact_id=fact_id, author=author, body=body, created_at=_dt(stamp)
+        )
 
     def list_notes(self, fact_id: str) -> list[Note]:
         rows = self._q("SELECT * FROM notes WHERE fact_id = ? ORDER BY created_at", (fact_id,))
         return [
-            Note(note_id=r["note_id"], fact_id=r["fact_id"], author=r["author"], body=r["body"],
-                 created_at=_dt(r["created_at"]))
+            Note(
+                note_id=r["note_id"],
+                fact_id=r["fact_id"],
+                author=r["author"],
+                body=r["body"],
+                created_at=_dt(r["created_at"]),
+            )
             for r in rows
         ]
 
@@ -1406,8 +1438,18 @@ class Store:
                 """INSERT INTO witnesses (witness_id, case_id, name, aliases, role, notes,
                        flagged, confirmed, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (witness_id, case_id, name, json.dumps(aliases), role, notes,
-                 int(flagged and not agent), int(not agent), stamp, stamp),
+                (
+                    witness_id,
+                    case_id,
+                    name,
+                    json.dumps(aliases),
+                    role,
+                    notes,
+                    int(flagged and not agent),
+                    int(not agent),
+                    stamp,
+                    stamp,
+                ),
             )
         return self.get_witness(witness_id)  # type: ignore[return-value]
 
@@ -1455,7 +1497,7 @@ class Store:
             )
         for key in ("role", "notes"):
             if key in changes:
-                cols[key] = (changes[key] or None)
+                cols[key] = changes[key] or None
         for key in ("flagged", "confirmed"):
             if key in changes:
                 cols[key] = int(bool(changes[key]))
@@ -1554,16 +1596,18 @@ class Store:
         return Tag(tag_id=tag_id, case_id=case_id, name=name, color=color or None)
 
     def list_tags(self, case_id: str) -> list[Tag]:
-        rows = self._q("SELECT * FROM tags WHERE case_id = ? ORDER BY name COLLATE NOCASE",
-                       (case_id,))
+        rows = self._q(
+            "SELECT * FROM tags WHERE case_id = ? ORDER BY name COLLATE NOCASE", (case_id,)
+        )
         return [Tag(**dict(r)) for r in rows]
 
     def get_tag(self, tag_id: str) -> Tag | None:
         row = self._q1("SELECT * FROM tags WHERE tag_id = ?", (tag_id,))
         return Tag(**dict(row)) if row else None
 
-    def update_tag(self, tag_id: str, *, by: str, name: str | None = None,
-                   color: str | None = None) -> Tag:
+    def update_tag(
+        self, tag_id: str, *, by: str, name: str | None = None, color: str | None = None
+    ) -> Tag:
         _require_person(by, "edit tags")
         with self._tx() as c:
             if name is not None:
@@ -1665,12 +1709,18 @@ class Store:
                 "WHERE contradiction_id = ?",
                 (status, reviewer, _now_ts(), contradiction_id),
             )
-        if action == "confirm":
-            for fact in self.get_facts(current.fact_ids):
-                if "disputed" not in fact.statuses:
-                    self.update_fact(
-                        fact.fact_id, {"statuses": [*fact.statuses, "disputed"]}, by=reviewer
+            if action == "confirm":
+                # Set the status directly: confirming a dispute must not accept a draft fact.
+                for fact in self.get_facts(current.fact_ids):
+                    if "disputed" in fact.statuses:
+                        continue
+                    new = [s for s in STATUSES if s in {*fact.statuses, "disputed"}]
+                    c.execute(
+                        "UPDATE facts SET statuses = ?, updated_by = ?, updated_at = ? "
+                        "WHERE fact_id = ?",
+                        (json.dumps(new), reviewer, _now_ts(), fact.fact_id),
                     )
+                    self._history(c, fact.fact_id, "statuses", fact.statuses, new, reviewer)
         return self.get_contradiction(contradiction_id)  # type: ignore[return-value]
 
     # ------------------------------------------------------------------ alerts
@@ -1703,8 +1753,15 @@ class Store:
             c.execute(
                 """INSERT INTO alerts (alert_id, case_id, type, fact_ids, doc_ids, job_id,
                        created_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (alert_id, case_id, type, json.dumps(_dedupe(fact_ids)),
-                 json.dumps(_dedupe(doc_ids)), job_id, _now_ts()),
+                (
+                    alert_id,
+                    case_id,
+                    type,
+                    json.dumps(_dedupe(fact_ids)),
+                    json.dumps(_dedupe(doc_ids)),
+                    job_id,
+                    _now_ts(),
+                ),
             )
         return self.get_alert(alert_id)  # type: ignore[return-value]
 
@@ -1798,7 +1855,11 @@ class Store:
             )
 
     def finish_job(
-        self, job_id: str, status: str, *, error: str | None = None,
+        self,
+        job_id: str,
+        status: str,
+        *,
+        error: str | None = None,
         counts: dict[str, int] | None = None,
     ) -> Job:
         if status not in ("done", "failed"):
@@ -1949,8 +2010,9 @@ class Store:
                AND case_id = ? ORDER BY distance""",
             (sqlite_vec.serialize_float32(qvec[0]), min(max(k * 2, k), 4096), case_id),
         )
-        pks = [r["rowid"] for r in rows if r["distance"] is not None
-               and r["distance"] < max_distance]
+        pks = [
+            r["rowid"] for r in rows if r["distance"] is not None and r["distance"] < max_distance
+        ]
         if not pks:
             return []
         found = {

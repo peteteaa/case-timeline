@@ -1,73 +1,134 @@
-// Renders /api/events with vis-timeline. All event text is inserted as text, never as HTML.
+// Visual view: renders the JSON from /cases/{id}/facts?format=json with vis-timeline.
+// Points for single dates, bars for ranges, key facts highlighted, undated facts in their own
+// lane. Clicking a fact loads its card into the side panel. Text is set with textContent only.
 (function () {
   "use strict";
   var el = document.getElementById("timeline");
-  if (!el || !window.vis) return;
+  var lane = document.getElementById("undated-lane");
+  if (!el) return;
 
-  function esc(s) {
-    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
-    });
+  function openFact(item) {
+    var url = item.url + "?partial=1";
+    if (window.htmx) {
+      window.htmx.ajax("GET", url, { target: "#fact-panel", swap: "innerHTML" });
+    } else {
+      window.location.href = item.url;
+    }
   }
 
   function label(item) {
     var span = document.createElement("span");
-    span.textContent = item.label;
+    span.textContent = item.title;
     return span;
   }
 
   function tooltip(item) {
-    var parts = [
-      "<strong>" + esc(item.date_text) + "</strong> (" + esc(item.certainty) + ", " + esc(item.status) + ")",
-      esc(item.label),
-    ];
-    if (item.actors && item.actors.length) parts.push("Actors: " + esc(item.actors.join(", ")));
-    if (item.quote) parts.push("<em>“" + esc(item.quote) + "”</em>");
-    if (item.deadline_relevant) parts.push("<strong>Needs attorney review</strong>");
-    if (item.contradiction) parts.push("<strong>Involved in a contradiction</strong>");
-    return parts.join("<br>");
+    var box = document.createElement("div");
+    var head = document.createElement("strong");
+    head.textContent = item.id + " · " + (item.date_label || "Undated");
+    box.appendChild(head);
+    var title = document.createElement("div");
+    title.textContent = item.title;
+    box.appendChild(title);
+    var flags = [];
+    if (item.review === "draft") flags.push("Draft (AI suggestion)");
+    if (item.key_fact) flags.push("Key fact");
+    if (item.statuses.indexOf("disputed") >= 0) flags.push("Disputed");
+    if (item.conflict) flags.push("Possible conflict");
+    if (item.alleged) flags.push("Alleged");
+    if (item.date_text) flags.push("As written: " + item.date_text);
+    if (flags.length) {
+      var meta = document.createElement("div");
+      meta.className = "muted";
+      meta.textContent = flags.join(" · ");
+      box.appendChild(meta);
+    }
+    return box;
   }
 
-  fetch(el.dataset.src || "/api/events", { headers: { Accept: "application/json" } })
+  function renderLane(undated) {
+    if (!lane) return;
+    lane.textContent = "";
+    if (!undated.length) {
+      var none = document.createElement("span");
+      none.className = "muted small";
+      none.textContent = "No undated facts.";
+      lane.appendChild(none);
+      return;
+    }
+    undated.forEach(function (item) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "lane-item " + item.class_name + (item.key_fact ? " key" : "");
+      btn.textContent = item.title;
+      btn.title = item.id;
+      btn.addEventListener("click", function () { openFact(item); });
+      lane.appendChild(btn);
+    });
+  }
+
+  var DAY = 24 * 3600 * 1000;
+  var SPANS = { day: 21 * DAY, month: 240 * DAY, year: 6 * 365 * DAY };
+
+  fetch(el.dataset.src, { headers: { Accept: "application/json" }, credentials: "same-origin" })
     .then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     })
     .then(function (data) {
-      var dated = data.items.filter(function (i) { return i.start; });
-      if (!dated.length) {
-        el.textContent = "No dated events to plot yet.";
+      if (data.error) {
+        el.textContent = data.error;
+        renderLane([]);
         return;
       }
-      var items = new vis.DataSet(
+      var dated = data.items.filter(function (i) { return !i.undated; });
+      var byId = {};
+      data.items.forEach(function (i) { byId[i.id] = i; });
+      renderLane(data.items.filter(function (i) { return i.undated; }));
+      if (!dated.length) {
+        el.textContent = "No dated facts match.";
+        return;
+      }
+      var items = new window.vis.DataSet(
         dated.map(function (i) {
           return {
             id: i.id,
             start: i.start,
             end: i.end || undefined,
-            type: i.end ? "range" : "box",
+            type: i.end ? "range" : "point",
             content: label(i),
             title: tooltip(i),
-            className: i.class_name,
-            url: i.source_url,
+            className: i.class_name + (i.key_fact ? " key" : ""),
           };
         })
       );
-      var timeline = new vis.Timeline(el, items, {
+      var timeline = new window.vis.Timeline(el, items, {
         stack: true,
         zoomKey: "ctrlKey",
-        maxHeight: "65vh",
+        zoomMin: DAY * 3,
+        zoomMax: 60 * 365 * DAY,
+        maxHeight: "60vh",
         orientation: { axis: "top" },
         tooltip: { followMouse: true, overflowMethod: "cap" },
         selectable: true,
       });
-      timeline.on("click", function (props) {
-        if (!props.item) return;
-        var it = items.get(props.item);
-        if (it && it.url && it.url.indexOf("/source/") === 0) window.location.href = it.url;
+      timeline.on("select", function (props) {
+        if (props.items && props.items.length && byId[props.items[0]]) {
+          openFact(byId[props.items[0]]);
+        }
+      });
+      document.querySelectorAll("[data-zoom]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var kind = btn.getAttribute("data-zoom");
+          if (kind === "fit") { timeline.fit(); return; }
+          var w = timeline.getWindow();
+          var mid = (w.start.valueOf() + w.end.valueOf()) / 2;
+          var half = SPANS[kind] / 2;
+          timeline.setWindow(new Date(mid - half), new Date(mid + half));
+        });
       });
     })
     .catch(function (err) {
-      el.textContent = "Could not load timeline: " + err.message;
+      el.textContent = "Could not load the timeline: " + err.message;
     });
 })();

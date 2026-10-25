@@ -1,20 +1,33 @@
-"""Deduplicate newly extracted events against events already in the timeline."""
+"""Decide which drafts describe a fact already on the timeline (SPEC §6.1 step 4).
+
+A draft merges into an existing fact only when all three hold:
+- **dates compatible**: both dated with overlapping ranges, or both undated with the same (or no)
+  date text;
+- **people compatible**: the draft's witnesses and the fact's witnesses overlap, or either side
+  names nobody;
+- **similar**: rapidfuzz similarity of title + details (or a shared quote with a related
+  title), falling back to embedding cosine for pairs that pass the first two gates.
+Drafts that look like a fact but disagree on the date or the people are left alone: that is a
+possible contradiction, which ``conflicts`` checks. Rejected facts are never merge targets.
+"""
 
 from __future__ import annotations
 
 import logging
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date
 
 from rapidfuzz import fuzz
 
-from pipeline.contracts import Event
+from pipeline.schema import DraftFact, Fact
 
 log = logging.getLogger(__name__)
 
 FUZZ_THRESHOLD = 85.0
+QUOTE_THRESHOLD = 90.0  # a quote that matches one already cited by the fact
+QUOTE_TITLE_THRESHOLD = 50.0  # ...still needs a related title
 COSINE_THRESHOLD = 0.9
 
 _WS = re.compile(r"\s+")
@@ -24,61 +37,85 @@ def _norm_text(text: str) -> str:
     return _WS.sub(" ", text).strip().casefold()
 
 
-def normalize_actor(name: str) -> str:
-    """Case-fold and collapse whitespace so actor names compare loosely."""
-    return _norm_text(name)
+def _preprocess(text: str) -> str:
+    return _WS.sub(" ", re.sub(r"[^\w\s]", " ", text)).strip().casefold()
 
 
-def actor_set(event: Event) -> set[str]:
-    """Normalized, non-empty actor names of an event."""
-    return {a for a in (normalize_actor(x) for x in event.actors) if a}
+def similarity(a: str, b: str) -> float:
+    """rapidfuzz token_set_ratio (0-100) on punctuation-free, case-folded text."""
+    return fuzz.token_set_ratio(a, b, processor=_preprocess)
 
 
-def _interval(event: Event) -> tuple[date, date] | None:
-    if event.date_start is None:
+def fact_text(title: str, details: str | None) -> str:
+    return f"{title}. {details}" if details else title
+
+
+def fact_similarity(
+    title_a: str, details_a: str | None, title_b: str, details_b: str | None
+) -> float:
+    """Best of title-only and title-plus-details similarity (details often differ in length)."""
+    return max(
+        similarity(title_a, title_b),
+        similarity(fact_text(title_a, details_a), fact_text(title_b, details_b)),
+    )
+
+
+Interval = tuple[date, date]
+
+
+def interval(start: date | None, end: date | None) -> Interval | None:
+    if start is None:
         return None
-    end = event.date_end or event.date_start
-    return (min(event.date_start, end), max(event.date_start, end))
+    end = end or start
+    return (min(start, end), max(start, end))
 
 
-def date_gap_days(a: Event, b: Event) -> int | None:
-    """Days between two resolved date intervals (0 if they overlap); None if either is unknown."""
-    ia, ib = _interval(a), _interval(b)
-    if ia is None or ib is None:
+def gap_days(a: Interval | None, b: Interval | None) -> int | None:
+    """Days between two date intervals (0 if they overlap); None if either is undated."""
+    if a is None or b is None:
         return None
-    if ia[1] < ib[0]:
-        return (ib[0] - ia[1]).days
-    if ib[1] < ia[0]:
-        return (ia[0] - ib[1]).days
+    if a[1] < b[0]:
+        return (b[0] - a[1]).days
+    if b[1] < a[0]:
+        return (a[0] - b[1]).days
     return 0
 
 
-def same_date(a: Event, b: Event) -> bool:
-    """Resolved intervals overlap, or both unresolved with identical date text."""
-    gap = date_gap_days(a, b)
+def dates_compatible(draft: DraftFact, fact: Fact) -> bool:
+    gap = gap_days(
+        interval(draft.date_start, draft.date_end), interval(fact.date_start, fact.date_end)
+    )
     if gap is not None:
         return gap == 0
-    if a.date_start is None and b.date_start is None:
-        ta, tb = _norm_text(a.date_text), _norm_text(b.date_text)
-        return bool(ta) and ta == tb
+    if draft.date_start is None and fact.date_start is None:
+        ta, tb = _norm_text(draft.date_text or ""), _norm_text(fact.date_text or "")
+        return not ta or not tb or ta == tb
+    return False  # one dated, one not: not enough to call them the same event
+
+
+def people_compatible(draft_witnesses: Sequence[str], fact: Fact) -> bool:
+    """True unless both sides name people and the sets are disjoint."""
+    a, b = set(draft_witnesses), set(fact.witness_ids)
+    return not (a and b) or bool(a & b)
+
+
+def _quote_hit(draft: DraftFact, fact: Fact) -> bool:
+    """The draft cites a span the fact already cites, or a near-identical quote."""
+    for span in draft.spans:
+        for ev in fact.evidence:
+            if ev.kind != "span" or ev.quote is None:
+                continue
+            if (
+                ev.doc_id == span.doc_id
+                and ev.char_start is not None
+                and ev.char_end is not None
+                and ev.char_start < span.char_end
+                and span.char_start < ev.char_end
+            ):
+                return True
+            if fuzz.ratio(_preprocess(span.quote), _preprocess(ev.quote)) >= QUOTE_THRESHOLD:
+                return True
     return False
-
-
-def actors_compatible(a: Event, b: Event) -> bool:
-    """True unless both events name actors and the sets are disjoint."""
-    sa, sb = actor_set(a), actor_set(b)
-    if sa and sb:
-        return bool(sa & sb)
-    return True
-
-
-def description_similarity(a: Event, b: Event) -> float:
-    """rapidfuzz token_set_ratio (0-100) over the event descriptions."""
-    return fuzz.token_set_ratio(a.description, b.description, processor=_preprocess)
-
-
-def _preprocess(text: str) -> str:
-    return _WS.sub(" ", re.sub(r"[^\w\s]", " ", text)).strip().casefold()
 
 
 def _cosine(u: Sequence[float], v: Sequence[float]) -> float:
@@ -99,54 +136,64 @@ def _embed(texts: list[str]) -> list[list[float]] | None:
         return None
 
 
-def duplicate_pairs(new: list[Event], existing: list[Event]) -> list[tuple[Event, str]]:
-    """Return ``(new_event, canonical_event_id)`` for every new event that duplicates another.
+def plan(
+    drafts: Sequence[DraftFact],
+    existing: Sequence[Fact],
+    *,
+    witness_ids: Mapping[str, Sequence[str]] | None = None,
+) -> dict[str, str | None]:
+    """Map each draft key to the existing fact id it duplicates, or None for a new fact.
 
-    New events are compared with existing events and with earlier events of the same batch.
-    Embeddings are computed only for pairs that pass the date/actor gate but not the fuzzy test.
+    ``witness_ids`` (draft key → matched witness ids) drives the people check; without it,
+    people don't block a merge.
     """
-    pool: list[Event] = list(existing)
-    existing_ids = {e.id for e in existing}
-    # candidate matches per new event: (target_id, fuzzy_hit)
-    candidates: dict[str, list[tuple[Event, bool]]] = {}
-    for i, ev in enumerate(new):
-        targets = pool + new[:i]
-        hits: list[tuple[Event, bool]] = []
-        for other in targets:
-            if other.id == ev.id or not same_date(ev, other) or not actors_compatible(ev, other):
+    people = witness_ids or {}
+    live = [f for f in existing if f.review != "rejected"]
+    # (draft key) -> [(fact, fuzzy score, fuzzy hit)] for facts passing the date/people gates
+    candidates: dict[str, list[tuple[Fact, float, bool]]] = {}
+    for d in drafts:
+        hits: list[tuple[Fact, float, bool]] = []
+        for f in live:
+            if not dates_compatible(d, f) or not people_compatible(people.get(d.key, ()), f):
                 continue
-            hits.append((other, description_similarity(ev, other) >= FUZZ_THRESHOLD))
-        candidates[ev.id] = hits
+            score = fact_similarity(d.title, d.details, f.title, f.details)
+            hit = score >= FUZZ_THRESHOLD or (score >= QUOTE_TITLE_THRESHOLD and _quote_hit(d, f))
+            hits.append((f, score, hit))
+        candidates[d.key] = hits
 
-    vectors = _embed_needed(new, candidates)
-
-    canonical: dict[str, str] = {}  # dup new-event id -> canonical id
-    pairs: list[tuple[Event, str]] = []
-    for ev in new:
-        if ev.id in existing_ids:
-            continue  # already stored; nothing to merge
-        for other, fuzzy_hit in candidates[ev.id]:
-            if not fuzzy_hit and not _cosine_hit(ev, other, vectors):
-                continue
-            target = canonical.get(other.id, other.id)
-            canonical[ev.id] = target
-            pairs.append((ev, target))
-            break
-    return pairs
+    vectors = _embed_needed(drafts, candidates)
+    out: dict[str, str | None] = {}
+    for d in drafts:
+        dtext = fact_text(d.title, d.details)
+        best: tuple[float, float, str] | None = None
+        for f, score, hit in candidates[d.key]:
+            if not hit:
+                cos = _cosine_of(vectors, f"d:{d.key}", f"f:{f.fact_id}")
+                if cos is None or cos < COSINE_THRESHOLD:
+                    continue
+                score = max(score, cos * 100)
+            # token_set_ratio ties at 100 for any subset; break ties on the plain ratio.
+            tie = fuzz.ratio(_preprocess(dtext), _preprocess(fact_text(f.title, f.details)))
+            if best is None or (score, tie) > best[:2]:
+                best = (score, tie, f.fact_id)
+        out[d.key] = best[2] if best else None
+    n = sum(1 for v in out.values() if v)
+    log.info("merge plan: %d new, %d attach to existing facts", len(out) - n, n)
+    return out
 
 
 def _embed_needed(
-    new: list[Event], candidates: dict[str, list[tuple[Event, bool]]]
+    drafts: Sequence[DraftFact], candidates: dict[str, list[tuple[Fact, float, bool]]]
 ) -> dict[str, list[float]]:
-    """Embed descriptions only for events in candidate pairs that need the semantic check."""
+    """Embed only drafts (and facts) in candidate pairs that the fuzzy test didn't settle."""
     needed: dict[str, str] = {}
-    for ev in new:
-        hits = candidates[ev.id]
-        if any(fuzzy for _, fuzzy in hits):
+    for d in drafts:
+        hits = candidates[d.key]
+        if any(hit for _, _, hit in hits):
             continue
-        for other, _ in hits:
-            needed[ev.id] = ev.description
-            needed[other.id] = other.description
+        for f, _, _ in hits:
+            needed[f"d:{d.key}"] = fact_text(d.title, d.details)
+            needed[f"f:{f.fact_id}"] = fact_text(f.title, f.details)
     if not needed:
         return {}
     ids = list(needed)
@@ -156,29 +203,8 @@ def _embed_needed(
     return dict(zip(ids, vecs, strict=True))
 
 
-def _cosine_hit(a: Event, b: Event, vectors: dict[str, list[float]]) -> bool:
-    va, vb = vectors.get(a.id), vectors.get(b.id)
-    return va is not None and vb is not None and _cosine(va, vb) >= COSINE_THRESHOLD
-
-
-def merge_events_linked(
-    new: list[Event], existing: list[Event]
-) -> tuple[list[Event], list[tuple[Event, str]]]:
-    """Like :func:`merge_events` but returns ``(to_insert, [(duplicate, canonical_id), ...])``."""
-    pairs = duplicate_pairs(new, existing)
-    dup_ids = {ev.id for ev, _ in pairs}
-    existing_ids = {e.id for e in existing}
-    to_insert = [e for e in new if e.id not in dup_ids and e.id not in existing_ids]
-    log.info("merge: %d new, %d duplicates", len(to_insert), len(pairs))
-    return to_insert, pairs
-
-
-def merge_events(new: list[Event], existing: list[Event]) -> tuple[list[Event], list[Event]]:
-    """Split ``new`` into ``(to_insert, duplicates)``.
-
-    ``to_insert`` are genuinely new events. ``duplicates`` are new events that repeat an existing
-    (or earlier in-batch) event; use :func:`merge_events_linked` / :func:`duplicate_pairs` for
-    their canonical ids so the store can keep both sources via ``link_duplicate``.
-    """
-    to_insert, pairs = merge_events_linked(new, existing)
-    return to_insert, [ev for ev, _ in pairs]
+def _cosine_of(vectors: dict[str, list[float]], a: str, b: str) -> float | None:
+    va, vb = vectors.get(a), vectors.get(b)
+    if va is None or vb is None:
+        return None
+    return _cosine(va, vb)

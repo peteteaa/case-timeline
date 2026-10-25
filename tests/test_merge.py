@@ -7,29 +7,30 @@ from datetime import date
 import pytest
 
 from pipeline import merge
-from pipeline.contracts import Certainty, Event, SourceRef
+from pipeline.schema import DraftFact, SpanIn
+from tests.pipeline_helpers import make_fact
 
 
-def ev(
-    eid: str,
-    desc: str,
+def draft(
+    key: str,
+    title: str,
     d: date | None = date(2024, 3, 3),
-    actors: list[str] | None = None,
-    doc: str = "doc1",
-    date_text: str = "March 3, 2024",
+    *,
     end: date | None = None,
-) -> Event:
-    return Event(
-        id=eid,
-        case_id="demo",
+    date_text: str | None = "March 3, 2024",
+    quote: str = "some quote",
+    doc: str = "D-0002",
+    at: int = 0,
+) -> DraftFact:
+    return DraftFact(
+        key=key,
+        title=title,
         date_text=date_text,
         date_start=d,
         date_end=end or d,
-        certainty=Certainty.EXACT if d else Certainty.UNKNOWN,
-        actors=actors if actors is not None else ["John Smith"],
-        description=desc,
-        source=SourceRef(doc_id=doc, char_start=0, char_end=5, quote="quote"),
-        confidence=0.9,
+        date_certainty="exact" if d else "unknown",
+        quotes=[quote],
+        spans=[SpanIn(doc_id=doc, char_start=at, char_end=at + len(quote), quote=quote)],
     )
 
 
@@ -46,50 +47,76 @@ def no_embed(monkeypatch):
 
 
 def test_fuzzy_duplicate_detected():
-    old = ev("e1", "John Smith signed the lease agreement")
-    new = ev("n1", "Smith signed the lease agreement", actors=["john  smith"], doc="doc2")
-    to_insert, dups = merge.merge_events([new], [old])
-    assert to_insert == []
-    assert [d.id for d in dups] == ["n1"]
-    assert merge.duplicate_pairs([new], [old]) == [(new, "e1")]
+    old = make_fact("F-0001", "John Smith signed the lease agreement", witnesses=["W-1"])
+    new = draft("n1", "Smith signed the lease agreement")
+    assert merge.plan([new], [old], witness_ids={"n1": ["W-1"]}) == {"n1": "F-0001"}
 
 
-def test_different_date_not_duplicate():
-    old = ev("e1", "John Smith signed the lease agreement")
-    new = ev("n1", "John Smith signed the lease agreement", d=date(2024, 3, 10))
-    to_insert, dups = merge.merge_events([new], [old])
-    assert [e.id for e in to_insert] == ["n1"] and dups == []
+def test_different_date_not_merged():
+    old = make_fact("F-0001", "John Smith signed the lease agreement")
+    new = draft("n1", "John Smith signed the lease agreement", d=date(2024, 3, 10))
+    assert merge.plan([new], [old]) == {"n1": None}
 
 
 def test_range_overlap_counts_as_same_date():
-    old = ev("e1", "Smith signed the lease", d=date(2024, 3, 1), end=date(2024, 3, 31))
-    new = ev("n1", "Smith signed the lease")
-    assert merge.duplicate_pairs([new], [old]) == [(new, "e1")]
+    old = make_fact(
+        "F-0001",
+        "Smith signed the lease",
+        date(2024, 3, 1),
+        end=date(2024, 3, 31),
+        certainty="approximate",
+    )
+    new = draft("n1", "Smith signed the lease")
+    assert merge.plan([new], [old]) == {"n1": "F-0001"}
 
 
-def test_disjoint_actors_not_duplicate():
-    old = ev("e1", "signed the lease agreement", actors=["Alice"])
-    new = ev("n1", "signed the lease agreement", actors=["Bob"])
-    to_insert, dups = merge.merge_events([new], [old])
-    assert len(to_insert) == 1 and dups == []
+def test_disjoint_people_not_merged():
+    old = make_fact("F-0001", "signed the lease agreement", witnesses=["W-1"])
+    new = draft("n1", "signed the lease agreement")
+    assert merge.plan([new], [old], witness_ids={"n1": ["W-2"]}) == {"n1": None}
 
 
-def test_missing_actors_on_one_side_still_matches():
-    old = ev("e1", "signed the lease agreement", actors=[])
-    new = ev("n1", "signed the lease agreement", actors=["Bob"])
-    assert merge.duplicate_pairs([new], [old]) == [(new, "e1")]
+def test_missing_people_on_one_side_still_matches():
+    old = make_fact("F-0001", "signed the lease agreement", witnesses=[])
+    new = draft("n1", "signed the lease agreement")
+    assert merge.plan([new], [old], witness_ids={"n1": ["W-2"]}) == {"n1": "F-0001"}
 
 
-def test_unknown_dates_match_on_identical_text():
-    old = ev("e1", "meeting at the office", d=None, date_text="the next morning")
-    new = ev("n1", "meeting at the office", d=None, date_text="The next  morning")
-    other = ev("n2", "meeting at the office", d=None, date_text="later that week")
-    to_insert, dups = merge.merge_events([new, other], [old])
-    assert [d.id for d in dups] == ["n1"]
-    assert [e.id for e in to_insert] == ["n2"]
+def test_undated_match_on_identical_or_missing_date_text():
+    old = make_fact("F-0001", "meeting at the office", None, date_text="the next morning")
+    same = draft("n1", "meeting at the office", None, date_text="The next  morning")
+    other = draft("n2", "meeting at the office", None, date_text="later that week")
+    none = draft("n3", "meeting at the office", None, date_text=None)
+    out = merge.plan([same, other, none], [old])
+    assert out == {"n1": "F-0001", "n2": None, "n3": "F-0001"}
 
 
-def test_embedding_used_only_for_candidate_pairs(monkeypatch, no_embed):
+def test_dated_and_undated_not_merged():
+    old = make_fact("F-0001", "meeting at the office", None)
+    assert merge.plan([draft("n1", "meeting at the office")], [old]) == {"n1": None}
+
+
+def test_rejected_facts_are_never_targets():
+    old = make_fact("F-0001", "Smith paid rent", review="rejected")
+    assert merge.plan([draft("n1", "Smith paid rent")], [old]) == {"n1": None}
+
+
+def test_best_scoring_fact_wins():
+    a = make_fact("F-0001", "Smith paid the rent for March and April late")
+    b = make_fact("F-0002", "Smith paid rent")
+    assert merge.plan([draft("n1", "Smith paid rent")], [a, b]) == {"n1": "F-0002"}
+
+
+def test_shared_quote_with_related_title_merges():
+    q = "On March 3, 2024 Smith handed the keys to Jones."
+    old = make_fact("F-0001", "Keys handed over to Jones", quotes=[q], docs=["D-0001"])
+    new = draft("n1", "Smith gives Jones the keys", quote=q, doc="D-0009")
+    assert merge.plan([new], [old]) == {"n1": "F-0001"}
+    unrelated = draft("n2", "Rent dispute begins", quote=q, doc="D-0009")
+    assert merge.plan([unrelated], [old]) == {"n2": None}
+
+
+def test_embedding_used_only_for_candidate_pairs(monkeypatch):
     vecs = {"Smith paid rent": [1.0, 0.0], "rent payment made by Smith": [0.99, 0.05]}
     calls: list[list[str]] = []
 
@@ -98,39 +125,25 @@ def test_embedding_used_only_for_candidate_pairs(monkeypatch, no_embed):
         return [vecs.get(t, [0.0, 1.0]) for t in texts]
 
     monkeypatch.setattr(merge, "_embed", fake)
-    old = ev("e1", "Smith paid rent")
-    far = ev("e2", "Smith paid rent", d=date(2025, 1, 1))  # wrong date: never embedded
-    new = ev("n1", "rent payment made by Smith")
-    pairs = merge.duplicate_pairs([new], [old, far])
-    assert pairs == [(new, "e1")]
+    old = make_fact("F-0001", "Smith paid rent")
+    far = make_fact("F-0002", "Smith paid rent", date(2025, 1, 1))  # wrong date: never embedded
+    new = draft("n1", "rent payment made by Smith")
+    assert merge.plan([new], [old, far]) == {"n1": "F-0001"}
     assert len(calls) == 1
     assert sorted(calls[0]) == sorted(["rent payment made by Smith", "Smith paid rent"])
 
 
-def test_low_cosine_not_duplicate(monkeypatch):
+def test_low_cosine_not_merged(monkeypatch):
     monkeypatch.setattr(merge, "_embed", lambda texts: [[1.0, 0.0], [0.0, 1.0]])
-    old = ev("e1", "Smith paid rent")
-    new = ev("n1", "Smith slipped on the stairs")
-    assert merge.duplicate_pairs([new], [old]) == []
+    old = make_fact("F-0001", "Smith paid rent")
+    assert merge.plan([draft("n1", "Smith slipped on the stairs")], [old]) == {"n1": None}
 
 
 def test_no_embed_call_when_fuzzy_already_matches(no_embed):
-    old = ev("e1", "Smith paid rent")
-    new = ev("n1", "Smith paid rent")
-    merge.merge_events([new], [old])
+    old = make_fact("F-0001", "Smith paid rent")
+    merge.plan([draft("n1", "Smith paid rent")], [old])
     assert no_embed == []
 
 
-def test_in_batch_duplicates_link_to_canonical():
-    a = ev("n1", "Smith paid rent", doc="d1")
-    b = ev("n2", "Smith paid rent", doc="d2")
-    c = ev("n3", "Smith paid the rent", doc="d3")
-    to_insert, pairs = merge.merge_events_linked([a, b, c], [])
-    assert [e.id for e in to_insert] == ["n1"]
-    assert [(e.id, t) for e, t in pairs] == [("n2", "n1"), ("n3", "n1")]
-
-
-def test_already_stored_events_are_not_reinserted():
-    old = ev("e1", "Smith paid rent")
-    to_insert, dups = merge.merge_events([old], [old])
-    assert to_insert == [] and dups == []
+def test_no_existing_facts():
+    assert merge.plan([draft("n1", "x"), draft("n2", "y")], []) == {"n1": None, "n2": None}
