@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Timeline{% endblock %}
+{% block head %}<link rel="stylesheet" href="/static/vendor/vis-timeline-graph2d.min.css">{% endblock %}
+{% block content %}
+<section class="page-head">
+  <h1>Timeline</h1>
+  <div class="legend" aria-label="Legend">
+    <span class="swatch cert-exact">exact</span>
+    <span class="swatch cert-approximate">approximate</span>
+    <span class="swatch cert-relative">relative</span>
+    <span class="swatch cert-range">range</span>
+    <span class="swatch status-unverified">unverified</span>
+    <span class="swatch conflict">contradiction</span>
+    <span class="swatch deadline">attorney review</span>
+  </div>
+</section>
+<div id="timeline" class="card timeline-box" data-src="/api/events">
+  <noscript>The interactive timeline needs JavaScript; the table below has every event.</noscript>
+</div>
+<p class="muted small">Click an item to open its source with the quote highlighted. Ctrl + scroll to zoom.</p>
+
+<section class="card">
+  <h2>All events <span class="muted">({{ events | length }})</span></h2>
+  {% if events %}
+  <div class="table-wrap">
+  <table class="events">
+    <thead><tr><th>Date</th><th>Certainty</th><th>Event</th><th>Source</th><th>Review</th></tr></thead>
+    <tbody>
+      {% for e in events %}{% include "_event_row.html" %}{% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="muted">No events yet. Upload documents or press “Process now” on the dashboard.</p>
+  {% endif %}
+</section>
+{% endblock %}
+{% block scripts %}
+<script src="/static/vendor/vis-timeline-graph2d.min.js"></script>
+<script src="/static/timeline.js"></script>
+{% endblock %}

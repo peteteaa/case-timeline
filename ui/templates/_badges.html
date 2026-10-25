@@ -1,0 +1,3 @@
+{% if e.deadline_relevant %}<span class="badge deadline" title="Possible deadline or limitation date">Needs attorney review</span>{% endif %}
+{% if e.status.value == 'unverified' %}<span class="badge unverified" title="Quote could not be located verbatim in the source">Unverified</span>{% endif %}
+{% if e.id in conflicts %}<span class="badge conflict" title="Involved in an open contradiction"><a href="/contradictions">Contradiction</a></span>{% endif %}

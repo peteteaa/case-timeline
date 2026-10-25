@@ -1,0 +1,109 @@
+[
+  {
+    "id": "C1",
+    "field": "date",
+    "event_key": "office_meeting",
+    "planted": true,
+    "explanation": "Becker dates the office meeting March 11, 2024; the police report, Rivera's email, Ellison's deposition and the HR memo all say March 12, 2024.",
+    "sides": [
+      {
+        "doc": "witness_statement_becker.docx",
+        "quote": "took place on March 11, 2024"
+      },
+      {
+        "doc": "incident_report.pdf",
+        "quote": "on March 12, 2024, during a meeting in Mr. Ellison's"
+      },
+      {
+        "doc": "deposition_excerpt_ellison.txt",
+        "quote": "A. March 12, 2024. In the afternoon, I believe."
+      },
+      {
+        "doc": "hr_memo.md",
+        "quote": "On March 12, 2024, I attended a meeting"
+      }
+    ]
+  },
+  {
+    "id": "C2",
+    "field": "actor",
+    "event_key": "office_meeting",
+    "planted": true,
+    "explanation": "Who attended the meeting: Ellison told police only he and Rivera were present; Becker says he was in the room; Ellison's deposition and Nand's memo say Nand attended and no one else.",
+    "sides": [
+      {
+        "doc": "incident_report.pdf",
+        "quote": "only he and Ms. Rivera were present in the office"
+      },
+      {
+        "doc": "witness_statement_becker.docx",
+        "quote": "I was in the room for the whole meeting"
+      },
+      {
+        "doc": "deposition_excerpt_ellison.txt",
+        "quote": "A. Priya Nand from HR sat in. Nobody else."
+      },
+      {
+        "doc": "hr_memo.md",
+        "quote": "I attended a meeting between Mark Ellison and Dana Rivera"
+      }
+    ]
+  },
+  {
+    "id": "C3",
+    "field": "fact",
+    "event_key": "ellison_learns_brakes",
+    "planted": true,
+    "explanation": "Ellison testifies he first learned of the forklift #7 brake problem in mid-March, after the meeting; Rivera's email says she reported it to him in writing on March 4, 2024, and Becker says she had reported it by early March.",
+    "sides": [
+      {
+        "doc": "deposition_excerpt_ellison.txt",
+        "quote": "Sometime in mid-March, after that meeting."
+      },
+      {
+        "doc": "email_thread.eml",
+        "quote": "On March 4, 2024 I reported in writing to Mark Ellison"
+      },
+      {
+        "doc": "witness_statement_becker.docx",
+        "quote": "she had reported it to Mark Ellison"
+      }
+    ]
+  },
+  {
+    "id": "C4",
+    "field": "date",
+    "event_key": "unpaid_leave",
+    "planted": false,
+    "derived": true,
+    "explanation": "Becker's 'two days after the meeting' resolves to March 13, 2024 using his own meeting date (March 11); the police report, Rivera's email and the HR memo put the unpaid leave on March 14, 2024. A consequence of C1.",
+    "sides": [
+      {
+        "doc": "witness_statement_becker.docx",
+        "quote": "Two days after the meeting, Dana was sent home without pay."
+      },
+      {
+        "doc": "hr_memo.md",
+        "quote": "placed on unpaid administrative leave on March 14, 2024"
+      }
+    ]
+  },
+  {
+    "id": "C5",
+    "field": "fact",
+    "event_key": "office_meeting",
+    "planted": false,
+    "derived": true,
+    "explanation": "Becker told police on March 15 that he heard raised voices from Ellison's office (implying he was outside), but his statement says he was in the room for the whole meeting.",
+    "sides": [
+      {
+        "doc": "incident_report.pdf",
+        "quote": "had heard raised voices from Mr. Ellison's office"
+      },
+      {
+        "doc": "witness_statement_becker.docx",
+        "quote": "I was in the room for the whole meeting"
+      }
+    ]
+  }
+]

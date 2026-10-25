@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Ask{% endblock %}
+{% block content %}
+<section class="page-head"><h1>Ask about the case</h1></section>
+<form method="post" action="/chat" class="card chat-form"
+      hx-post="/chat" hx-target="#answers" hx-swap="afterbegin" hx-disabled-elt="find button"
+      hx-indicator="#thinking">
+  <label for="question" class="muted small">Answers come only from the case evidence, with citations.</label>
+  <textarea id="question" name="question" rows="3" maxlength="4000" required
+            placeholder="e.g. When did the defendant first receive notice?"></textarea>
+  <div class="row"><button class="btn primary" type="submit">Ask</button>
+    <span id="thinking" class="htmx-indicator muted">Thinking…</span></div>
+</form>
+<div id="answers">
+  {% if result %}{% include "_chat_answer.html" %}{% endif %}
+</div>
+{% endblock %}

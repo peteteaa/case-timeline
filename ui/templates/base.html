@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="htmx-config" content='{"allowEval": false, "includeIndicatorStyles": false, "selfRequestsOnly": true}'>
+  <title>{% block title %}Case Timeline{% endblock %} · {{ case_id }}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  {% block head %}{% endblock %}
+  <script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">Case Timeline</a>
+    <span class="case-pill" title="Case">{{ case_id }}</span>
+    <nav>
+      {% set p = request.url.path %}
+      <a href="/" {% if p == '/' %}aria-current="page"{% endif %}>Dashboard</a>
+      <a href="/timeline" {% if p.startswith('/timeline') %}aria-current="page"{% endif %}>Timeline</a>
+      <a href="/contradictions" {% if p.startswith('/contradictions') %}aria-current="page"{% endif %}>Contradictions</a>
+      <a href="/alerts" {% if p.startswith('/alerts') %}aria-current="page"{% endif %}>Alerts</a>
+      <a href="/chat" {% if p.startswith('/chat') %}aria-current="page"{% endif %}>Ask</a>
+      <a href="/upload" {% if p.startswith('/upload') %}aria-current="page"{% endif %}>Upload</a>
+    </nav>
+    <span class="local-badge" title="All processing happens on this machine">Local only</span>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="foot">Draft for human review. Extracted events are not evidence; always check the cited source.</footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

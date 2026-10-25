@@ -1,0 +1,9 @@
+<div class="c-status" id="cstatus-{{ c.id }}">
+  <span class="state state-{{ c.status.value }}">{{ c.status.value }}</span>
+  <form method="post" action="/contradictions/{{ c.id | urlencode }}/status" class="inline"
+        hx-post="/contradictions/{{ c.id | urlencode }}/status" hx-target="closest .c-status" hx-swap="outerHTML">
+    <button class="btn small danger" name="status" value="confirmed" {% if c.status.value == 'confirmed' %}disabled{% endif %}>Confirm</button>
+    <button class="btn small" name="status" value="dismissed" {% if c.status.value == 'dismissed' %}disabled{% endif %}>Dismiss</button>
+    <button class="btn small" name="status" value="open" {% if c.status.value == 'open' %}disabled{% endif %}>Reopen</button>
+  </form>
+</div>

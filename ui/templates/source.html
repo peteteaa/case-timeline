@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Source{% endblock %}
+{% block content %}
+<section class="page-head">
+  <h1>Source: {{ doc.filename if doc and doc.filename else doc_id }}</h1>
+  <a class="btn" href="/timeline">Back to timeline</a>
+</section>
+{% if e %}
+<section class="card">
+  <table class="events"><tbody>{% include "_event_row.html" %}</tbody></table>
+</section>
+{% endif %}
+{% if requested and not highlighted %}
+<p class="notice">The cited span could not be located in this document; showing full text.</p>
+{% elif highlighted %}
+<p class="muted small">Highlighted quote{% if page %} on page {{ page }}{% endif %}. <a href="#hl">Jump to quote</a></p>
+{% endif %}
+<article class="card doc-text" id="doc-text"><pre>{{ body }}</pre></article>
+{% endblock %}
+{% block scripts %}<script src="/static/source.js"></script>{% endblock %}

@@ -1,0 +1,21 @@
+<div class="answer card">
+  <div class="q"><span class="muted small">Question</span><p>{{ result.question }}</p></div>
+  {% if result.notice %}<p class="notice">{{ result.notice }}</p>{% endif %}
+  {% if result.answer_html %}<div class="a">{{ result.answer_html }}</div>{% endif %}
+  {% if result.citations %}
+  <h3>Cited events</h3>
+  <ol class="cites">
+    {% for c in result.citations %}
+    {% set e = c.event %}
+    <li id="cite-{{ c.tag }}"><strong>[{{ c.tag }}]</strong>
+      {{ e.date_start.isoformat() if e.date_start else e.date_text }} · {{ e.description }}
+      {% if e.deadline_relevant %}<span class="badge deadline">Needs attorney review</span>{% endif %}
+      {% if e.status.value == 'unverified' %}<span class="badge unverified">Unverified</span>{% endif %}
+      <blockquote>{{ e.source.quote }}</blockquote>
+      <a href="{{ c.url }}">Open source</a>
+    </li>
+    {% endfor %}
+  </ol>
+  {% endif %}
+  <p class="muted small">Answered by {{ 'OpenClaw agent' if result.backend == 'openclaw' else 'local model' }}. Verify every citation.</p>
+</div>

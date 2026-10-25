@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Alerts{% endblock %}
+{% block content %}
+<section class="page-head"><h1>Alerts <span class="muted">({{ alerts | length }})</span></h1></section>
+{% if alerts %}
+<div class="card table-wrap">
+<table class="events">
+  <thead><tr><th>When</th><th>Type</th><th>Related</th></tr></thead>
+  <tbody>
+  {% for a in alerts %}
+  <tr id="alert-{{ a.id }}" class="alert-row">
+    <td class="nowrap">{{ a.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+    <td><span class="badge {{ 'conflict' if a.type.value == 'new_contradiction' else 'deadline' }}">{{ a.type.value | replace('_', ' ') }}</span></td>
+    <td>
+      {% if a.type.value == 'new_contradiction' %}
+        {% for r in a.ref_ids %}<a href="/contradictions#c-{{ r }}">{{ r }}</a>{% if not loop.last %}, {% endif %}{% endfor %}
+      {% else %}
+        {% for r in a.ref_ids %}<a href="/timeline#event-{{ r }}">{{ r }}</a>{% if not loop.last %}, {% endif %}{% endfor %}
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="muted">No alerts.</p>
+{% endif %}
+{% endblock %}

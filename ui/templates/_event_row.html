@@ -1,0 +1,22 @@
+<tr id="event-{{ e.id }}" class="status-{{ e.status.value }}">
+  <td class="nowrap">
+    <div>{{ e.date_start.isoformat() if e.date_start else '—' }}{% if e.date_end and e.date_end != e.date_start %} → {{ e.date_end.isoformat() }}{% endif %}</div>
+    <div class="muted small">“{{ e.date_text }}”</div>
+  </td>
+  <td><span class="cert cert-{{ e.certainty.value }}">{{ e.certainty.value }}</span></td>
+  <td>
+    <div>{{ e.description }}</div>
+    {% if e.actors %}<div class="muted small">{{ e.actors | join(', ') }}</div>{% endif %}
+    <div class="badges">{% include "_badges.html" %}</div>
+  </td>
+  <td><a href="{{ source_url(e) }}">Source{% if e.source.page %} p.{{ e.source.page }}{% endif %}</a>
+      <div class="muted small">conf {{ '%.2f' | format(e.confidence) }}</div></td>
+  <td class="review">
+    <span class="state state-{{ e.status.value }}">{{ e.status.value }}</span>
+    <form method="post" action="/events/{{ e.id | urlencode }}/status" class="inline"
+          hx-post="/events/{{ e.id | urlencode }}/status" hx-target="closest tr" hx-swap="outerHTML">
+      <button class="btn small ok" name="status" value="accepted" {% if e.status.value == 'accepted' %}disabled{% endif %}>Accept</button>
+      <button class="btn small danger" name="status" value="rejected" {% if e.status.value == 'rejected' %}disabled{% endif %}>Reject</button>
+    </form>
+  </td>
+</tr>

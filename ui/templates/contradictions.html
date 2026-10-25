@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Contradictions{% endblock %}
+{% block content %}
+<section class="page-head"><h1>Contradictions <span class="muted">({{ items | length }})</span></h1></section>
+{% for item in items %}
+{% set c = item.c %}
+<section class="card contradiction status-{{ c.status.value }}" id="c-{{ c.id }}">
+  <div class="c-head">
+    <span class="badge conflict">{{ c.field.value }} conflict</span>
+    {% include "_contradiction_status.html" %}
+  </div>
+  <p>{{ c.explanation }}</p>
+  <div class="pair">
+    {% for e in item.events %}
+    <div class="side">
+      <div class="side-date"><strong>{{ e.date_start.isoformat() if e.date_start else 'undated' }}</strong>
+        <span class="muted small">“{{ e.date_text }}” · {{ e.certainty.value }}</span></div>
+      <div>{{ e.description }}</div>
+      {% if e.actors %}<div class="muted small">{{ e.actors | join(', ') }}</div>{% endif %}
+      <blockquote>{{ e.source.quote }}</blockquote>
+      <a href="{{ source_url(e) }}">Open source{% if e.source.page %} (p.{{ e.source.page }}){% endif %}</a>
+    </div>
+    {% else %}
+    <p class="muted">The referenced events are no longer available.</p>
+    {% endfor %}
+  </div>
+</section>
+{% else %}
+<p class="muted">No contradictions detected.</p>
+{% endfor %}
+{% endblock %}

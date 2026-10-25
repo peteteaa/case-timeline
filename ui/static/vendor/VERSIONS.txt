@@ -1,0 +1,8 @@
+Vendored front-end libraries (served from /static/vendor; no CDN at runtime).
+
+htmx.org@2.0.4        https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js
+  sha256 e209dda5c8235479f3166defc7750e1dbcd5a5c1808b7792fc2e6733768fb447  htmx.min.js
+vis-timeline@7.7.3    https://cdn.jsdelivr.net/npm/vis-timeline@7.7.3/standalone/umd/vis-timeline-graph2d.min.js
+  sha256 55f5627557103696a538c5e662cab07d554fafc545882a082dfb5e2b5dea65d6  vis-timeline-graph2d.min.js
+                      https://cdn.jsdelivr.net/npm/vis-timeline@7.7.3/styles/vis-timeline-graph2d.min.css
+  sha256 b2fccd6ac3e0d7247982f11a45e8b68e0fa7e0f737b15c8c516792eb144087a5  vis-timeline-graph2d.min.css
