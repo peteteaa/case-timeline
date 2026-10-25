@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+{% block title %}Eval{% endblock %}
+{% block content %}
+{% set base = '/cases/' ~ quote(case_id) %}
+<div class="titlebar">
+  <div>
+    <span class="eyebrow">{{ case_id }}</span>
+    <h1>Eval<span class="n">{{ gold_n }} gold fact{{ '' if gold_n == 1 else 's' }}</span></h1>
+  </div>
+  <div class="actions">
+    <form method="post" action="{{ base }}/eval" class="inline">
+      <button class="btn primary" title="Re-score the stored facts against the gold timeline. No model calls.">Re-run eval</button>
+    </form>
+  </div>
+</div>
+<p class="lede">How the stored facts score against the gold timeline <span class="muted">({{ gold_path }})</span>. A re-run only re-scores what is already in the database. To measure new extraction, process the documents first.</p>
+
+{% if not res %}
+<section class="card">
+  <p>No eval report yet. {% if gold_n %}Press <strong>Re-run eval</strong> to score the current facts.{% else %}There is no gold timeline for this case, so nothing can be scored.{% endif %}</p>
+</section>
+{% else %}
+{% set f = res.facts %}
+<div class="sheet" style="margin-bottom: 16px">
+  <div class="table-wrap">
+  <table class="data">
+    <thead><tr><th>Metric</th><th class="num">Value</th><th>Detail</th></tr></thead>
+    <tbody>
+    {% for name, value, detail in rows %}
+      <tr><td>{{ name }}</td><td class="num"><strong>{{ fmt(value) }}</strong></td><td class="muted">{{ detail }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+{% set missed = f.matches | rejectattr('fact_id') | list %}
+{% set wrong_date = f.matches | selectattr('date_correct', 'sameas', false) | list %}
+<div class="sheet">
+  <div class="table-wrap">
+  <table class="data">
+    <thead><tr><th>Gold fact</th><th>Document</th><th>Gold date</th><th>Matched fact</th><th>Its date</th><th class="num">Score</th></tr></thead>
+    <tbody>
+    {% for r in f.matches %}
+      <tr id="gold-{{ r.gold_id }}">
+        <td><span class="fid">{{ r.gold_id }}</span> {{ gold_titles.get(r.gold_id, '') }}</td>
+        <td class="muted">{{ r.doc }}</td>
+        <td>{{ r.gold_date or '—' }}</td>
+        <td>{% if r.fact_id %}<a href="/facts/{{ quote(r.fact_id) }}">{{ r.fact_id }}</a>{% else %}<span class="error">missed</span>{% endif %}</td>
+        <td>{% if r.fact_id %}{{ r.pred_date or '—' }}{% if r.date_correct is sameas false %} <span class="error">wrong</span>{% endif %}{% endif %}</td>
+        <td class="num">{{ r.score if r.score is not none else '' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <p class="muted small" style="padding: 8px 12px">{{ missed | length }} missed · {{ wrong_date | length }} wrong date · {{ f.unmatched_facts | length }} stored facts not in the gold timeline (not all are errors: the gold timeline lists only key facts){% if report_time %} · report written {{ report_time }}{% endif %}</p>
+</div>
+{% endif %}
+{% endblock %}

@@ -30,7 +30,7 @@ Reference implementation: branch `wip/ntsb-accuracy` (`cc59d06`, old architectur
 
 ## Gotchas
 
-- **Eval gold path:** `python -m eval --case ntsb` looks for `eval/gold/ntsb_timeline.json` and silently falls back to `eval/gold_timeline.json`, the wrong file. Until it's renamed or converted, pass `--gold eval/gold/ntsb.json`.
+- **Eval gold path:** fixed. The NTSB gold is now `eval/gold/ntsb_timeline.json` (renamed, content unchanged), so `make eval CASE=ntsb` and the app's **Eval** tab (`/cases/ntsb/eval`) find it without `--gold`.
 - **Data policy (admin):** live scans and evals use the real NTSB case (`CT_CASE_ID=ntsb`, `CT_EVIDENCE_DIR=/home/dell/case-data/ntsb_cen10fa443/evidence`; Leo's copy is `/srv/case-timeline/case-data/ntsb_cen10fa443`). Unit tests stay on `tests/fixtures`.
 - **Scan:** `python -m pipeline.jobs scan --case ntsb` with its own `CT_DATA_DIR`. Never use `data/` itself: an OpenClaw cron job (currently paused) scans into it.
 

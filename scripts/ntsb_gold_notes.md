@@ -1,6 +1,6 @@
 # NTSB CEN10FA443 gold chronology: provenance
 
-`eval/gold/ntsb.json` holds the gold events for the real-document case `ntsb`. The source is the public NTSB docket for CEN10FA443, a Hawker Beechcraft 390 (N6JR) accident at Oshkosh, WI, on July 27, 2010. See `~/case-data/ntsb_cen10fa443/SOURCES.md`.
+`eval/gold/ntsb_timeline.json` holds the gold events for the real-document case `ntsb`. The source is the public NTSB docket for CEN10FA443, a Hawker Beechcraft 390 (N6JR) accident at Oshkosh, WI, on July 27, 2010. See `~/case-data/ntsb_cen10fa443/SOURCES.md`.
 
 ## How it was built
 
