@@ -528,7 +528,8 @@ def _fmt(v: Any) -> str:
     return str(v)
 
 
-def format_table(res: dict[str, Any]) -> str:
+def metric_rows(res: dict[str, Any]) -> list[tuple[str, Any, str]]:
+    """(name, value, detail) rows shared by the text report and the app's eval page."""
     f, m, c = res["facts"], res["merge"], res["contradictions"]
     j, r = res["jobs"], res["review"]
     rows = [
@@ -551,6 +552,11 @@ def format_table(res: dict[str, Any]) -> str:
             f"{j['docs_parsed']} docs in {j['job_seconds']:.0f}s",
         ),
     ]
+    return rows
+
+
+def format_table(res: dict[str, Any]) -> str:
+    rows = metric_rows(res)
     width = max(len(name) for name, *_ in rows)
     lines = [
         f"Case: {res['case_id']}",

@@ -26,6 +26,7 @@
       <a href="{{ base }}/documents" {% if p == base ~ '/documents' or p.startswith('/documents/') %}aria-current="page"{% endif %}>Documents</a>
       <a href="{{ base }}/witnesses" {% if p == base ~ '/witnesses' or p.startswith('/witnesses/') %}aria-current="page"{% endif %}>Witnesses</a>
       <a href="{{ base }}/contradictions" {% if p == base ~ '/contradictions' %}aria-current="page"{% endif %}>Contradictions{% if nav and nav.conflicts %} <span class="count warn">{{ nav.conflicts }}</span>{% endif %}</a>
+      <a href="{{ base }}/eval" {% if p == base ~ '/eval' %}aria-current="page"{% endif %}>Eval</a>
     </nav>
     <div class="appbar-end">
       <span class="local" title="Everything runs on this machine">{{ m.icon('lock') }}<span class="local-text">Local only</span></span>

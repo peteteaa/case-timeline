@@ -19,7 +19,7 @@ from collections import Counter
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import quote, urlsplit
@@ -78,6 +78,7 @@ from app.helpers import (
     toggle_query,
     valid_color,
 )
+from eval import run_eval as eval_mod
 from pipeline import digest as digest_mod
 from pipeline import export as export_mod
 from pipeline import search as search_mod
@@ -1192,6 +1193,57 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None) 
             items.append({"c": c, "facts": store.get_facts(c.fact_ids)})
         items.sort(key=lambda v: order.get(v["c"].status, 3))
         return render(request, "contradictions.html", items=items, **lookups(store))
+
+    def eval_report_path() -> Path:
+        return Path(settings.data_dir) / f"eval_{case}.json"
+
+    @app.get("/cases/{case_id}/eval", response_class=HTMLResponse)
+    def eval_page(request: Request, case_id: str) -> HTMLResponse:
+        check_case(case_id)
+        gold_path, _ = eval_mod.default_paths(case)
+        gold = eval_mod.load_gold(gold_path) if gold_path.exists() else []
+        res = None
+        path = eval_report_path()
+        if path.exists():
+            try:
+                res = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                log.warning("unreadable eval report %s", path)
+        try:
+            rows = eval_mod.metric_rows(res) if res else []
+        except (KeyError, TypeError):
+            log.warning("eval report %s has an unexpected shape", path)
+            res, rows = None, []
+        return render(
+            request,
+            "eval.html",
+            res=res,
+            rows=rows,
+            fmt=eval_mod._fmt,
+            gold_titles={g.id: g.title for g in gold},
+            gold_path=gold_path,
+            gold_n=len(gold),
+            report_time=(
+                datetime.fromtimestamp(path.stat().st_mtime, UTC).strftime("%Y-%m-%d %H:%M UTC")
+                if res
+                else None
+            ),
+        )
+
+    @app.post("/cases/{case_id}/eval", response_model=None)
+    def eval_run(request: Request, case_id: str) -> Response:
+        """Re-score the stored facts against the gold timeline (no model calls)."""
+        check_case(case_id)
+        require_user(request)
+        gold_path, disputes_path = eval_mod.default_paths(case)
+        gold = eval_mod.load_gold(gold_path) if gold_path.exists() else []
+        disputes = eval_mod.load_disputes(disputes_path) if disputes_path.exists() else []
+        res = eval_mod.evaluate(_store(request), case, gold, disputes)
+        res["gold"] = {"timeline": str(gold_path), "disputes": str(disputes_path)}
+        path = eval_report_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(res, indent=2, default=str) + "\n", encoding="utf-8")
+        return _redirect(f"/cases/{quote(case, safe='')}/eval")
 
     @app.post("/contradictions/{contradiction_id}", response_model=None)
     async def review_contradiction(request: Request, contradiction_id: str) -> Response:
