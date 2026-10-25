@@ -204,6 +204,9 @@ def _sighting(d: DraftFact) -> tuple[str, str]:
 def draft_facts(parsed: ParsedDocument) -> list[DraftFact]:
     """Chunk the document, ask the LLM for facts per chunk, return deduplicated drafts.
 
+    Chunks are sent to the model concurrently (bounded by ``settings.llm_concurrency``; the
+    requests share ``pipeline.llm``'s process-wide limiter) and their results are combined in
+    chunk order, so keys, cross-chunk dedupe and the returned order match a sequential run.
     A chunk whose LLM call fails is logged and skipped; if every chunk fails the last error is
     re-raised so the document stays queued for the next scan.
     """
@@ -216,7 +219,9 @@ def draft_facts(parsed: ParsedDocument) -> list[DraftFact]:
     by_sighting: dict[tuple[str, str], str] = {}
     failures = 0
     last_error: Exception | None = None
-    for i, (start, end) in enumerate(spans, start=1):
+
+    def ask(item: tuple[int, tuple[int, int]]) -> object:
+        i, (start, end) = item
         user = prompts.extraction_user(
             parsed.doc.filename,
             parsed.text[start:end],
@@ -224,13 +229,15 @@ def draft_facts(parsed: ParsedDocument) -> list[DraftFact]:
             len(spans),
             head=head_context(parsed.text, start),
         )
-        try:
-            result = llm.chat_json(prompts.EXTRACTION_SYSTEM, user, ExtractionResult)
-        except Exception as exc:  # one bad chunk must not sink the whole document
+        return llm.chat_json(prompts.EXTRACTION_SYSTEM, user, ExtractionResult)
+
+    results = llm.map_ordered(ask, list(enumerate(spans, start=1)))
+    for i, result in enumerate(results, start=1):
+        if isinstance(result, Exception):  # one bad chunk must not sink the whole document
             failures += 1
-            last_error = exc
+            last_error = result
             logger.warning(
-                "extraction failed for %s chunk %d/%d: %s", parsed.doc.doc_id, i, len(spans), exc
+                "extraction failed for %s chunk %d/%d: %s", parsed.doc.doc_id, i, len(spans), result
             )
             continue
         if not isinstance(result, ExtractionResult):

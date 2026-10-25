@@ -8,6 +8,14 @@ A scan: discover files in the evidence folder and the inbox (hash dedupe) → pa
 documents → draft facts (extract → verify → dates → witnesses → merge) → contradictions →
 alerts. Every stage lives in its own module; this file only orchestrates.
 
+New documents are parsed one at a time, and each one's extraction (the LLM-bound step) starts
+as soon as it is parsed, up to ``settings.llm_concurrency`` at once (the model requests share
+one limiter in ``pipeline.llm``). Once every document is parsed, the case's incident date is
+taken as the consensus of its documents' own incident dates, so a document that never states
+it (an interview held weeks later) dates its account against it. Verify, dates, merge and
+every store write stay on the job thread, in document order, so the result does not depend
+on which extraction finished first.
+
 CLI: ``python -m pipeline.jobs scan [--case ID]`` queues a scan and runs it inline.
 """
 
@@ -17,11 +25,16 @@ import argparse
 import logging
 import sys
 import threading
+from collections import Counter
+from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import date
+from itertools import chain
 from pathlib import Path
 
 from pipeline.config import Settings, get_settings, valid_case_id
-from pipeline.schema import AGENT, Contradiction, DraftFact, Job, ParsedDocument
+from pipeline.schema import AGENT, Contradiction, Document, DraftFact, Job, ParsedDocument
 from pipeline.store import Store
 
 log = logging.getLogger(__name__)
@@ -173,10 +186,17 @@ def _store_drafts(store: Store, parsed: ParsedDocument, drafts: list[DraftFact],
                 store.update_fact(fid, {"anchor_fact_id": anchor}, by=AGENT)
 
 
-def _draft_doc(store: Store, settings: Settings, parsed: ParsedDocument, run: _Run) -> None:
-    from pipeline import dates, extract, parse, verify
+def _draft_doc(
+    store: Store,
+    settings: Settings,
+    parsed: ParsedDocument,
+    run: _Run,
+    drafts: list[DraftFact],
+    case_incident: date | None = None,
+) -> None:
+    """Verify, date and store one document's extracted drafts (job thread)."""
+    from pipeline import dates, parse, verify
 
-    drafts = extract.draft_facts(parsed)
     run.counts["drafts"] += len(drafts)
     drafts, vcounts = verify.verify_drafts(parsed, drafts)
     for k in ("quotes_checked", "quotes_rejected", "drafts_discarded"):
@@ -184,10 +204,91 @@ def _draft_doc(store: Store, settings: Settings, parsed: ParsedDocument, run: _R
     cap = settings.max_drafts_per_doc
     if cap and len(drafts) > cap:
         drafts = sorted(drafts, key=lambda d: -d.confidence)[:cap]
-    drafts = dates.resolve_drafts(drafts, parse.doc_date(parsed), store.list_facts(run.job.case_id))
+    drafts = dates.resolve_drafts(
+        drafts,
+        parse.doc_date(parsed),
+        store.list_facts(run.job.case_id),
+        parsed=parsed,
+        case_incident_date=case_incident,
+        tz=settings.case_tz,
+    )
     _store_drafts(store, parsed, drafts, run)
     store.mark_drafted(parsed.doc.doc_id)
     run.processed_doc_ids.append(parsed.doc.doc_id)
+
+
+def case_incident_date(parsed_docs: Iterable[ParsedDocument]) -> date | None:
+    """The case's incident date: the date most of its documents give as their incident date.
+
+    Each document votes with ``parse.incident_date`` (an incident form field, a where/when
+    header or an opening sentence); documents that name none do not vote. None when no
+    document names one or when two dates tie for the most votes.
+    """
+    from pipeline import parse
+
+    votes: Counter[date] = Counter()
+    for parsed in parsed_docs:
+        try:
+            found = parse.incident_date(parsed)
+        except Exception:  # a heuristic must never fail the job
+            log.debug("incident date of %s failed", parsed.doc.doc_id, exc_info=True)
+            continue
+        if found is not None:
+            votes[found] += 1
+    ranked = votes.most_common(2)
+    if not ranked or (len(ranked) > 1 and ranked[0][1] == ranked[1][1]):
+        return None
+    return ranked[0][0]
+
+
+def _stored_parsed(store: Store, case_id: str, skip: set[str]) -> Iterable[ParsedDocument]:
+    """The stored text of the case's other parsed documents (lazily, one at a time)."""
+    for doc in store.list_documents(case_id):
+        if doc.doc_id in skip or doc.parse_status != "parsed":
+            continue
+        parsed = store.get_parsed(doc.doc_id)
+        if parsed is not None:
+            yield parsed
+
+
+def _draft_docs(store: Store, settings: Settings, todo: list[Document], run: _Run) -> None:
+    """Parse every new document while their extractions run, then date and store them in order.
+
+    A document that fails is recorded and the job goes on.
+    """
+    from pipeline import extract
+
+    case_id = run.job.case_id
+    items: list[tuple[Document, ParsedDocument | None, Future[list[DraftFact]] | None]] = []
+    pool = ThreadPoolExecutor(
+        max_workers=max(1, settings.llm_concurrency), thread_name_prefix="extract"
+    )
+    try:
+        for doc in todo:
+            parsed = _parse_doc(store, settings, doc.doc_id, run)
+            future = pool.submit(extract.draft_facts, parsed) if parsed is not None else None
+            items.append((doc, parsed, future))
+            store.update_job_counts(run.job.job_id, run.counts)
+
+        incident = settings.case_incident_date or case_incident_date(
+            chain(
+                (parsed for _doc, parsed, _f in items if parsed is not None),
+                _stored_parsed(store, case_id, {doc.doc_id for doc in todo}),
+            )
+        )
+        log.info("case %s: incident date %s", case_id, incident)
+
+        for doc, parsed, future in items:
+            if parsed is None or future is None:
+                continue
+            try:
+                _draft_doc(store, settings, parsed, run, future.result(), incident)
+            except Exception as exc:
+                log.exception("drafting failed for %s", doc.doc_id)
+                run.problems.append(f"{doc.filename}: {type(exc).__name__}: {exc}")
+            store.update_job_counts(run.job.job_id, run.counts)
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def run_job(store: Store, job: Job, settings: Settings | None = None) -> Job:
@@ -202,15 +303,7 @@ def run_job(store: Store, job: Job, settings: Settings | None = None) -> Job:
         _discover(store, settings, run)
         todo = store.documents_to_process(case_id)
         store.update_job_counts(job.job_id, run.counts)
-        for doc in todo:
-            parsed = _parse_doc(store, settings, doc.doc_id, run)
-            if parsed is not None:
-                try:
-                    _draft_doc(store, settings, parsed, run)
-                except Exception as exc:
-                    log.exception("drafting failed for %s", doc.doc_id)
-                    run.problems.append(f"{doc.filename}: {type(exc).__name__}: {exc}")
-            store.update_job_counts(job.job_id, run.counts)
+        _draft_docs(store, settings, todo, run)
 
         store.refresh_vectors(case_id)
         opened: list[Contradiction] = []

@@ -47,7 +47,11 @@ said or decided, each side's account), or an empty string.
 3. "date_text": this fact's time reference copied character for character from the excerpt \
 ("June 5, 2021", "late spring 2021", "three weeks later", "that evening", "no later than \
 May 6, 2024"). Never compute, complete or reformat a date: "three weeks later" stays "three \
-weeks later". Empty string if no time reference applies.
+weeks later". A bare clock time is a valid time reference: copy it as written ("At \
+0942:15", "1405 local time", "around 3:40 p.m."). An account tied only to the occurrence the \
+document is about uses that phrase ("at the time of the collision"). Never use the date a \
+statement, letter, or report was written, sent, or signed as the date of the occurrences it \
+describes. Empty string if no time reference applies.
 4. "people": the names of the people involved, as written (e.g. "John Smith", "Ms. Rivera"). \
 Person names only: no organizations, no job titles on their own, no pronouns. Empty list if \
 none are named.

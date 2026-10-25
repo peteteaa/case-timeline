@@ -161,7 +161,7 @@ def test_settings_paths(tmp_path, monkeypatch):
 
 def test_llm_concurrency_setting(monkeypatch):
     monkeypatch.delenv("CT_LLM_CONCURRENCY", raising=False)
-    assert Settings().llm_concurrency == 8
+    assert Settings().llm_concurrency == 4
     monkeypatch.setenv("CT_LLM_CONCURRENCY", "3")
     assert Settings().llm_concurrency == 3
     monkeypatch.setenv("CT_LLM_CONCURRENCY", "0")

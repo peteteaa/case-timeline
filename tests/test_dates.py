@@ -1,9 +1,9 @@
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 
 from pipeline.dates import is_open_bound, parse_absolute, parse_relative, resolve_drafts
-from pipeline.schema import DraftFact, SpanIn
+from pipeline.schema import Document, DraftFact, ParsedDocument, SpanIn
 from tests.pipeline_helpers import make_fact
 
 DOC_DATE = date(2024, 6, 15)  # a Saturday
@@ -129,12 +129,13 @@ def test_month_without_year_uses_nearest_year(text: str, start: date, end: date)
     assert one(text, doc_date=None).date_start is None
 
 
-def test_time_of_day_only_stays_undated() -> None:
-    # "approximately 6:15 PM" names no day; guessing one from a nearby fact is too risky.
+def test_time_of_day_takes_the_day_of_the_timed_fact_before_it() -> None:
+    # "approximately 6:15 PM" names no day: it continues the narrative's last timed day.
     a = ev("a", "March 14, 2024 at approximately 5:40 PM", 0)
     b = ev("b", "approximately 6:15 PM", 50)
     out = resolve([a, b], DOC_DATE)[1]
-    assert out.date_start is None and out.date_certainty == UNKNOWN
+    assert out.date_start == out.date_end == date(2024, 3, 14)
+    assert out.date_certainty == APPROXIMATE and out.anchor_key == "a"
 
 
 def test_month_only_never_becomes_exact() -> None:
@@ -540,11 +541,14 @@ def test_is_open_bound(text: str | None, bound: bool) -> None:
         "approximately 6:15 PM",
     ],
 )
-def test_time_only_is_not_a_year_and_stays_undated(text: str) -> None:
+def test_time_only_is_never_a_year(text: str) -> None:
     assert parse_absolute(text) is None
-    assert parse_relative(text) is None
+    spec = parse_relative(text)
+    assert spec is not None and spec.clock
+    # With nothing else to go on, a bare time falls back to the document's own day.
     out = one(text)
-    assert out.date_start is None and out.date_certainty == UNKNOWN
+    assert out.date_start == out.date_end == DOC_DATE and out.date_certainty == APPROXIMATE
+    assert one(text, doc_date=None).date_start is None
 
 
 @pytest.mark.parametrize("text", ["about 2005", "in 1999", "2010"])
@@ -563,3 +567,197 @@ def test_plausible_years_stay_years(text: str) -> None:
 )
 def test_time_ranges_within_a_day(text: str) -> None:
     assert parse_absolute(text, None) == ((date(2024, 3, 3), date(2024, 3, 3)), EXACT)
+
+
+# ------------------------------------------------- times of day, incident date, time zone
+
+ACCIDENT = date(2010, 7, 27)
+
+
+def doc(text: str, doc_id: str = "D-0001") -> ParsedDocument:
+    return ParsedDocument(
+        doc=Document(
+            doc_id=doc_id,
+            case_id="ntsb",
+            filename="report.pdf",
+            sha256="0" * 64,
+            location="evidence",
+            kind="other",
+            pages=1,
+            parse_status="parsed",
+            added_at=datetime(2026, 1, 1, tzinfo=UTC),
+        ),
+        text=text,
+    )
+
+
+def located(key: str, date_text: str, text: str, quote: str, title: str = "x") -> DraftFact:
+    start = text.index(quote)
+    return DraftFact(
+        key=key,
+        title=title,
+        date_text=date_text,
+        quotes=[quote],
+        spans=[SpanIn(doc_id="D-0001", char_start=start, char_end=start + len(quote), quote=quote)],
+    )
+
+
+def test_time_takes_the_day_stated_in_its_sentence() -> None:
+    text = "On July 27, 2010, at 1729, N6JR departed Willow Run Airport for Oshkosh."
+    d = located("a", "at 1729", text, "at 1729, N6JR departed Willow Run Airport")
+    out = resolve_drafts([d], date(2010, 9, 1), [], parsed=doc(text))[0]
+    assert out.date_start == out.date_end == ACCIDENT and out.date_certainty == EXACT
+
+
+def test_times_continue_the_narratives_last_explicit_date() -> None:
+    text = (
+        "HISTORY OF FLIGHT\n"
+        "On July 27, 2010, about 1817 central daylight time, a Premier jet crashed at Oshkosh.\n"
+        "At 1810:33 the pilot called the tower.\n"
+        "At 1816:19 the pilot asked whether 6JR was going to be okay.\n"
+    )
+    a = located("a", "1810:33", text, "the pilot called the tower")
+    b = located("b", "1816:19", text, "the pilot asked whether 6JR")
+    out = resolve_drafts([a, b], date(2010, 9, 1), [], parsed=doc(text))
+    assert [o.date_start for o in out] == [ACCIDENT, ACCIDENT]
+    assert all(o.date_certainty == APPROXIMATE for o in out)
+
+
+def test_a_time_never_continues_a_year_wide_span() -> None:
+    a = ev("a", "since 2006", 0)
+    b = ev("b", "at 1729", 50)
+    out = resolve([a, b], DOC_DATE)
+    assert out[1].date_start == DOC_DATE  # not January 1, 2006
+
+
+def test_at_the_time_of_the_accident_is_the_incident_date() -> None:
+    d = ev("a", "at the time of the accident", 40)
+    out = resolve_drafts([d], date(2010, 8, 17), [], incident_date=ACCIDENT)[0]
+    assert out.date_start == out.date_end == ACCIDENT and out.date_certainty == RELATIVE
+
+
+def test_incident_date_is_read_from_the_document_header() -> None:
+    text = "Date of Accident: 07/27/2010\nLocation: Oshkosh, WI\n\nAt 1816:57 the airplane crashed."
+    d = located("a", "1816:57", text, "the airplane crashed")
+    out = resolve_drafts([d], date(2010, 8, 2), [], parsed=doc(text))[0]
+    assert out.date_start == ACCIDENT
+
+
+INTERVIEW = (  # laid out like the NTSB docket's interview transcript
+    "NATIONAL TRANSPORTATION SAFETY BOARD\n"
+    "Investigation of: AIRPLANE ACCIDENT, OSHKOSH, WISCONSIN\n"
+    "Interview of: JACK ROUSH\n"
+    "Interview conducted by telephone\n"
+    "Monday,\n"
+    "August 30, 2010\n\n"
+    "Q. Tell us about the accident flight.\n"
+    "A. That day I cancelled the IFR flight plan to Milwaukee and continued to Oshkosh.\n"
+    "A. The stick shaker and the pusher went off as the right wing stalled.\n"
+)
+
+
+def test_an_interview_dates_its_account_by_the_case_incident() -> None:
+    held = located("held", "August 30, 2010", INTERVIEW, "Interview conducted by telephone")
+    cancel = located("cancel", "that day", INTERVIEW, "That day I cancelled the IFR flight plan")
+    stall = located("stall", "that day", INTERVIEW, "the right wing stalled")
+    drafts = [held, cancel, stall]
+    out = resolve_drafts(
+        drafts, date(2010, 8, 30), [], parsed=doc(INTERVIEW), case_incident_date=ACCIDENT
+    )
+    assert out[0].date_start == date(2010, 8, 30)  # the interview itself keeps its own date
+    assert out[1].date_start == out[2].date_start == ACCIDENT
+    # Without the case's incident date, "that day" can only mean the interview's day.
+    plain = resolve_drafts(drafts, date(2010, 8, 30), [], parsed=doc(INTERVIEW))
+    assert plain[1].date_start == date(2010, 8, 30)
+
+
+def test_case_incident_date_needs_a_document_about_an_incident() -> None:
+    text = "Memo dated March 3, 2024.\nThat day the board met to approve the budget.\n"
+    d = located("a", "that day", text, "the board met to approve the budget")
+    out = resolve_drafts([d], date(2024, 3, 3), [], parsed=doc(text), case_incident_date=ACCIDENT)
+    assert out[0].date_start == date(2024, 3, 3)
+
+
+@pytest.mark.parametrize(
+    ("text", "tz", "day"),
+    [
+        ("July 28, 2010, 0016 UTC", "America/Chicago", date(2010, 7, 27)),
+        ("July 28, 2010 at 00:16Z", "America/Chicago", date(2010, 7, 27)),
+        ("July 28, 2010, 0016 UTC", None, date(2010, 7, 28)),  # no case zone: as written
+        ("July 28, 2010, 0016 cdt", "America/Chicago", date(2010, 7, 28)),  # already local
+        ("July 28, 2010, 1816", "America/Chicago", date(2010, 7, 28)),  # no zone: never moved
+        ("July 27, 2010, 2316 UTC/1816 CDT", "America/Chicago", date(2010, 7, 27)),
+    ],
+)
+def test_utc_times_move_to_the_case_time_zone(text: str, tz: str | None, day: date) -> None:
+    found = parse_absolute(text, tz=tz)
+    assert found is not None and found[0] == (day, day)
+
+
+def test_unknown_case_time_zone_is_ignored() -> None:
+    found = parse_absolute("July 28, 2010, 0016 UTC", tz="Mars/Olympus")
+    assert found is not None and found[0][0] == date(2010, 7, 28)
+
+
+@pytest.mark.parametrize(
+    ("text", "start", "end"),
+    [
+        ("since 2006", date(2006, 1, 1), date(2006, 12, 31)),
+        ("starting in March 2007", date(2007, 3, 1), date(2007, 3, 31)),
+        ("from 2006", date(2006, 1, 1), date(2006, 12, 31)),
+    ],
+)
+def test_a_start_point_in_a_year_or_month_is_the_whole_period(
+    text: str, start: date, end: date
+) -> None:
+    found = parse_absolute(text)
+    assert found == ((start, end), APPROXIMATE)
+    assert is_open_bound(text)
+
+
+def test_year_only_is_the_whole_year_never_january_first() -> None:
+    out = one("2010")
+    assert (out.date_start, out.date_end) == (date(2010, 1, 1), date(2010, 12, 31))
+    assert out.date_certainty == APPROXIMATE
+
+
+def test_alternatives_span_both_dates() -> None:
+    assert parse_absolute("May or June of 2007") == (
+        (date(2007, 5, 1), date(2007, 6, 30)),
+        APPROXIMATE,
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "start", "end"),
+    [
+        ("two hours later", date(2024, 3, 3), date(2024, 3, 4)),  # may cross midnight
+        ("15 seconds later", date(2024, 3, 3), date(2024, 3, 3)),
+        ("30 minutes before", date(2024, 3, 3), date(2024, 3, 3)),
+    ],
+)
+def test_sub_day_offsets_stay_on_or_near_the_anchor_day(text: str, start: date, end: date) -> None:
+    a = ev("a", "March 3, 2024", 0)
+    b = ev("b", text, 50)
+    out = resolve([a, b])[1]
+    assert (out.date_start, out.date_end) == (start, end) and out.anchor_key == "a"
+
+
+def test_after_that_refers_back_to_the_previous_fact() -> None:
+    a = ev("a", "March 3, 2024", 0, title="the board met")
+    b = ev("b", "March 10, 2024", 50, title="that was approved")
+    c = ev("c", "shortly after that", 100)
+    out = resolve([a, b, c])[2]
+    assert out.anchor_key == "b" and out.date_start == date(2024, 3, 10)
+
+
+def test_on_this_date_is_the_date_just_mentioned_not_the_documents() -> None:
+    a = ev("a", "March 3, 2024", 0)
+    b = ev("b", "on this date", 50)
+    out = resolve([a, b])[1]
+    assert out.date_start == date(2024, 3, 3)
+
+
+def test_ocr_date_run_into_a_time_still_parses() -> None:
+    found = parse_absolute("07/02/202118:17")
+    assert found is not None and found[0] == (date(2021, 7, 2), date(2021, 7, 2))

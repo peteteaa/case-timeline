@@ -12,13 +12,13 @@
 # optionally CT_ALERT_TO to announce content-free alerts on that channel; the sandbox policy
 # must then allow that one endpoint.
 #
-# Env overrides: OPENCLAW, CT_CASE_ID (default demo), CT_TZ (IANA tz), CT_SCAN_EVERY (default 5m),
+# Env overrides: OPENCLAW, CT_CASE_ID (default ntsb, the live case), CT_TZ (IANA tz), CT_SCAN_EVERY (default 5m),
 # CT_OPENCLAW_AGENT (default case-timeline: the shell-less agent),
 # CT_ALERT_CHANNEL (unset = no channel), CT_ALERT_TO (channel destination, optional).
 set -euo pipefail
 
 OPENCLAW="${OPENCLAW:-$HOME/.openclaw/bin/openclaw}"
-CASE_ID="${CT_CASE_ID:-demo}"
+CASE_ID="${CT_CASE_ID:-ntsb}"
 EVERY="${CT_SCAN_EVERY:-5m}"
 AGENT="${CT_OPENCLAW_AGENT:-case-timeline}"
 DRY_RUN=0

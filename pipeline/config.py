@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -61,17 +63,42 @@ class Settings(BaseSettings):
     llm_timeout: float = 300.0  # seconds per request
     # Most model requests in flight at once (shared by every caller in this process). vLLM
     # batches concurrent requests, so a few parallel calls raise throughput a lot; 1 restores
-    # strictly sequential processing.
-    llm_concurrency: int = Field(default=8, ge=1, le=256)
+    # strictly sequential processing. The shared Qwen3.6 server has crashed at about 10-16
+    # concurrent requests (docs/HANDOFF.md), so the default stays at 4.
+    llm_concurrency: int = Field(default=4, ge=1, le=256)
     embed_model: str = "BAAI/bge-m3"
     embed_dim: int = 1024
 
     ui_host: str = "127.0.0.1"
     ui_port: int = 8090
 
+    # Case time zone (IANA name, e.g. "America/Chicago"). A time stated explicitly in UTC/GMT/
+    # Zulu is converted to it before its calendar day is taken; None = no conversion.
+    case_tz: str | None = None
+    # The case's incident date, when the documents' consensus should not be used.
+    case_incident_date: date | None = None
+
     max_drafts_per_doc: int = 40  # keep the most confident drafts per document (0 = no cap)
     worker_poll_seconds: float = 2.0
     run_worker: bool = True  # the app server starts the job worker
+
+    @field_validator("case_tz", mode="before")
+    @classmethod
+    def _valid_tz(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        if not isinstance(value, str):
+            raise ValueError("case_tz must be an IANA time zone name")
+        try:
+            ZoneInfo(value.strip())
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown time zone {value!r}") from exc
+        return value.strip()
+
+    @field_validator("case_incident_date", mode="before")
+    @classmethod
+    def _empty_date(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
 
     @model_validator(mode="after")
     def _resolve_paths(self) -> Settings:
