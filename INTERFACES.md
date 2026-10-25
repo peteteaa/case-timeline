@@ -8,7 +8,7 @@ All data types live in `pipeline/contracts.py`, and they are frozen. Only `pipel
 - `data_dir`: default `./data`. Holds the SQLite database, caches, and logs.
 - `db_path`: default `data_dir/case.db`.
 - `case_id`: default `demo`.
-- `llm_base_url`: `http://127.0.0.1:8000/v1`.
+- `llm_base_url`: `http://172.17.0.1:8000/v1` (docker0 bridge, so the NemoClaw sandbox can reach it). `llm_allowed_hosts` lists hosts trusted to be this machine; `llm.py` refuses anything else.
 - `llm_model`: `qwen3.6-35b-a3b`.
 - `embed_model`: `BAAI/bge-m3`.
 - `ui_host`: `127.0.0.1`. `ui_port`: `8080`.

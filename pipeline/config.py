@@ -53,7 +53,10 @@ class Settings(BaseSettings):
     db_path: Path | None = None  # defaults to data_dir / "case.db"
     case_id: str = "demo"
 
-    llm_base_url: str = "http://127.0.0.1:8000/v1"
+    # vLLM binds the docker0 bridge so the NemoClaw sandbox can reach it; never 0.0.0.0.
+    llm_base_url: str = "http://172.17.0.1:8000/v1"
+    # Hosts trusted to be this machine even from inside the sandbox (docker host-gateway).
+    llm_allowed_hosts: list[str] = ["host.openshell.internal", "172.17.0.1"]
     llm_model: str = "qwen3.6-35b-a3b"
     llm_timeout: float = 300.0  # seconds per request
     embed_model: str = "BAAI/bge-m3"

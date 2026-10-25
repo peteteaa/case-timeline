@@ -84,7 +84,16 @@ def test_llm_refuses_remote_endpoint_and_ignores_proxies(monkeypatch) -> None:
 
     assert llm._require_loopback("http://127.0.0.1:8000/v1")
     assert llm._require_loopback("http://[::1]:8000/v1")
-    for url in ("https://api.example.com/v1", "http://192.168.1.5:8000/v1", "http://0.0.0.0:1"):
+    assert llm._require_loopback("http://host.openshell.internal:8000/v1")
+    monkeypatch.setattr(llm, "_is_host_local", lambda h: h == "172.17.0.1")
+    assert llm._require_loopback("http://172.17.0.1:8000/v1")
+    monkeypatch.undo()
+    for url in (
+        "https://api.example.com/v1",
+        "http://203.0.113.5:8000/v1",
+        "http://0.0.0.0:1",
+        "http://evil.example:8000/v1",
+    ):
         with pytest.raises(llm.LLMError):
             llm._require_loopback(url)
 

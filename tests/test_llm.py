@@ -130,7 +130,7 @@ def test_embed_uses_sentence_transformer_when_loaded(monkeypatch):
 
 def test_health_ok(monkeypatch):
     def fake_get(url, timeout, headers, **kw):
-        assert url == "http://127.0.0.1:8000/v1/models"
+        assert url == "http://172.17.0.1:8000/v1/models"
         req = httpx.Request("GET", url)
         return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b-a3b"}]}, request=req)
 

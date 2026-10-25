@@ -7,6 +7,7 @@ import ipaddress
 import logging
 import math
 import re
+import socket
 import threading
 import time
 from functools import lru_cache
@@ -32,15 +33,36 @@ class LLMError(RuntimeError):
     """The model returned no usable output."""
 
 
-def _require_loopback(url: str) -> str:
-    """Return ``url`` if its host is loopback; case text must never leave this machine."""
-    host = (urlsplit(url).hostname or "").strip("[]")
+def _is_host_local(host: str) -> bool:
+    """True if ``host`` is loopback or an address assigned to this machine (e.g. docker0)."""
     try:
-        ok = host == "localhost" or ipaddress.ip_address(host).is_loopback
+        addr = ipaddress.ip_address(host)
     except ValueError:
-        ok = False
+        return False
+    if addr.is_loopback:
+        return True
+    if addr.is_unspecified or addr.is_multicast:
+        return False
+    family = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as sock:
+        try:
+            sock.bind((host, 0))  # only succeeds for addresses on a local interface
+        except OSError:
+            return False
+    return True
+
+
+def _require_loopback(url: str) -> str:
+    """Return ``url`` if its host stays on this machine; case text must never leave it.
+
+    Allowed: loopback, addresses assigned to a local interface (the docker0 bridge vLLM
+    binds to), and hostnames listed in ``settings.llm_allowed_hosts`` (e.g.
+    ``host.openshell.internal`` inside the NemoClaw sandbox, which resolves to the host).
+    """
+    host = (urlsplit(url).hostname or "").strip("[]")
+    ok = host == "localhost" or host in get_settings().llm_allowed_hosts or _is_host_local(host)
     if not ok:
-        raise LLMError(f"refusing non-loopback LLM endpoint {url!r}; models must run locally")
+        raise LLMError(f"refusing non-local LLM endpoint {url!r}; models must run on this machine")
     return url
 
 

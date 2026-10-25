@@ -9,7 +9,7 @@ An always-on local assistant for an NVIDIA GB10. It watches a case evidence fold
 ```bash
 make preflight          # checks aarch64, disk, GPU, uv, and openclaw
 make setup              # uv sync (needs internet once)
-make llm                # starts vLLM on 127.0.0.1:8000; wait for /v1/models to answer
+make llm                # starts vLLM on 172.17.0.1:8000 (docker0 bridge); wait for /v1/models
 make fixtures           # builds the demo case in tests/fixtures/case_demo
 make scan CASE=demo     # parses, extracts, verifies, dates, merges, and checks for conflicts
 make ui                 # dashboard at http://127.0.0.1:8080
@@ -30,7 +30,7 @@ If vLLM fails to initialise with the default MoE backend, run `MOE_BACKEND=flash
              v               v
    parse (Docling / PyMuPDF / text) -> ParsedDocument + page offsets
              |
-   extract  -- pipeline/llm.py --> vLLM Qwen3.6 @127.0.0.1:8000 (JSON schema)
+   extract  -- pipeline/llm.py --> vLLM Qwen3.6 @172.17.0.1:8000 (JSON schema)
              |
    verify (locate quote -> char offsets)  -> dates (resolve, certainty)
              |
@@ -46,7 +46,7 @@ Only `pipeline/llm.py` talks to the model. The UI and the MCP server go through 
 
 ## Security model
 
-- Every service binds to `127.0.0.1`: vLLM on :8000 and the UI on :8080. Nothing binds to `0.0.0.0`. `make ports` fails if any listener other than sshd:22 uses a non-loopback address.
+- The UI binds to `127.0.0.1:8080`. vLLM binds to the docker0 bridge, `172.17.0.1:8000`, so the NemoClaw sandbox can reach it; it is not reachable from Wi-Fi or Tailscale. Nothing binds to `0.0.0.0`. `make ports` fails if any listener other than sshd:22 and vLLM on the bridge uses a non-loopback address.
 - For remote access, use an SSH tunnel: `ssh -L 8080:127.0.0.1:8080 dell@<gb10>`, then open http://127.0.0.1:8080.
 - The evidence folder is read-only to the pipeline. Uploads go to `data/inbox`.
 - Alerts carry no case content, only the case name, the alert type, and a local dashboard link. That makes them safe to relay through messaging. `daily_digest` returns counts only.

@@ -41,8 +41,8 @@ else
 fi
 
 [[ -x /home/dell/.venvs/vllm/bin/vllm ]] && ok "vllm binary" || warn "vllm binary missing"
-if curl -fsS --max-time 2 http://127.0.0.1:8000/v1/models >/dev/null 2>&1; then
-  ok "LLM serving on 127.0.0.1:8000"
+if curl -fsS --max-time 2 http://172.17.0.1:8000/v1/models >/dev/null 2>&1; then
+  ok "LLM serving on 172.17.0.1:8000"
 else
   warn "LLM not running (make llm)"
 fi
