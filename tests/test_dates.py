@@ -284,3 +284,167 @@ def test_empty() -> None:
 @pytest.mark.parametrize("text", ["0000", "February 30, 2024", "Q2 0000", "the 0000s"])
 def test_invalid_calendar_values_are_unknown(text: str) -> None:
     assert one(text).certainty == Certainty.UNKNOWN
+
+
+# ------------------------------------------------------------ times of day, year carry-over
+
+
+@pytest.mark.parametrize(
+    ("text", "start", "certainty"),
+    [
+        ("March 14, 2024 at 5:40 PM", date(2024, 3, 14), EXACT),
+        ("March 14, 2024 at approximately 5:40 PM", date(2024, 3, 14), APPROXIMATE),
+        ("Wednesday, March 20, 2024 4:02 PM", date(2024, 3, 20), EXACT),
+        ("Mon, 25 Mar 2024 09:14:00 -0400", date(2024, 3, 25), EXACT),
+        ("2024-03-14T17:40:00", date(2024, 3, 14), EXACT),
+        ("10/14/2010 13:42 CDT", date(2010, 10, 14), EXACT),
+        ("May 6, 2024 at 1700 hours", date(2024, 5, 6), EXACT),
+        ("at noon on June 1, 2024", date(2024, 6, 1), EXACT),
+        ("the morning of March 3, 2024", date(2024, 3, 3), EXACT),
+        ("March 3, 2024, after the meeting", date(2024, 3, 3), EXACT),
+    ],
+)
+def test_time_of_day_is_dropped(text: str, start: date, certainty: Certainty) -> None:
+    result = parse_absolute(text, None)
+    assert result is not None
+    (lo, hi), cert = result
+    assert (lo, hi, cert) == (start, start, certainty)
+
+
+def test_timezone_offset_is_not_a_range() -> None:
+    e = one("Mon, 25 Mar 2024 09:14:00 -0400")
+    assert (e.date_start, e.date_end, e.certainty) == (date(2024, 3, 25), date(2024, 3, 25), EXACT)
+
+
+@pytest.mark.parametrize(
+    ("text", "start", "end"),
+    [
+        ("mid-March", date(2024, 3, 11), date(2024, 3, 20)),
+        ("early March", date(2024, 3, 1), date(2024, 3, 10)),
+        ("Sometime in mid-March, after that meeting", date(2024, 3, 11), date(2024, 3, 20)),
+        ("March", date(2024, 3, 1), date(2024, 3, 31)),
+        ("late December", date(2023, 12, 21), date(2023, 12, 31)),
+    ],
+)
+def test_month_without_year_carries_year_over(text: str, start: date, end: date) -> None:
+    assert parse_absolute(text, date(2024, 3, 12)) == ((start, end), APPROXIMATE)
+
+
+def test_month_without_year_and_no_reference_is_unknown() -> None:
+    assert parse_absolute("mid-March", None) is None
+    assert one("mid-March", doc_date=None).certainty == Certainty.UNKNOWN
+
+
+def test_month_without_year_uses_prior_dated_event() -> None:
+    events = [ev("a", "March 12, 2024", 0), ev("b", "sometime in mid-March", 50)]
+    out = {e.id: e for e in resolve_dates(events, date(2024, 9, 10))}
+    assert (out["b"].date_start, out["b"].date_end) == (date(2024, 3, 11), date(2024, 3, 20))
+    assert out["b"].certainty == APPROXIMATE
+
+
+@pytest.mark.parametrize(
+    ("text", "start", "end"),
+    [
+        ("earlier in the week", date(2024, 3, 11), date(2024, 3, 17)),
+        ("later that month", date(2024, 3, 1), date(2024, 3, 31)),
+        ("that same day", date(2024, 3, 12), date(2024, 3, 12)),
+        ("Two days later at 3 PM", date(2024, 3, 14), date(2024, 3, 14)),
+        ("approximately 6:15 PM", date(2024, 3, 12), date(2024, 3, 12)),
+    ],
+)
+def test_more_relative_phrases(text: str, start: date, end: date) -> None:
+    spec = parse_relative(text)
+    assert spec is not None
+    anchor = date(2024, 3, 12)
+    assert spec.apply((anchor, anchor), True) == (start, end)
+
+
+def test_bare_time_continues_last_timed_event_not_quoted_date() -> None:
+    events = [
+        ev("a", "March 14, 2024 at approximately 5:40 PM", 0, "officer responded"),
+        ev("b", "March 12, 2024", 100, "she said a meeting happened earlier"),
+        ev("c", "approximately 6:15 PM", 200, "both parties left"),
+    ]
+    out = {e.id: e for e in resolve_dates(events, None)}
+    assert out["c"].date_start == date(2024, 3, 14)
+    assert out["c"].anchor_event_id == "a"
+    assert out["c"].certainty == Certainty.RELATIVE
+
+
+def test_earlier_that_day_anchors_to_prior_timed_event() -> None:
+    events = [
+        ev("a", "March 14, 2024 at 5:40 PM", 0, "officer responded"),
+        ev("b", "earlier that day", 80, "she was sent home"),
+    ]
+    out = {e.id: e for e in resolve_dates(events, date(2024, 3, 18))}
+    assert out["b"].date_start == date(2024, 3, 14)
+    assert out["b"].anchor_event_id == "a"
+
+
+# --------------------------------------------------------------- 24-hour clock times
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1810:33",
+        "At 1816:19",
+        "about 1816:45",
+        "1829 Eastern daylight time",
+        "1342 cdt",
+        "at 1729",
+        "at about 0930",
+        "about 1815",
+        "at 1200 hours",
+    ],
+)
+def test_24_hour_times_are_times_not_years(text: str) -> None:
+    assert parse_absolute(text) is None
+    spec = parse_relative(text)
+    assert spec is not None and spec.clock
+
+
+@pytest.mark.parametrize("text", ["about 2005", "in 1999", "2010"])
+def test_plausible_years_stay_years(text: str) -> None:
+    found = parse_absolute(text)
+    assert found is not None and found[0][0].month == 1 and found[0][1].month == 12
+
+
+def test_date_with_24_hour_time_and_zone_name() -> None:
+    found = parse_absolute("June 5, 2021, about 1816 central daylight time")
+    assert found == ((date(2021, 6, 5), date(2021, 6, 5)), APPROXIMATE)
+    assert parse_absolute("On June 5, 2021 at 1729") == ((date(2021, 6, 5),) * 2, EXACT)
+
+
+def test_time_only_events_take_the_day_of_the_last_dated_event() -> None:
+    events = [
+        ev("a", "June 5, 2021, at 1729", 0, "The aircraft departed."),
+        ev("b", "1810:33", 50, "The pilot reported the field in sight."),
+        ev("c", "At 1816:19", 90, "The controller cleared the aircraft to land."),
+    ]
+    out = {e.id: e for e in resolve_dates(events, date(2021, 9, 1))}
+    for eid in ("b", "c"):
+        assert out[eid].date_start == date(2021, 6, 5)
+        assert out[eid].certainty == Certainty.RELATIVE
+
+
+def test_time_only_events_skip_untimed_later_dates_and_wide_spans() -> None:
+    events = [
+        ev("acc", "June 5, 2021", 0, "On June 5, 2021, about 1816 cdt, the truck overturned."),
+        ev("bg", "since 2006", 40, "The driver had held a commercial license since 2006."),
+        ev("meet", "June 6, 2021", 80, "The review team met the next day."),
+        ev("t1", "1810:33", 120, "The driver radioed dispatch."),
+        ev("t2", "1811:02", 160, "Dispatch replied."),
+    ]
+    out = {e.id: e for e in resolve_dates(events, date(2022, 2, 1))}
+    assert out["t1"].date_start == date(2021, 6, 5) and out["t1"].anchor_event_id == "acc"
+    assert out["t2"].date_start == date(2021, 6, 5)
+
+
+def test_time_only_event_never_anchors_to_a_year_span() -> None:
+    events = [
+        ev("bg", "since 2006", 0, "He has flown this aircraft type since 2006."),
+        ev("t", "8:00", 40, "He flew a morning mission."),
+    ]
+    out = {e.id: e for e in resolve_dates(events, date(2021, 8, 30))}
+    assert out["t"].date_start == date(2021, 8, 30)  # the document date, not 2006-01-01

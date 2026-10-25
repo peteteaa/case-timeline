@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 6000
 CHUNK_OVERLAP = 500
+HEAD_CHARS = 600  # start of the document shown as context for later chunks
+# Second "did you miss anything?" pass per chunk. Off by default: it roughly doubles
+# extraction latency; enable when recall matters more than scan time.
+GLEAN_PASSES = 0
+UNCOPIED_DATE_PENALTY = 0.8  # date_text not found in the excerpt (model computed it)
 
 _WS = re.compile(r"\s+")
 
@@ -24,9 +29,14 @@ class ExtractedEvent(BaseModel):
     """One event as returned by the model (offsets are computed later, not by the LLM)."""
 
     quote: str = Field(description="Verbatim sentence or clause copied from the excerpt.")
-    date_text: str = Field(description="The date exactly as written in the excerpt.")
+    date_text: str = Field(
+        description="This event's time reference copied verbatim from the excerpt "
+        "(never computed), e.g. 'June 5, 2021' or 'three weeks later'."
+    )
     actors: list[str] = Field(default_factory=list, description="Named people/organizations.")
-    description: str = Field(description="One neutral sentence describing the event.")
+    description: str = Field(
+        description="One short neutral sentence: who did what to whom (no date or location)."
+    )
     deadline_relevant: bool = False
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
 
@@ -96,6 +106,21 @@ def _chat_json(system: str, user: str, schema: type[BaseModel]) -> BaseModel:
     return llm.chat_json(system, user, schema)
 
 
+def _squash(s: str) -> str:
+    """Lowercase, unify quotes/dashes and drop whitespace for lenient containment checks."""
+    s = s.lower().translate(str.maketrans("\u2018\u2019\u201c\u201d\u2013\u2014", "''\"\"--"))
+    return _WS.sub("", s)
+
+
+def _head(text: str, chunk_start: int, limit: int = HEAD_CHARS) -> str:
+    """The document's opening (title, date, parties) for chunks that do not include it."""
+    if chunk_start <= 0:
+        return ""
+    end = min(limit, chunk_start, len(text))
+    cut = text.rfind("\n", 0, end)
+    return text[: cut if cut > limit // 2 else end]
+
+
 def _page_for(parsed: ParsedDocument, offset: int) -> int | None:
     for page in parsed.pages:
         if page.char_start <= offset < page.char_end:
@@ -125,6 +150,12 @@ def _to_event(
         actor = _norm(actor)
         if actor and actor not in actors:
             actors.append(actor)
+    confidence = min(1.0, max(0.0, item.confidence))
+    if date_text and _squash(date_text) not in _squash(parsed.text):
+        # The model computed or reworded the date instead of copying it; keep the event
+        # (the date is often right) but do not let it look as solid as a copied one.
+        logger.debug("date_text %r not found verbatim in %s", date_text, parsed.doc.id)
+        confidence *= UNCOPIED_DATE_PENALTY
     doc_id = parsed.doc.id
     return Event(
         id=event_id(doc_id, quote, date_text),
@@ -135,7 +166,7 @@ def _to_event(
         source=SourceRef(
             doc_id=doc_id, page=page, char_start=char_start, char_end=char_end, quote=quote
         ),
-        confidence=min(1.0, max(0.0, item.confidence)),
+        confidence=confidence,
         status=EventStatus.PROPOSED,
         deadline_relevant=item.deadline_relevant,
     )
@@ -159,6 +190,46 @@ def _merge_dup(a: Event, b: Event) -> Event:
     )
 
 
+def _ask(system: str, user: str) -> ExtractionResult:
+    result = _chat_json(system, user, ExtractionResult)
+    if not isinstance(result, ExtractionResult):
+        result = ExtractionResult.model_validate(result, from_attributes=True)
+    return result
+
+
+def _summary(item: ExtractedEvent) -> str:
+    return f"{_norm(item.date_text)}: {_norm(item.description)}"
+
+
+def _extract_chunk(parsed: ParsedDocument, start: int, end: int, i: int, n: int) -> list[Event]:
+    """First pass plus optional gleaning passes for one chunk."""
+    user = prompts.extraction_user(
+        parsed.doc.filename, parsed.text[start:end], i, n, head=_head(parsed.text, start)
+    )
+    items = list(_ask(prompts.EXTRACTION_SYSTEM, user).events)
+    for _ in range(GLEAN_PASSES):
+        try:
+            more = _ask(
+                prompts.EXTRACTION_SYSTEM,
+                user + "\n\n" + prompts.glean_user([_summary(x) for x in items]),
+            ).events
+        except Exception as exc:  # gleaning is best effort; keep the first pass
+            logger.warning("gleaning failed for %s chunk %d/%d: %s", parsed.doc.id, i, n, exc)
+            break
+        seen = {(_squash(x.quote), _squash(x.date_text)) for x in items}
+        new = [x for x in more if (_squash(x.quote), _squash(x.date_text)) not in seen]
+        logger.info("gleaning found %d new events in %s chunk %d/%d", len(new), parsed.doc.id, i, n)
+        if not new:
+            break
+        items.extend(new)
+    out: list[Event] = []
+    for item in items:
+        ev = _to_event(parsed, item, start, end)
+        if ev is not None:
+            out.append(ev)
+    return out
+
+
 def extract_events(parsed: ParsedDocument) -> list[Event]:
     """Chunk the document, ask the LLM for events per chunk, and return deduped Events.
 
@@ -170,9 +241,8 @@ def extract_events(parsed: ParsedDocument) -> list[Event]:
     failures = 0
     last_error: Exception | None = None
     for i, (start, end) in enumerate(spans, start=1):
-        user = prompts.extraction_user(parsed.doc.filename, parsed.text[start:end], i, len(spans))
         try:
-            result = _chat_json(prompts.EXTRACTION_SYSTEM, user, ExtractionResult)
+            chunk_events = _extract_chunk(parsed, start, end, i, len(spans))
         except Exception as exc:  # one bad chunk must not sink the whole document
             failures += 1
             last_error = exc
@@ -180,12 +250,7 @@ def extract_events(parsed: ParsedDocument) -> list[Event]:
                 "extraction failed for %s chunk %d/%d: %s", parsed.doc.id, i, len(spans), exc
             )
             continue
-        if not isinstance(result, ExtractionResult):
-            result = ExtractionResult.model_validate(result, from_attributes=True)
-        for item in result.events:
-            ev = _to_event(parsed, item, start, end)
-            if ev is None:
-                continue
+        for ev in chunk_events:
             events[ev.id] = _merge_dup(events[ev.id], ev) if ev.id in events else ev
     if spans and failures == len(spans) and last_error is not None:
         raise last_error

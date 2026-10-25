@@ -134,3 +134,48 @@ def test_already_stored_events_are_not_reinserted():
     old = ev("e1", "Smith paid rent")
     to_insert, dups = merge.merge_events([old], [old])
     assert to_insert == [] and dups == []
+
+
+def test_names_match_handles_titles_and_partial_names():
+    assert merge.names_match("Mr. Ellison", "Mark Ellison")
+    assert merge.names_match("Ms. Rivera", "Dana Rivera")
+    assert merge.names_match("Officer Ortiz", "Officer Jamie Ortiz")
+    assert merge.names_match("Dana", "Dana Rivera")
+    assert not merge.names_match("John Smith", "Mary Smith")
+    assert not merge.names_match("Alice", "Bob")
+    assert merge.is_organization("Halvorsen Freight Co.") and not merge.is_organization("Dana")
+
+
+def test_title_variants_count_as_same_actor():
+    old = ev("e1", "Rivera submitted a formal complaint", actors=["Ms. Rivera"])
+    new = ev("n1", "Rivera submitted a formal complaint", actors=["Dana Rivera"], doc="doc2")
+    assert merge.duplicate_pairs([new], [old]) == [(new, "e1")]
+
+
+def test_subset_description_not_enough_for_duplicate():
+    # token_set_ratio is 100 for a subset; the generic one must not swallow the detailed one.
+    old = ev("e1", "Meeting held")
+    new = ev("n1", "Meeting held with the board to approve the merger and the new budget")
+    assert merge.description_similarity(old, new) == 100
+    assert not merge.fuzzy_duplicate(old, new)
+    assert merge.duplicate_pairs([new], [old]) == []
+
+
+def test_cross_document_people_must_agree():
+    # Linked duplicates are hidden from contradiction checks, so a cross-document merge must
+    # not hide a disagreement about who was there.
+    old = ev("e1", "Meeting in Smith's office", actors=["John Smith", "Ann Lee"])
+    new = ev("n1", "Meeting in Smith's office", actors=["John Smith", "Bo Chan"], doc="doc2")
+    assert merge.duplicate_pairs([new], [old]) == []
+    same_doc = ev("n2", "Meeting in Smith's office", actors=["John Smith", "Bo Chan"])
+    assert merge.duplicate_pairs([same_doc], [old]) == [(same_doc, "e1")]
+    org_only_extra = ev(
+        "n3", "Meeting in Smith's office", actors=["Smith", "Lee", "Acme Corp."], doc="doc3"
+    )
+    assert merge.duplicate_pairs([org_only_extra], [old]) == [(org_only_extra, "e1")]
+
+
+def test_conflicting_dates_never_merge_across_documents():
+    old = ev("e1", "Meeting in Smith's office", d=date(2024, 3, 11))
+    new = ev("n1", "Meeting in Smith's office", d=date(2024, 3, 12), doc="doc2")
+    assert merge.duplicate_pairs([new], [old]) == []

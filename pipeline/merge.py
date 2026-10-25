@@ -15,6 +15,10 @@ from pipeline.contracts import Event
 log = logging.getLogger(__name__)
 
 FUZZ_THRESHOLD = 85.0
+# token_set_ratio scores 100 whenever one description's words are a subset of the other's
+# ("Meeting held." vs "Meeting held with X about Y"), so a fuzzy hit also needs this much
+# whole-string agreement (token_sort_ratio), which penalizes large length/content differences.
+SORT_THRESHOLD = 55.0
 COSINE_THRESHOLD = 0.9
 
 _WS = re.compile(r"\s+")
@@ -32,6 +36,74 @@ def normalize_actor(name: str) -> str:
 def actor_set(event: Event) -> set[str]:
     """Normalized, non-empty actor names of an event."""
     return {a for a in (normalize_actor(x) for x in event.actors) if a}
+
+
+# Titles and honorifics dropped before comparing names ("Dr. Lopez" ~ "Ana Lopez").
+_HONORIFICS = frozenset(
+    "mr mrs ms miss mx dr prof professor officer ofc sgt sergeant det detective cpl corporal "
+    "lt lieutenant capt captain cmdr commander chief judge justice hon honorable atty attorney "
+    "counsel esq sir madam dame rev father agent deputy sheriff trooper inspector investigator "
+    "witness plaintiff defendant the".split()
+)
+# Words that mark an organization rather than a person.
+_ORG_CUES = frozenset(
+    "co company corp corporation inc incorporated llc llp lp ltd plc gmbh group holdings "
+    "department dept division agency board bureau office administration authority commission "
+    "council court police sheriff's university school hospital bank association union "
+    "airlines airline services industries partners firm foundation trust committee state "
+    "county city federal national".split()
+)
+_NAME_TOKEN = re.compile(r"[^\W_]+(?:['’][^\W_]+)?")
+
+
+def name_tokens(name: str) -> tuple[str, ...]:
+    """Lower-cased name tokens with honorifics, initials and possessives removed."""
+    toks = []
+    for raw in _NAME_TOKEN.findall(name.casefold()):
+        tok = re.sub(r"['’]s$", "", raw)
+        if tok in _HONORIFICS or (len(tok) == 1 and tok.isalpha()):
+            continue
+        toks.append(tok)
+    return tuple(toks)
+
+
+def is_organization(name: str) -> bool:
+    """Heuristic: the name contains an organization cue word ("Co.", "Department", ...)."""
+    return any(t in _ORG_CUES for t in _NAME_TOKEN.findall(name.casefold()))
+
+
+def names_match(x: str, y: str) -> bool:
+    """Loose person/org name match: equal, one name's tokens contained in the other's
+    ("Lopez" ~ "Ana Lopez", "Mr. Okafor" ~ "Sam Okafor"), or a near-identical spelling."""
+    tx, ty = name_tokens(x), name_tokens(y)
+    if not tx or not ty:
+        return bool(_norm_text(x)) and _norm_text(x) == _norm_text(y)
+    sx, sy = set(tx), set(ty)
+    if sx <= sy or sy <= sx:
+        return True
+    return fuzz.token_sort_ratio(" ".join(tx), " ".join(ty)) >= 92
+
+
+def matched_actors(a: Event, b: Event) -> set[str]:
+    """Actors of ``a`` (as written) that loosely match some actor of ``b``."""
+    return {x for x in a.actors if x.strip() and any(names_match(x, y) for y in b.actors)}
+
+
+def unmatched_people(a: Event, b: Event) -> list[str]:
+    """People (not organizations) named in ``a`` that ``b`` does not name."""
+    return [
+        x
+        for x in a.actors
+        if x.strip()
+        and name_tokens(x)
+        and not is_organization(x)
+        and not any(names_match(x, y) for y in b.actors)
+    ]
+
+
+def actors_overlap(a: Event, b: Event) -> bool:
+    """True when the events share at least one (loosely matched) actor."""
+    return bool(matched_actors(a, b))
 
 
 def _interval(event: Event) -> tuple[date, date] | None:
@@ -65,16 +137,48 @@ def same_date(a: Event, b: Event) -> bool:
 
 
 def actors_compatible(a: Event, b: Event) -> bool:
-    """True unless both events name actors and the sets are disjoint."""
-    sa, sb = actor_set(a), actor_set(b)
-    if sa and sb:
-        return bool(sa & sb)
+    """True unless both events name actors and no name loosely matches across them."""
+    if actor_set(a) and actor_set(b):
+        return actors_overlap(a, b)
     return True
 
 
 def description_similarity(a: Event, b: Event) -> float:
     """rapidfuzz token_set_ratio (0-100) over the event descriptions."""
     return fuzz.token_set_ratio(a.description, b.description, processor=_preprocess)
+
+
+def fuzzy_duplicate(a: Event, b: Event) -> bool:
+    """Descriptions near-identical: high token_set_ratio *and* reasonable token_sort_ratio."""
+    if description_similarity(a, b) < FUZZ_THRESHOLD:
+        return False
+    sort = fuzz.token_sort_ratio(a.description, b.description, processor=_preprocess)
+    return sort >= SORT_THRESHOLD
+
+
+def people_agree(a: Event, b: Event) -> bool:
+    """Neither event names a person the other leaves out (organizations are ignored).
+
+    Events where one side names no actors at all are treated as agreeing.
+    """
+    if not actor_set(a) or not actor_set(b):
+        return True
+    return not unmatched_people(a, b) and not unmatched_people(b, a)
+
+
+def may_merge(a: Event, b: Event) -> bool:
+    """Date/actor gate for a duplicate link.
+
+    Linked duplicates are hidden from the timeline and from contradiction checks, so a merge
+    must never swallow a disagreement between two documents: across documents the resolved
+    dates must overlap and the named people must be the same. Within one document (e.g. the
+    same sentence seen in two overlapping chunks) sharing one actor is enough.
+    """
+    if not same_date(a, b):
+        return False
+    if a.source.doc_id != b.source.doc_id:
+        return actors_compatible(a, b) and people_agree(a, b)
+    return actors_compatible(a, b)
 
 
 def _preprocess(text: str) -> str:
@@ -113,9 +217,9 @@ def duplicate_pairs(new: list[Event], existing: list[Event]) -> list[tuple[Event
         targets = pool + new[:i]
         hits: list[tuple[Event, bool]] = []
         for other in targets:
-            if other.id == ev.id or not same_date(ev, other) or not actors_compatible(ev, other):
+            if other.id == ev.id or not may_merge(ev, other):
                 continue
-            hits.append((other, description_similarity(ev, other) >= FUZZ_THRESHOLD))
+            hits.append((other, fuzzy_duplicate(ev, other)))
         candidates[ev.id] = hits
 
     vectors = _embed_needed(new, candidates)

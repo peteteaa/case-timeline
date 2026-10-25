@@ -8,8 +8,20 @@ from pathlib import Path
 
 import pytest
 
-from eval.run_eval import GoldEvent, Pred, load_gold, main, match, run, score
-from pipeline.contracts import Event, SourceRef
+from eval.run_eval import (
+    GoldContradiction,
+    GoldEvent,
+    Pred,
+    contradictions_to_preds,
+    load_gold,
+    load_gold_contradictions,
+    main,
+    match,
+    run,
+    score,
+    score_contradictions,
+)
+from pipeline.contracts import Contradiction, Event, SourceRef
 
 GOLD = [
     {
@@ -139,3 +151,92 @@ def test_main_exits_zero(files: tuple[Path, Path], tmp_path: Path, capsys) -> No
     assert "precision=0.750" in capsys.readouterr().out
     # Missing gold file still exits 0.
     assert main(["--case", "t", "--gold", str(tmp_path / "nope.json"), "--out", str(out)]) == 0
+
+
+GOLD_C = [
+    {
+        "id": "C1",
+        "field": "date",
+        "planted": True,
+        "sides": [{"doc": "contract.pdf"}, {"doc": "emails.eml"}, {"doc": "letter.docx"}],
+    },
+    {
+        "id": "C2",
+        "field": "actor",
+        "planted": True,
+        "sides": [{"doc": "contract.pdf"}, {"doc": "emails.eml"}],
+    },
+    {"id": "C3", "field": "fact", "planted": False,
+     "sides": [{"doc": "emails.eml"}, {"doc": "letter.docx"}]},
+]  # fmt: skip
+
+
+def _contra(cid: str, ids: list[str], field: str, **kw) -> Contradiction:
+    return Contradiction(id=cid, case_id="t", event_ids=ids, field=field, explanation="x", **kw)
+
+
+def test_score_contradictions(tmp_path: Path) -> None:
+    path = tmp_path / "t_contradictions.json"
+    path.write_text(json.dumps(GOLD_C))
+    gold = load_gold_contradictions(path)
+    assert gold[0].docs == {"contract.pdf", "emails.eml", "letter.docx"} and not gold[2].planted
+    contras = [
+        _contra("p1", ["e0", "e1"], "date"),  # C1
+        _contra("p2", ["e1", "e0"], "fact"),  # right docs, wrong field -> FP (docs-only hit)
+        _contra("p3", ["e1", "e2"], "fact"),  # same document -> FP
+        _contra("p4", ["e1", "e9"], "fact"),  # unknown event -> one doc -> FP
+        _contra("p5", ["e0", "e1"], "actor", status="dismissed"),  # ignored
+    ]
+    preds = contradictions_to_preds(contras, PREDS)
+    assert [p.id for p in preds] == ["p1", "p2", "p3", "p4"]
+    res = score_contradictions(gold, preds)
+    assert res.n_gold == 2 and res.n_gold_all == 3 and res.n_pred == 4
+    assert res.found == ["C1"] and res.missed == ["C2"]
+    assert res.recall == pytest.approx(0.5) and res.precision == pytest.approx(0.25)
+    assert res.false_positives == ["p2", "p3", "p4"]
+    assert res.docs_only_recall == pytest.approx(1.0)
+    assert res.docs_only_precision == pytest.approx(0.5)
+
+
+def test_derived_gold_counts_for_precision_not_recall() -> None:
+    gold = [GoldContradiction("D", "fact", frozenset({"a", "b"}), planted=False)]
+    preds = contradictions_to_preds(
+        [_contra("p", ["x", "y"], "fact")],
+        [
+            _event(7, "d", [], None, "a").model_copy(update={"id": "x"}),
+            _event(8, "d", [], None, "b").model_copy(update={"id": "y"}),
+        ],
+    )
+    res = score_contradictions(gold, preds)
+    # No planted entries: every gold entry is scored for recall.
+    assert res.n_gold == 1 and res.recall == 1.0 and res.precision == 1.0
+
+
+def test_run_reports_contradictions_from_pred_json(tmp_path: Path, capsys) -> None:
+    gold = tmp_path / "t.json"
+    gold.write_text(json.dumps(GOLD))
+    (tmp_path / "t_contradictions.json").write_text(json.dumps(GOLD_C))
+    pred = tmp_path / "pred.json"
+    pred.write_text(
+        json.dumps(
+            {
+                "events": [e.model_dump(mode="json") for e in PREDS],
+                "contradictions": [_contra("p1", ["e0", "e1"], "date").model_dump(mode="json")],
+            }
+        )
+    )
+    out = tmp_path / "r.json"
+    assert (
+        main(["--case", "t", "--gold", str(gold), "--pred-json", str(pred), "--out", str(out)]) == 0
+    )
+    text = capsys.readouterr().out
+    assert "contra_recall=0.500" in text and "contra_precision=1.000" in text
+    report = json.loads(out.read_text())
+    assert report["contradictions"]["found"] == ["C1"]
+    assert report["n_matched"] == 3
+
+
+def test_no_contradiction_gold_means_no_section(files: tuple[Path, Path], tmp_path: Path) -> None:
+    gold, pred = files
+    res = run("t", gold_path=gold, pred_json=pred, out_path=tmp_path / "o.json")
+    assert res.contradictions is None

@@ -5,6 +5,13 @@ Gold file format (``eval/gold/<case>.json``): a list of
 
 Predictions come from the Store (``settings.db_path``) or, with ``--pred-json``,
 from a JSON file holding a list of ``Event`` objects (or ``{"events": [...]}``).
+
+Contradictions are scored too when ``eval/gold/<case>_contradictions.json`` exists: a list of
+``{"id", "field": "date"|"actor"|"fact", "planted": bool, "sides": [{"doc": ...}, ...]}``.
+A predicted contradiction matches a gold one when the fields agree and the documents of its
+events are all among the gold entry's side documents (at least two distinct documents).
+Recall is over planted entries (all entries if none is marked); precision counts a prediction
+as correct when it matches any gold entry, planted or derived.
 """
 
 from __future__ import annotations
@@ -20,8 +27,9 @@ from pathlib import Path
 from typing import Any
 
 from rapidfuzz import fuzz
+from rapidfuzz.utils import default_process
 
-from pipeline.contracts import Event
+from pipeline.contracts import Contradiction, ContradictionStatus, Event
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +75,55 @@ class DocStats:
         }
 
 
+@dataclass(frozen=True)
+class GoldContradiction:
+    id: str
+    field: str
+    docs: frozenset[str]
+    planted: bool = True
+    explanation: str = ""
+
+
+@dataclass(frozen=True)
+class PredContradiction:
+    id: str
+    field: str
+    docs: frozenset[str]
+    explanation: str = ""
+
+
+@dataclass
+class ContradictionResult:
+    n_gold: int  # gold entries scored for recall (planted ones, or all if none is marked)
+    n_gold_all: int
+    n_pred: int
+    found: list[str] = field(default_factory=list)  # scored gold ids matched by >= 1 pred
+    missed: list[str] = field(default_factory=list)
+    pred_matches: dict[str, list[str]] = field(default_factory=dict)  # pred id -> gold ids
+    false_positives: list[str] = field(default_factory=list)
+    recall: float = 0.0
+    precision: float = 0.0
+    docs_only_recall: float = 0.0  # same, ignoring the field
+    docs_only_precision: float = 0.0
+    preds: list[dict[str, Any]] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "n_gold": self.n_gold,
+            "n_gold_all": self.n_gold_all,
+            "n_pred": self.n_pred,
+            "recall": self.recall,
+            "precision": self.precision,
+            "docs_only_recall": self.docs_only_recall,
+            "docs_only_precision": self.docs_only_precision,
+            "found": self.found,
+            "missed": self.missed,
+            "pred_matches": self.pred_matches,
+            "false_positives": self.false_positives,
+            "preds": self.preds,
+        }
+
+
 @dataclass
 class EvalResult:
     case_id: str
@@ -82,6 +139,7 @@ class EvalResult:
     date_scored: int = 0
     date_correct: int = 0
     per_doc: dict[str, dict[str, Any]] = field(default_factory=dict)
+    contradictions: ContradictionResult | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -99,6 +157,7 @@ class EvalResult:
             "matches": self.matches,
             "unmatched_gold": self.unmatched_gold,
             "unmatched_pred": self.unmatched_pred,
+            "contradictions": self.contradictions.as_dict() if self.contradictions else None,
         }
 
 
@@ -153,6 +212,14 @@ def events_to_preds(events: Sequence[Event], doc_names: dict[str, str] | None = 
     ]
 
 
+def load_pred_json_contradictions(path: Path) -> list[Contradiction]:
+    """Contradictions from a ``{"events": [...], "contradictions": [...]}`` JSON file."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        return []
+    return [Contradiction.model_validate(item) for item in raw.get("contradictions") or []]
+
+
 def load_pred_json(path: Path) -> list[Event]:
     """Load Events from a JSON file (a list, or an object with an ``events`` key)."""
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -161,11 +228,15 @@ def load_pred_json(path: Path) -> list[Event]:
     return [Event.model_validate(item) for item in raw]
 
 
-def load_store_events(case_id: str) -> tuple[list[Event], dict[str, str]]:
-    """Load events (and a doc_id -> filename map, if available) from the local Store."""
-    from pipeline.store import Store
+def load_store_events(
+    case_id: str, *, include_duplicates: bool = False
+) -> tuple[list[Event], dict[str, str]]:
+    """Load events (and a doc_id -> filename map, if available) from the local Store.
 
+    Linked duplicates are hidden like in the timeline unless ``include_duplicates``.
+    """
     from pipeline.config import get_settings
+    from pipeline.store import Store
 
     settings = get_settings()
     db_path = Path(settings.db_path)
@@ -175,8 +246,25 @@ def load_store_events(case_id: str) -> tuple[list[Event], dict[str, str]]:
     store = Store(db_path)
     if hasattr(store, "init"):
         store.init()
-    events = list(store.list_events(case_id))
+    if include_duplicates:
+        events = list(store.list_events(case_id, include_duplicates=True))
+    else:
+        events = list(store.list_events(case_id))
     return events, _doc_names(store, case_id)
+
+
+def load_store_contradictions(case_id: str) -> tuple[list[Contradiction], list[Event]]:
+    """Stored contradictions plus every event (duplicates included) they may reference."""
+    from pipeline.config import get_settings
+    from pipeline.store import Store
+
+    db_path = Path(get_settings().db_path)
+    if not db_path.exists():
+        return [], []
+    store = Store(db_path)
+    return list(store.list_contradictions(case_id)), list(
+        store.list_events(case_id, include_duplicates=True)
+    )
 
 
 def _doc_names(store: Any, case_id: str) -> dict[str, str]:
@@ -189,6 +277,100 @@ def _doc_names(store: Any, case_id: str) -> dict[str, str]:
             except Exception:
                 log.debug("store.%s failed; falling back to doc ids", attr, exc_info=True)
     return {}
+
+
+def gold_contradictions_path(case_id: str, gold_path: Path | None = None) -> Path:
+    """``<gold dir>/<case>_contradictions.json`` next to the event gold file."""
+    base = gold_path.parent if gold_path is not None else GOLD_DIR
+    return base / f"{case_id}_contradictions.json"
+
+
+def load_gold_contradictions(path: Path) -> list[GoldContradiction]:
+    """Load a gold contradictions file (a list, or an object with a ``contradictions`` key)."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(raw, dict):
+        raw = raw.get("contradictions", [])
+    out = []
+    for i, item in enumerate(raw):
+        docs = frozenset(
+            _norm_doc(str(side.get("doc") or "")) for side in item.get("sides") or []
+        ) - {""}
+        out.append(
+            GoldContradiction(
+                id=str(item.get("id") or f"G{i + 1}"),
+                field=str(item.get("field", "")).strip().lower(),
+                docs=docs,
+                planted=bool(item.get("planted", True)),
+                explanation=str(item.get("explanation", "")),
+            )
+        )
+    return out
+
+
+def contradictions_to_preds(
+    contradictions: Sequence[Contradiction],
+    events: Sequence[Event],
+    doc_names: dict[str, str] | None = None,
+) -> list[PredContradiction]:
+    """Map contradictions to the (file) names of their events' documents; dismissed ones and
+    event ids that cannot be resolved are skipped."""
+    names = doc_names or {}
+    doc_of = {e.id: e.source.doc_id for e in events}
+    out = []
+    for c in contradictions:
+        if c.status == ContradictionStatus.DISMISSED:
+            continue
+        docs = {
+            _norm_doc(names.get(doc_of[eid], doc_of[eid])) for eid in c.event_ids if eid in doc_of
+        }
+        out.append(
+            PredContradiction(
+                id=c.id, field=str(c.field), docs=frozenset(docs), explanation=c.explanation
+            )
+        )
+    return out
+
+
+def _contradiction_matches(p: PredContradiction, g: GoldContradiction, use_field: bool) -> bool:
+    if use_field and p.field != g.field:
+        return False
+    return len(p.docs) >= 2 and p.docs <= g.docs
+
+
+def score_contradictions(
+    gold: Sequence[GoldContradiction], preds: Sequence[PredContradiction]
+) -> ContradictionResult:
+    """Contradiction recall (over planted gold) and precision (vs any gold entry)."""
+    scored = [g for g in gold if g.planted] or list(gold)
+    res = ContradictionResult(n_gold=len(scored), n_gold_all=len(gold), n_pred=len(preds))
+
+    def rates(use_field: bool) -> tuple[float, float, dict[str, list[str]]]:
+        hits = {
+            p.id: [g.id for g in gold if _contradiction_matches(p, g, use_field)] for p in preds
+        }
+        found = {gid for gids in hits.values() for gid in gids}
+        recall = _ratio(sum(1 for g in scored if g.id in found), len(scored))
+        precision = _ratio(sum(1 for gids in hits.values() if gids), len(preds))
+        return recall, precision, hits
+
+    res.recall, res.precision, hits = rates(True)
+    res.docs_only_recall, res.docs_only_precision, _ = rates(False)
+    found = {gid for gids in hits.values() for gid in gids}
+    res.found = [g.id for g in scored if g.id in found]
+    res.missed = [g.id for g in scored if g.id not in found]
+    res.pred_matches = {pid: gids for pid, gids in hits.items() if gids}
+    res.false_positives = [p.id for p in preds if not hits[p.id]]
+    res.preds = [
+        {
+            "id": p.id,
+            "field": p.field,
+            "docs": sorted(p.docs),
+            "matches": hits[p.id],
+            "explanation": p.explanation,
+        }
+        for p in preds
+    ]
+    return res
 
 
 def _actor_overlap(a: Sequence[str], b: Sequence[str]) -> float:
@@ -204,20 +386,26 @@ def _actor_overlap(a: Sequence[str], b: Sequence[str]) -> float:
 def match(
     gold: Sequence[GoldEvent], preds: Sequence[Pred], threshold: float = DESC_THRESHOLD
 ) -> list[tuple[int, int, float, float]]:
-    """Greedy one-to-one matching. Returns (gold_idx, pred_idx, desc_score, total_score)."""
-    candidates: list[tuple[float, float, int, int]] = []
+    """Greedy one-to-one matching. Returns (gold_idx, pred_idx, desc_score, total_score).
+
+    Descriptions are compared case- and punctuation-insensitively. Pairs from the same
+    document are matched first, so that two documents' accounts of one occurrence are not
+    swapped; cross-document pairs only fill what is left.
+    """
+    candidates: list[tuple[bool, float, float, int, int]] = []
     for gi, g in enumerate(gold):
         for pi, p in enumerate(preds):
-            desc = fuzz.token_set_ratio(g.description, p.description)
+            desc = fuzz.token_set_ratio(g.description, p.description, processor=default_process)
             if desc < threshold:
                 continue
             total = desc + ACTOR_BONUS * _actor_overlap(g.actors, p.actors)
-            candidates.append((total, desc, gi, pi))
-    candidates.sort(key=lambda c: (-c[0], -c[1], c[2], c[3]))
+            same_doc = bool(g.doc) and _norm_doc(g.doc) == _norm_doc(p.doc)
+            candidates.append((not same_doc, total, desc, gi, pi))
+    candidates.sort(key=lambda c: (c[0], -c[1], -c[2], c[3], c[4]))
     used_g: set[int] = set()
     used_p: set[int] = set()
     out: list[tuple[int, int, float, float]] = []
-    for total, desc, gi, pi in candidates:
+    for _, total, desc, gi, pi in candidates:
         if gi in used_g or pi in used_p:
             continue
         used_g.add(gi)
@@ -287,7 +475,27 @@ def format_table(res: EvalResult) -> str:
             f"{name:<40} {d['gold']:>5} {d['pred']:>5} {d['matched']:>5} "
             f"{d['precision']:>6.3f} {d['recall']:>6.3f} {d['f1']:>6.3f}"
         )
+    if res.contradictions is not None:
+        lines += ["", *format_contradictions(res.contradictions)]
     return "\n".join(lines)
+
+
+def format_contradictions(c: ContradictionResult) -> list[str]:
+    """Plain-text contradiction summary lines."""
+    lines = [
+        f"Contradictions: gold={c.n_gold} (of {c.n_gold_all})  pred={c.n_pred}  "
+        f"found={len(c.found)}  false_pos={len(c.false_positives)}",
+        f"contra_recall={c.recall:.3f}  contra_precision={c.precision:.3f}  "
+        f"(docs only: recall={c.docs_only_recall:.3f} precision={c.docs_only_precision:.3f})",
+    ]
+    if c.found:
+        lines.append(f"found:  {', '.join(c.found)}")
+    if c.missed:
+        lines.append(f"missed: {', '.join(c.missed)}")
+    for p in c.preds:
+        tag = ",".join(p["matches"]) or "FP"
+        lines.append(f"  [{tag:<6}] {p['field']:<5} {' vs '.join(p['docs'])}")
+    return lines
 
 
 def _data_dir() -> Path:
@@ -304,16 +512,30 @@ def run(
     gold_path: Path | None = None,
     pred_json: Path | None = None,
     out_path: Path | None = None,
+    *,
+    contradictions_path: Path | None = None,
+    include_duplicates: bool = True,
 ) -> EvalResult:
     """Load gold + predictions, score, and write the JSON report."""
+    contradictions_path = contradictions_path or gold_contradictions_path(case_id, gold_path)
     gold_path = gold_path or GOLD_DIR / f"{case_id}.json"
     gold = load_gold(gold_path)
+    names: dict[str, str] = {}
     if pred_json is not None:
-        preds = events_to_preds(load_pred_json(pred_json))
+        events = load_pred_json(pred_json)
     else:
-        events, names = load_store_events(case_id)
-        preds = events_to_preds(events, names)
+        events, names = load_store_events(case_id, include_duplicates=include_duplicates)
+    preds = events_to_preds(events, names)
     res = score(case_id, gold, preds)
+    if contradictions_path.exists():
+        gold_c = load_gold_contradictions(contradictions_path)
+        if pred_json is not None:
+            pred_c, all_events = load_pred_json_contradictions(pred_json), events
+        else:
+            pred_c, all_events = load_store_contradictions(case_id)
+        res.contradictions = score_contradictions(
+            gold_c, contradictions_to_preds(pred_c, all_events, names)
+        )
     out_path = out_path or _data_dir() / f"eval_{case_id}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(res.as_dict(), indent=2), encoding="utf-8")
@@ -328,6 +550,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--gold", type=Path, default=None, help="gold file (default eval/gold/<case>)")
     ap.add_argument("--pred-json", type=Path, default=None, help="score Events from a JSON file")
     ap.add_argument("--out", type=Path, default=None, help="report path (default data/eval_<case>)")
+    ap.add_argument(
+        "--contradictions",
+        type=Path,
+        default=None,
+        help="gold contradictions file (default <gold dir>/<case>_contradictions.json)",
+    )
+    ap.add_argument(
+        "--exclude-duplicates",
+        action="store_true",
+        help="hide linked duplicate events like the timeline does (by default they are scored, "
+        "because the gold lists each document's own account of an occurrence)",
+    )
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -340,7 +574,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         except Exception:
             case_id = "demo"
     try:
-        res = run(case_id, args.gold, args.pred_json, args.out)
+        res = run(
+            case_id,
+            args.gold,
+            args.pred_json,
+            args.out,
+            contradictions_path=args.contradictions,
+            include_duplicates=not args.exclude_duplicates,
+        )
     except Exception as exc:
         log.error("eval failed: %s", exc)
         return 0

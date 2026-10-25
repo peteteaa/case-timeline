@@ -246,6 +246,95 @@ def test_bad_overlap_rejected() -> None:
         chunk_text("abc", 10, 10)
 
 
+def test_computed_date_text_lowers_confidence(fake_llm) -> None:
+    _, responses = fake_llm
+    responses.append(
+        ExtractionResult(
+            events=[
+                ExtractedEvent(
+                    quote="Two days after the meeting, Smith emailed Jane Doe about the invoice.",
+                    date_text="March 5, 2024",  # computed by the model, not in the text
+                    description="Smith emailed Jane Doe.",
+                    confidence=1.0,
+                ),
+                ExtractedEvent(
+                    quote="Acme Corp. hired John Smith on March 3, 2024.",
+                    date_text="march  3, 2024",  # copied (case/whitespace differences are fine)
+                    description="Acme Corp. hired John Smith.",
+                    confidence=1.0,
+                ),
+            ]
+        )
+    )
+    by_desc = {e.description: e for e in extract_events(make_parsed())}
+    computed, copied = by_desc["Smith emailed Jane Doe."], by_desc["Acme Corp. hired John Smith."]
+    assert computed.confidence == pytest.approx(extract.UNCOPIED_DATE_PENALTY)
+    assert copied.confidence == 1.0
+
+
+def test_later_chunks_get_document_head_as_context(
+    fake_llm, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls, _ = fake_llm
+    head = "WITNESS STATEMENT OF JANE ROE\nDate: April 2, 2024\n\n"
+    text = head + ("Filler sentence about nothing in particular. " * 60)
+    monkeypatch.setattr(extract, "CHUNK_SIZE", 1500)
+    monkeypatch.setattr(extract, "CHUNK_OVERLAP", 200)
+    extract_events(make_parsed(text))
+    assert len(calls) >= 2
+    first_user, second_user = calls[0][1], calls[1][1]
+    assert "<document_start>" not in first_user  # the first chunk already has the head
+    assert "<document_start>" in second_user and "Date: April 2, 2024" in second_user
+
+
+def test_prompts_keep_contracted_names() -> None:
+    from pipeline import prompts
+
+    for name in ("EXTRACTION_SYSTEM", "EXTRACTION_USER", "CONFLICT_SYSTEM", "CONFLICT_USER"):
+        assert isinstance(getattr(prompts, name), str)
+    user = prompts.extraction_user("f.txt", "chunk text", 1, 1)
+    assert "chunk text" in user and "f.txt" in user and "{" not in user
+
+
+def test_gleaning_adds_only_new_events(fake_llm, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls, responses = fake_llm
+    monkeypatch.setattr(extract, "GLEAN_PASSES", 1)
+    hired = ExtractedEvent(
+        quote="Acme Corp. hired John Smith on March 3, 2024.",
+        date_text="March 3, 2024",
+        description="Acme Corp. hired John Smith.",
+    )
+    due = ExtractedEvent(
+        quote="The answer is due no later than April 1, 2024.",
+        date_text="no later than April 1, 2024",
+        description="Answer due.",
+    )
+    responses.append(ExtractionResult(events=[hired]))
+    responses.append(ExtractionResult(events=[hired, due]))  # repeats one, adds one
+    events = extract_events(make_parsed())
+    assert len(calls) == 2
+    assert "Acme Corp. hired John Smith." in calls[1][1]  # first-pass events are listed
+    assert [e.date_text for e in events] == ["March 3, 2024", "no later than April 1, 2024"]
+
+
+def test_gleaning_failure_keeps_first_pass(fake_llm, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, responses = fake_llm
+    monkeypatch.setattr(extract, "GLEAN_PASSES", 1)
+    responses.append(
+        ExtractionResult(
+            events=[
+                ExtractedEvent(
+                    quote="Acme Corp. hired John Smith on March 3, 2024.",
+                    date_text="March 3, 2024",
+                    description="Acme Corp. hired John Smith.",
+                )
+            ]
+        )
+    )
+    responses.append(RuntimeError("model unavailable"))
+    assert len(extract_events(make_parsed())) == 1
+
+
 @pytest.mark.llm
 def test_live_extraction_quotes_are_verbatim() -> None:
     events = extract_events(make_parsed())

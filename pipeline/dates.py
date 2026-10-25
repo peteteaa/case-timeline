@@ -88,6 +88,88 @@ def _clean(text: str) -> str:
     return s.strip(" .,;:\"'")
 
 
+_TZ = r"(?:\s*(?:[+-]\d{2}:?\d{2}|z\b|(?:utc|gmt|[ecmp][sd]t)\b(?:\s*[+-]\d{1,2}(?::?\d{2})?)?))?"
+_TIME_QUAL = (
+    r"(?P<q>(?:approximately|approx\.?|about|around|roughly|circa|ca\.|shortly before"
+    r"|shortly after|just before|just after)\s+)?"
+)
+# Spelled-out zones ("central daylight time") and "local"/"lcl", as in incident reports.
+_TZ_WORDS = (
+    r"(?:(?:eastern|central|mountain|pacific|alaska|hawaii|atlantic)\s+(?:standard|daylight)"
+    r"(?:\s+(?:saving\s+)?time)?|local(?:\s+time)?|lcl|[ecmp][sd]t|utc|gmt|zulu|z)\b"
+)
+_HHMM = r"(?:[01]\d|2[0-3])[0-5]\d"  # 24-hour clock without a colon ("1816")
+_CLOCK = (
+    rf"(?:{_HHMM}:[0-5]\d(?:\.\d+)?{_TZ}"  # "1810:33" (HHMM:SS, recorder transcripts)
+    rf"|\d{{1,2}}:\d{{2}}(?::\d{{2}}(?:\.\d+)?)?(?:\s*[ap]\.?\s?m\b\.?)?{_TZ}"
+    rf"|\d{{1,2}}\s*[ap]\.?\s?m\b\.?{_TZ}|[0-2]\d[0-5]\d\s*(?:hours|hrs\.?|h\b)(?:\s+local)?{_TZ}"
+    rf"|{_HHMM}\s*{_TZ_WORDS}"  # "1829 eastern daylight time", "1342 cdt"
+    rf"|noon|midnight)"
+)
+_TIME_OF_DAY = re.compile(
+    rf"(?:,\s*|\s+|^)(?:at\s+|@\s*|by\s+)?{_TIME_QUAL}{_CLOCK}"
+    rf"(?:\s+(?:hours|hrs\.?|local(?:\s+time)?))?"
+)
+# A bare 24-hour time is only a time (not a year) when introduced by "at" ("at 1729",
+# "at about 0930"), or when qualified as approximate and too early to be a plausible year
+# ("about 1815"). "About 2005" stays a year.
+_BARE_HHMM = re.compile(
+    rf"(?:,\s*|\s+|^)(?:(?P<at>at\s+(?P<aq>(?:approximately|approx\.?|about|around)\s+)?)"
+    rf"|(?P<q>(?:approximately|approx\.?|about|around)\s+))(?P<hhmm>{_HHMM})\b"
+    rf"(?!\s*(?:[-/.,]\s*)?\d|\s+(?:{_MONTH}))"
+)
+
+
+def _sub_times(s: str) -> tuple[str, bool]:
+    """Replace every time of day in `s` with a space; also say if one was approximate."""
+    approx = False
+
+    def drop(m: re.Match[str]) -> str:
+        nonlocal approx
+        approx = approx or bool(m.group("q"))
+        return " "
+
+    def drop_bare(m: re.Match[str]) -> str:
+        nonlocal approx
+        if not m.group("at") and int(m.group("hhmm")) >= 1900:
+            return m.group(0)
+        approx = approx or bool(m.group("q") or m.group("aq"))
+        return " "
+
+    out = _TIME_OF_DAY.sub(drop, s)
+    return _BARE_HHMM.sub(drop_bare, out), approx
+
+
+def _is_time_only(s: str) -> bool:
+    """`s` (already cleaned) states only a time of day, no date ("at 1816:19", "6:15 pm")."""
+    return bool(s) and not _sub_times(s)[0].strip(" ,;:-") and s.strip() != ""
+
+
+def _has_time(s: str) -> bool:
+    return _sub_times(s)[0] != s
+
+
+_DAY_PART = r"(?:early\s+|late\s+|mid-?)?(?:morning|afternoon|evening|night|day)"
+_DAY_PART_PREFIX = re.compile(rf"^(?:in\s+|during\s+|on\s+)?the\s+{_DAY_PART}\s+of\s+")
+_DAY_PART_SUFFIX = re.compile(rf",?\s+(?:in|during)\s+the\s+{_DAY_PART}$")
+
+
+def _strip_time(s: str) -> tuple[str, bool]:
+    """Drop clock times, time zones and day parts ("at approximately 5:40 pm", "-0400").
+
+    Returns the remaining text and whether a removed time was qualified as approximate
+    ("around 3pm"), which keeps the date APPROXIMATE rather than EXACT.
+    """
+    s = re.sub(r"(\d)t(?=\d{1,2}:\d{2})", r"\1 ", s)  # ISO 8601 "2021-06-05T09:30"
+    out, approx = _sub_times(s)
+    if re.search(r"\d", out):  # never reduce "this morning" to "this"
+        out = _DAY_PART_PREFIX.sub("", out.strip())
+        out = _DAY_PART_SUFFIX.sub("", out)
+    out = re.sub(r"\s+", " ", out).strip(" ,;:-")
+    out = re.sub(r"\s+(?:on|at|of)$", "", out)
+    return (out, approx) if out else (s, False)
+
+
 def _last_day(y: int, m: int) -> int:
     return calendar.monthrange(y, m)[1]
 
@@ -124,13 +206,28 @@ def _nearest_year(month: int, day: int, ref: date) -> date | None:
 
 def parse_absolute(text: str, ref: date | None = None) -> tuple[Span, Certainty] | None:
     """Parse a date that needs no anchor event. `ref` only helps infer a missing year."""
-    s = _clean(text)
+    cleaned = _clean(text)
+    if _is_time_only(cleaned):  # "at 1729" is a time of day, never the year 1729
+        return None
+    s, approx_time = _strip_time(cleaned)
     if not s:
         return None
     try:
-        return _parse_range(s, ref) or _parse_point(s, ref)
+        found = _parse_range(s, ref) or _parse_point(s, ref)
     except (ValueError, OverflowError):  # e.g. year 0000, Feb 30
         return None
+    if found is None and "," in s:
+        # "March 3, 2024, after the meeting": keep the longest leading part that parses.
+        parts = s.split(",")
+        for k in range(len(parts) - 1, 0, -1):
+            head = ",".join(parts[:k]).strip()
+            if head and re.search(r"\d|" + _MONTH, head):
+                found = parse_absolute(head, ref)
+                if found is not None:
+                    break
+    if found is not None and approx_time and found[1] == Certainty.EXACT:
+        found = (found[0], Certainty.APPROXIMATE)
+    return found
 
 
 def _parse_point(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
@@ -236,7 +333,31 @@ def _parse_partial(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
         start = int(m.group(2)) * 10
         lo, hi = {"early": (0, 3), "mid": (3, 6), "late": (6, 9)}.get(m.group(1) or "", (0, 9))
         return (date(start + lo, 1, 1), date(start + hi, 12, 31)), approx
-    return None
+    return _partial_without_year(s, ref)
+
+
+def _partial_without_year(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
+    """'mid-June' / 'early June' / 'June' with no year: carry the year over from `ref`.
+
+    The year is the one that puts the span nearest to `ref` (the previous dated event in
+    the document, else the document date); the result is always APPROXIMATE.
+    """
+    if ref is None or _has_year(s) or re.search(r"\d", s):
+        return None
+    part = r"(?:(?:early|mid|middle|late|beginning|start|end|close)(?:\s*-\s*|\s+of\s+|\s+))"
+    m = re.match(rf"^(?:the\s+)?(?:month\s+of\s+)?{part}?(?:the\s+month\s+of\s+)?({_MONTH})$", s)
+    if not m:
+        return None
+    best: tuple[int, tuple[Span, Certainty]] | None = None
+    for y in (ref.year - 1, ref.year, ref.year + 1):
+        found = _parse_partial(f"{s} {y}", None)
+        if found is None:
+            continue
+        lo, hi = found[0]
+        dist = 0 if lo <= ref <= hi else min(abs((lo - ref).days), abs((hi - ref).days))
+        if best is None or dist < best[0]:
+            best = (dist, (found[0], Certainty.APPROXIMATE))
+    return best[1] if best else None
 
 
 def _parse_full(s: str, ref: date | None) -> tuple[Span, Certainty] | None:
@@ -348,6 +469,7 @@ class RelativeSpec:
     apply: Callable[[Span, bool], Span]
     deictic: bool = False  # relative to the document's own date ("yesterday", "3 days ago")
     phrase: str | None = None  # explicit anchor ("the meeting", "March 3, 2024")
+    clock: bool = False  # a bare time of day: continues the last event that had a time
 
 
 def _shift(d: date, n: int, unit: str, business: bool = False) -> date:
@@ -412,6 +534,9 @@ _DAY_UNITS = {"day", "morning", "afternoon", "evening", "night"}
 def parse_relative(text: str) -> RelativeSpec | None:
     """Recognize a relative date expression; None if the text is not relative."""
     s = _clean(text)
+    if _is_time_only(s):
+        return RelativeSpec(lambda a, _e: a, clock=True)  # "at about 6:15 pm": same day
+    s = _strip_time(s)[0]
     if not s:
         return None
     s = re.sub(r"^(?:on|in)\s+", "", s)
@@ -470,8 +595,8 @@ def parse_relative(text: str) -> RelativeSpec | None:
 
     m = re.match(
         r"^(?P<the>the\s+)?(?P<which>next|following|previous|preceding|prior|last|this|that"
-        r"|same|very same|subsequent)\s+(?P<unit>day|date|morning|afternoon|evening|night|week"
-        r"|weekend|month|year)$",
+        r"|same|very same|that same|subsequent)\s+(?P<unit>day|date|morning|afternoon|evening"
+        r"|night|week|weekend|month|year)$",
         s,
     )
     if m:
@@ -484,10 +609,20 @@ def parse_relative(text: str) -> RelativeSpec | None:
         return RelativeSpec(lambda a, _e, n=n, u=unit: _period(a, u, n), deictic=deictic)
 
     m = re.match(
-        r"^(?:later|earlier) (?:that|the same) (?:day|morning|afternoon|evening|night)$", s
+        r"^(?:later|earlier) (?:that|the same|that same) (?:day|morning|afternoon|evening|night)$",
+        s,
     )
     if m:
         return RelativeSpec(lambda a, _e: a)
+
+    m = re.match(
+        r"^(?:(?:later|earlier)\s+(?:that|the same|that same|in the|in that|this)"
+        r"|(?:that|the same|that same))\s+(?P<unit>week|weekend|month|year)$",
+        s,
+    )
+    if m:
+        period_unit = m.group("unit")
+        return RelativeSpec(lambda a, _e: _period(a, period_unit, 0))
 
     m = re.match(
         rf"^(?:the\s+)?(?:(?P<which>next|following|last|previous|preceding|this|that|coming)\s+)?"
@@ -572,6 +707,13 @@ def _match_anchor(phrase: str, pos: int, candidates: list[tuple[int, Event]]) ->
 def _prior(pos: int, candidates: list[tuple[int, Event]]) -> Event | None:
     prior = [(cpos, ev) for cpos, ev in candidates if cpos < pos]
     return max(prior, key=lambda x: x[0])[1] if prior else None
+
+
+def _single_day(ev: Event) -> bool:
+    """The event is pinned to one day: not a span, and not an open bound ("since 2006")."""
+    if ev.date_start is None or (ev.date_end is not None and ev.date_end != ev.date_start):
+        return False
+    return not _OPEN_BOUND.match(_clean(ev.date_text))
 
 
 def _span_of(ev: Event) -> Span:
@@ -668,6 +810,18 @@ def _resolve_relative(
         anchor_span = (doc_date, doc_date)
     else:
         prior = _prior(pos, candidates)
+        if spec.clock:
+            # Narrative times ("At 6:15 pm they left", "1810:33") continue the most recent
+            # event that was itself stated with a time of day (in its date text or quote), not
+            # a date quoted in between ("the group met on <next day>"). A time of day only
+            # continues a single day, never a month- or year-wide span ("since 2006").
+            day = [(c, e) for c, e in candidates if _single_day(e)]
+            timed = [
+                (c, e)
+                for c, e in day
+                if _has_time(_clean(e.date_text)) or _has_time(_clean(e.source.quote))
+            ]
+            prior = _prior(pos, timed) or _prior(pos, day)
         if prior is not None:
             anchor_span, anchor_id, from_event = _span_of(prior), prior.id, True
         elif doc_date is not None and final:
