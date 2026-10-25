@@ -43,3 +43,22 @@ Reference implementation: branch `wip/ntsb-accuracy` (`cc59d06`, old architectur
 ## Demo UI
 
 `ct-ui-8090` (owned by dell-c9) serves the OLD ui at http://127.0.0.1:8090 from the worktree `/home/dell/case-timeline-demo` (`4bea4cd`), with NTSB data copied to `/home/dell/ct-demo/ntsb`. To switch it to Spec 2: `python -m app` from a clean checkout of `main`, with the same env (`CT_UI_PORT=8090`, `CT_CASE_ID=ntsb`, `CT_EVIDENCE_DIR`, `CT_DATA_DIR` pointed at a Spec 2 scan copy, `CT_CHAT_BACKEND=local` if supported). Ask dell-c9 to do the restart.
+
+## Status of the port (leo-zhang's Claude, 2026-10-25 ~22:35 UTC)
+
+Branch `port/handoff` (on top of `4004c9d`). 655 tests green, ruff clean.
+
+| Handoff item | State |
+|---|---|
+| 1. Date fixes | Ported to `pipeline/dates.py` + `pipeline/jobs.py`: bare times inherit the day (same sentence → exact; else the narrative's last day, the incident date, the document date → approximate); `parse.incident_date` is used again; a case-level incident date (consensus of the documents, or `CT_CASE_INCIDENT_DATE`) for documents that never state it; heading dates never anchor the account; `CT_CASE_TZ` converts UTC/Zulu times; "since 2006" is the whole year. Year-only was already a full-year range on Spec 2. |
+| 2. Contradiction precision rules | Ported to `pipeline/conflicts.py` (date relation / containment / slack, message vs. referenced date, plan vs. outcome, knowledge vs. actor, time-zone and 90 s clock compatibility, local exclusion cue, date notes in the prompt). |
+| 3. llm_concurrency fan-out | Extraction chunks, documents in a job, and contradiction confirmations all go through `llm.map_ordered`; stored results stay in document/candidate order. Default `llm_concurrency` lowered to 4. |
+| 4. OpenClaw scripts | `--agent` (CT_OPENCLAW_AGENT, default case-timeline) in both scripts; `openclaw_cron.sh` defaults to the ntsb case. |
+| Gotcha: eval gold path | Fixed: `--case ntsb` now finds `eval/gold/ntsb.json`, warns on any fallback, and never scores ntsb contradictions against the demo disputes. |
+
+Live NTSB scan on the port (one scan, concurrency 4, `CT_CASE_TZ=America/Chicago`, 252 s): **date accuracy 1.000 (21/21)**, recall 0.778 (21/27), 0 contradictions from 28 candidates (the model judged all of them distinct occurrences; there is no ntsb disputes gold to score them).
+
+Still open (not in the list above):
+- **Recall** is the gap to the old 0.926, and it is extraction, not dates: the per-document cap (`CT_MAX_DRAFTS_PER_DOC=40`) dropped part of the sheriff report's 64 drafts, and Spec 2's extractor has no gleaning passes (the old `GLEAN_PASSES`), so the interview's go-around / stick-shaker passages were never drafted.
+- The FAA Controller Statements PDF needs OCR (install the extras: `uv sync --all-extras`).
+- Not ported from `cc59d06` (WIP, unverified): the `importance` key-event flag, low-yield re-OCR, `_refine_from_quote`.
