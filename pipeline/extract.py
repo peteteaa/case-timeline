@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from pipeline import prompts
 from pipeline.contracts import Event, EventStatus, ParsedDocument, SourceRef
+from pipeline.llm import map_ordered
 
 logger = logging.getLogger(__name__)
 
@@ -230,27 +231,46 @@ def _extract_chunk(parsed: ParsedDocument, start: int, end: int, i: int, n: int)
     return out
 
 
+def _map_chunks(
+    parsed: ParsedDocument, spans: list[tuple[int, int]]
+) -> list[list[Event] | Exception]:
+    """Run ``_extract_chunk`` for every span, concurrently when allowed; results in span order.
+
+    Each element is the chunk's event list or the exception its LLM call raised. The model
+    requests share ``pipeline.llm``'s process-wide limiter, so this fan-out never exceeds
+    ``settings.llm_concurrency`` requests in flight.
+    """
+    n = len(spans)
+
+    def run(item: tuple[int, tuple[int, int]]) -> list[Event]:
+        i, (start, end) = item
+        return _extract_chunk(parsed, start, end, i, n)
+
+    return map_ordered(run, list(enumerate(spans, start=1)))
+
+
 def extract_events(parsed: ParsedDocument) -> list[Event]:
     """Chunk the document, ask the LLM for events per chunk, and return deduped Events.
 
-    A chunk whose LLM call fails is logged and skipped; if every chunk fails the last
-    error is re-raised so the caller can retry the document later.
+    Chunks are sent to the model concurrently (bounded by ``settings.llm_concurrency``), and
+    their results are combined in chunk order, so ids, cross-chunk dedupe and the returned
+    order are the same as a sequential run. A chunk whose LLM call fails is logged and
+    skipped; if every chunk fails the last error is re-raised so the caller can retry the
+    document later.
     """
     spans = chunk_text(parsed.text, CHUNK_SIZE, CHUNK_OVERLAP)
     events: dict[str, Event] = {}
     failures = 0
     last_error: Exception | None = None
-    for i, (start, end) in enumerate(spans, start=1):
-        try:
-            chunk_events = _extract_chunk(parsed, start, end, i, len(spans))
-        except Exception as exc:  # one bad chunk must not sink the whole document
+    for i, result in enumerate(_map_chunks(parsed, spans), start=1):
+        if isinstance(result, Exception):  # one bad chunk must not sink the whole document
             failures += 1
-            last_error = exc
+            last_error = result
             logger.warning(
-                "extraction failed for %s chunk %d/%d: %s", parsed.doc.id, i, len(spans), exc
+                "extraction failed for %s chunk %d/%d: %s", parsed.doc.id, i, len(spans), result
             )
             continue
-        for ev in chunk_events:
+        for ev in result:
             events[ev.id] = _merge_dup(events[ev.id], ev) if ev.id in events else ev
     if spans and failures == len(spans) and last_error is not None:
         raise last_error

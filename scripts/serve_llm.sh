@@ -4,8 +4,8 @@
 # Tailscale cannot. Never change --host to 0.0.0.0. Use an SSH tunnel for remote access.
 #
 # Env overrides:
-#   MOE_BACKEND   default flashinfer_b12x (needs CUTE_DSL_ARCH=sm_121a on GB10).
-#                 Fallback if the engine fails to initialise: MOE_BACKEND=flashinfer_cutlass
+#   MOE_BACKEND   default flashinfer_cutlass. flashinfer_b12x (~2x faster per the model README)
+#                 crashes on GB10 with vllm 0.32.0 + flashinfer 0.7.0.post1 (illegal memory access).
 #   MODEL_DIR     default /home/dell/models/Qwen3.6-35B-A3B-NVFP4-Fast
 #   VLLM_BIN      default /home/dell/.venvs/vllm/bin/vllm
 #   MAX_MODEL_LEN default 65536
@@ -19,7 +19,7 @@ SERVED_NAME="${SERVED_NAME:-qwen3.6-35b-a3b}"
 HOST="${HOST:-172.17.0.1}"
 PORT="${PORT:-8000}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
-MOE_BACKEND="${MOE_BACKEND:-flashinfer_b12x}"
+MOE_BACKEND="${MOE_BACKEND:-flashinfer_cutlass}"
 LOG="${ROOT}/data/vllm.log"
 
 export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_121a}"

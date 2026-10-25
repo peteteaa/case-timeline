@@ -368,7 +368,7 @@ def test_bare_time_continues_last_timed_event_not_quoted_date() -> None:
     out = {e.id: e for e in resolve_dates(events, None)}
     assert out["c"].date_start == date(2024, 3, 14)
     assert out["c"].anchor_event_id == "a"
-    assert out["c"].certainty == Certainty.RELATIVE
+    assert out["c"].certainty == Certainty.APPROXIMATE  # the day is inherited, not stated
 
 
 def test_earlier_that_day_anchors_to_prior_timed_event() -> None:
@@ -425,7 +425,8 @@ def test_time_only_events_take_the_day_of_the_last_dated_event() -> None:
     out = {e.id: e for e in resolve_dates(events, date(2021, 9, 1))}
     for eid in ("b", "c"):
         assert out[eid].date_start == date(2021, 6, 5)
-        assert out[eid].certainty == Certainty.RELATIVE
+        assert out[eid].certainty == Certainty.APPROXIMATE
+        assert out[eid].anchor_event_id in ("a", "b")
 
 
 def test_time_only_events_skip_untimed_later_dates_and_wide_spans() -> None:
@@ -448,3 +449,187 @@ def test_time_only_event_never_anchors_to_a_year_span() -> None:
     ]
     out = {e.id: e for e in resolve_dates(events, date(2021, 8, 30))}
     assert out["t"].date_start == date(2021, 8, 30)  # the document date, not 2006-01-01
+
+
+# ------------------------------------------------- narrative context: text + incident date
+
+
+def _doc(text: str, doc_id: str = "d1"):
+    from pipeline.contracts import Document, ParsedDocument
+
+    doc = Document(id=doc_id, case_id="demo", path="/x", filename="r.pdf", mime="x", sha256="x")
+    return ParsedDocument(doc=doc, text=text)
+
+
+def at(eid: str, date_text: str, text: str, quote: str, unverified: bool = False) -> Event:
+    """An event whose quote is located in `text` (offsets 0/0 when unverified)."""
+    start = 0 if unverified else text.index(quote)
+    end = 0 if unverified else start + len(quote)
+    return Event(
+        id=eid,
+        case_id="demo",
+        date_text=date_text,
+        description=quote,
+        source=SourceRef(doc_id="d1", char_start=start, char_end=end, quote=quote),
+        confidence=0.9,
+    )
+
+
+REPORT = (
+    "Regional Safety Office\n"
+    "September 9, 2022\n"
+    "FACTUAL REPORT\n"
+    "B. VEHICLE ACCIDENT\n"
+    "Location: Springfield Date: June 5, 2021 Time: 0940 central daylight time\n\n"
+    "On June 5, 2021, about 0940 central daylight time, a delivery truck overturned. "
+    "The review team met at the depot on June 7, 2021. "
+    "The team collected logs.\n\n"
+    "History of the trip\n\n"
+    "The truck left the yard at 0805 local time. "
+    "At 0931:12, the driver radioed dispatch. "
+    "Dispatch replied. "
+    "At the time of the accident, the road was wet.\n"
+)
+
+
+def test_time_only_takes_last_timed_narrative_date_from_text() -> None:
+    events = [
+        at("meet", "June 7, 2021", REPORT, "The review team met at the depot on June 7, 2021."),
+        at("t1", "0805 local time", REPORT, "The truck left the yard at 0805 local time."),
+        at("t2", "At 0931:12", REPORT, "At 0931:12, the driver radioed dispatch."),
+    ]
+    out = {e.id: e for e in resolve_dates(events, date(2022, 9, 9), parsed=_doc(REPORT))}
+    # the timed "On June 5, 2021, about 0940" beats the later, untimed review-team date
+    assert out["t1"].date_start == out["t1"].date_end == date(2021, 6, 5)
+    assert out["t1"].certainty == APPROXIMATE
+    assert out["t2"].date_start == date(2021, 6, 5)
+    assert out["t2"].certainty == APPROXIMATE
+    assert out["t2"].anchor_event_id == "t1"  # continues the previous timed event
+
+
+def test_time_only_with_the_day_in_the_same_sentence_is_exact() -> None:
+    text = "Notes.\n\nThe truck left at 0805 on June 5, 2021, heading north. It rained.\n"
+    e = at("t", "at 0805", text, "The truck left at 0805")
+    out = resolve_dates([e], date(2022, 1, 1), parsed=_doc(text))[0]
+    assert out.date_start == date(2021, 6, 5)
+    assert out.certainty == EXACT
+
+
+def test_time_only_falls_back_to_incident_date_not_doc_date() -> None:
+    text = "Statement taken March 1, 2022\nDate of Incident: 06/05/2021\n\nAt 0931 I saw it.\n"
+    e = at("t", "At 0931", text, "At 0931 I saw it.")
+    out = resolve_dates([e], date(2022, 3, 1), parsed=_doc(text))[0]
+    assert out.date_start == date(2021, 6, 5)
+    assert out.certainty == APPROXIMATE
+
+
+def test_time_only_without_text_uses_explicit_incident_date() -> None:
+    out = resolve_dates([ev("t", "at 1405", 0)], date(2022, 3, 1), incident_date=date(2021, 6, 5))
+    assert out[0].date_start == date(2021, 6, 5)
+    assert out[0].certainty == APPROXIMATE
+
+
+def test_time_only_without_incident_still_uses_doc_date() -> None:
+    out = resolve_dates([ev("t", "at 1405", 0)], date(2022, 3, 1))[0]
+    assert out.date_start == date(2022, 3, 1)
+    assert out.certainty == APPROXIMATE
+
+
+def test_at_the_time_of_the_accident_anchors_to_incident_date() -> None:
+    events = [
+        at("hdr", "June 5, 2021", REPORT, "Date: June 5, 2021 Time: 0940"),
+        at("meet", "June 7, 2021", REPORT, "The review team met at the depot on June 7, 2021."),
+        at("wet", "At the time of the accident", REPORT, "the road was wet."),
+        at("u", "at the time of the accident", REPORT, "nowhere", unverified=True),
+    ]
+    out = {e.id: e for e in resolve_dates(events, date(2022, 9, 9), parsed=_doc(REPORT))}
+    for eid in ("wet", "u"):
+        assert out[eid].date_start == date(2021, 6, 5)
+        assert out[eid].anchor_event_id == "hdr"
+
+
+def test_undated_account_takes_incident_date_not_authoring_date() -> None:
+    text = (
+        "September 2, 2021\nDear Ms. Ortiz:\nThis concerns the collision involving my truck "
+        "on June 5, 2021.\n\nThe next day I called the insurer.\n"
+    )
+    e = at("call", "The next day", text, "The next day I called the insurer.", unverified=True)
+    out = resolve_dates([e], date(2021, 9, 2), parsed=_doc(text))[0]
+    assert out.date_start == date(2021, 6, 6)  # the day after the incident, not Sept 3
+    assert out.certainty == Certainty.RELATIVE
+
+
+def test_letter_date_line_is_not_a_narrative_anchor_when_incident_known() -> None:
+    text = (
+        "Statement\nIncident occurred Saturday, June 5, 2021 near the depot.\n\n"
+        "September 4, 2021\n\nI was at the gate. At 0931 the truck tipped over.\n"
+    )
+    events = [
+        at("letter", "September 4, 2021", text, "September 4, 2021"),
+        at("t", "At 0931", text, "At 0931 the truck tipped over."),
+    ]
+    out = {e.id: e for e in resolve_dates(events, date(2021, 9, 4), parsed=_doc(text))}
+    assert out["t"].date_start == date(2021, 6, 5)
+
+
+def test_on_this_date_is_anaphoric_not_the_document_date() -> None:
+    events = [ev("a", "June 5, 2021", 0), ev("b", "On this date", 50)]
+    out = resolve_dates(events, date(2021, 9, 2))[1]
+    assert out.date_start == date(2021, 6, 5)
+    assert out.anchor_event_id == "a"
+
+
+@pytest.mark.parametrize(
+    ("text", "start", "end"),
+    [
+        ("about 15 seconds after the crash", date(2021, 6, 5), date(2021, 6, 5)),
+        ("ten minutes later", date(2021, 6, 5), date(2021, 6, 5)),
+        ("two hours later", date(2021, 6, 5), date(2021, 6, 6)),  # may cross midnight
+        ("30 hours later", date(2021, 6, 6), date(2021, 6, 7)),
+    ],
+)
+def test_sub_day_offsets(text: str, start: date, end: date) -> None:
+    out = resolve_dates([ev("a", "June 5, 2021", 0, "the crash"), ev("b", text, 50)], None)[1]
+    assert (out.date_start, out.date_end) == (start, end)
+
+
+def test_parsed_context_applies_only_to_its_own_document() -> None:
+    other = ev("x", "at 1405", 0, doc="d2")
+    out = resolve_dates([other], date(2022, 3, 1), parsed=_doc(REPORT))[0]
+    assert out.date_start == date(2022, 3, 1)  # d2 has no text/incident context
+
+
+def test_that_day_never_refers_back_to_an_open_bound_or_year() -> None:
+    events = [
+        ev("a", "June 5, 2021", 0, "the trip"),
+        ev("bg", "since 2006", 40, "he has driven trucks since 2006"),
+        ev("c", "that day", 80, "he drove two routes that day"),
+    ]
+    out = {e.id: e for e in resolve_dates(events, date(2021, 9, 1))}
+    assert out["c"].date_start == date(2021, 6, 5)
+    assert out["c"].anchor_event_id == "a"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("07-28-21", date(2021, 7, 28)),
+        ("12-31-99", date(1999, 12, 31)),
+        ("07/02/202118:17", date(2021, 7, 2)),  # OCR glued the time to the year
+    ],
+)
+def test_numeric_dates_with_short_years_and_glued_times(text: str, expected: date) -> None:
+    assert parse_absolute(text) == ((expected, expected), EXACT)
+
+
+@pytest.mark.parametrize("text", ["about 2:30 or 3:00", "between 3 pm and 5 pm"])
+def test_time_alternatives_are_times(text: str) -> None:
+    assert parse_absolute(text) is None
+    spec = parse_relative(text)
+    assert spec is not None and spec.clock
+
+
+def test_shortly_afterward_follows_prior_event() -> None:
+    out = resolve_dates([ev("a", "June 5, 2021", 0), ev("b", "Shortly afterward", 50)], None)[1]
+    assert out.date_start == date(2021, 6, 5) and out.anchor_event_id == "a"
+    assert out.certainty == Certainty.RELATIVE

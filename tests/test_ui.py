@@ -79,7 +79,7 @@ class FakeStore:
                 case_id="demo",
                 type=AlertType.NEW_CONTRADICTION,
                 created_at=datetime(2024, 3, 4, tzinfo=UTC),
-                dashboard_url="http://127.0.0.1:8080/cases/demo/alerts/a1",
+                dashboard_url="http://127.0.0.1:8090/cases/demo/alerts/a1",
                 ref_ids=["c1"],
             )
         ]
@@ -152,7 +152,7 @@ def env(tmp_path: Path):
     deps = app.state.deps
     deps.store, deps.runner, deps.llm = store, FakeRunner(store), FakeLLM()
     deps.openclaw_bin = None
-    client = TestClient(app, base_url="http://127.0.0.1:8080")
+    client = TestClient(app, base_url="http://127.0.0.1:8090")
     return client, store, settings, deps
 
 
@@ -242,7 +242,7 @@ def test_upload_refuses_inbox_inside_evidence(tmp_path):
     evidence = tmp_path / "ev"
     evidence.mkdir()
     app = create_app(Settings(evidence_dir=evidence, data_dir=evidence / "data"))
-    client = TestClient(app, base_url="http://127.0.0.1:8080", raise_server_exceptions=False)
+    client = TestClient(app, base_url="http://127.0.0.1:8090", raise_server_exceptions=False)
     r = client.post("/upload", files=[("files", ("a.txt", b"x", "text/plain"))])
     assert r.status_code == 500
     assert not (evidence / "data").exists()

@@ -167,7 +167,7 @@ def test_background_scan_and_consumers(env):
     # UI renders the timeline and the highlighted source.
     from ui.app import create_app
 
-    client = TestClient(create_app(env), base_url="http://127.0.0.1:8080")
+    client = TestClient(create_app(env), base_url="http://127.0.0.1:8090")
     r = client.get("/timeline")
     assert r.status_code == 200
     r = client.get(
@@ -236,3 +236,24 @@ def test_refuses_data_dir_inside_evidence(env, monkeypatch, tmp_path):
     with pytest.raises(RuntimeError):
         runner.scan_case_sync("demo", settings=Settings())
     assert not (evidence / "data").exists()
+
+
+def test_scan_gives_date_resolution_the_document_text(env, monkeypatch):
+    # The narrative-text and incident-date rules in dates.resolve_dates need the parsed
+    # document; the runner must pass it for every document it stores.
+    from pipeline import dates
+
+    seen: list[str] = []
+    real = dates.resolve_dates
+
+    def spy(events, doc_date, **kw):
+        parsed = kw.get("parsed")
+        assert parsed is not None and parsed.text
+        assert all(e.source.doc_id == parsed.doc.id for e in events)
+        seen.append(parsed.doc.filename)
+        return real(events, doc_date, **kw)
+
+    monkeypatch.setattr(dates, "resolve_dates", spy)
+    job = runner.scan_case_sync("demo")
+    assert job.state == JobState.DONE, job.error
+    assert len(seen) == job.docs_done == 5

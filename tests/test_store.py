@@ -237,7 +237,7 @@ def test_contradictions_and_alerts(store):
         case_id=CASE,
         type=AlertType.NEW_CONTRADICTION,
         created_at=datetime(2024, 1, 1, tzinfo=UTC),
-        dashboard_url="http://127.0.0.1:8080/cases/demo/alerts/a1",
+        dashboard_url="http://127.0.0.1:8090/cases/demo/alerts/a1",
         ref_ids=["c1"],
     )
     assert store.add_alerts([a]) == 1

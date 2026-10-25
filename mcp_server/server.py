@@ -27,7 +27,7 @@ from typing import Any
 log = logging.getLogger("mcp_server")
 
 SERVER_NAME = "case-timeline"
-DASHBOARD_BASE = "http://127.0.0.1:8080"
+DASHBOARD_BASE = "http://127.0.0.1:8090"
 BACKEND_ENV = "CT_MCP_BACKEND"  # "pkg.module:factory" returning a Backend (tests/alt setups)
 MAX_CONTEXT = 2000
 

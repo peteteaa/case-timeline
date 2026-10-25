@@ -6,7 +6,7 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -59,11 +59,15 @@ class Settings(BaseSettings):
     llm_allowed_hosts: list[str] = ["host.openshell.internal", "172.17.0.1"]
     llm_model: str = "qwen3.6-35b-a3b"
     llm_timeout: float = 300.0  # seconds per request
+    # Most model requests in flight at once (shared by every caller in this process). vLLM
+    # batches concurrent requests, so a few parallel calls raise throughput a lot; 1 restores
+    # strictly sequential processing.
+    llm_concurrency: int = Field(default=8, ge=1, le=256)
     embed_model: str = "BAAI/bge-m3"
     embed_dim: int = 1024
 
     ui_host: str = "127.0.0.1"
-    ui_port: int = 8080
+    ui_port: int = 8090
 
     @model_validator(mode="after")
     def _resolve_paths(self) -> Settings:

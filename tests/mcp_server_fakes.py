@@ -97,7 +97,7 @@ ALERT = Alert(
     case_id="demo",
     type=AlertType.NEW_CONTRADICTION,
     created_at=datetime(2024, 1, 1, tzinfo=UTC),
-    dashboard_url="http://127.0.0.1:8080/alerts",
+    dashboard_url="http://127.0.0.1:8090/alerts",
     ref_ids=["c1"],
 )
 

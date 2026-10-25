@@ -34,11 +34,11 @@ SCAN_MSG="Use the case-timeline skill. Scheduled scan for case '$CASE_ID': call 
 poll job_status every 5 seconds until done or failed, then call get_changes once. \
 If there are new alerts, reply with ONE line containing only the case name, the alert types \
 and counts (deadline dates always marked 'needs attorney review'), and \
-http://127.0.0.1:8080/alerts. Include NO case content: no names, quotes, dates, documents or \
+http://127.0.0.1:8090/alerts. Include NO case content: no names, quotes, dates, documents or \
 descriptions. If nothing is new, reply exactly NO_REPLY."
 
 DIGEST_MSG="Use the case-timeline skill. Daily digest for case '$CASE_ID': call daily_digest and \
-reply with only the case name, the counts, and http://127.0.0.1:8080/alerts. \
+reply with only the case name, the counts, and http://127.0.0.1:8090/alerts. \
 Include NO case content."
 
 echo "==> Scan every 5 minutes"

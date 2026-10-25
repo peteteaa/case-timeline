@@ -12,7 +12,7 @@ make setup              # uv sync (needs internet once)
 make llm                # starts vLLM on 172.17.0.1:8000 (docker0 bridge); wait for /v1/models
 make fixtures           # builds the demo case in tests/fixtures/case_demo
 make scan CASE=demo     # parses, extracts, verifies, dates, merges, and checks for conflicts
-make ui                 # dashboard at http://127.0.0.1:8080
+make ui                 # dashboard at http://127.0.0.1:8090
 make eval CASE=demo     # scores against eval/gold/demo.json; report in data/eval_demo.json
 ```
 
@@ -39,15 +39,15 @@ If vLLM fails to initialise with the default MoE backend, run `MOE_BACKEND=flash
    store: SQLite + FTS5 + sqlite-vec  (data/case.db)
         /                 |                       \
   ui (FastAPI+HTMX)   mcp_server (stdio)      eval (gold vs stored)
-  127.0.0.1:8080      scan/timeline/search    precision/recall/date acc
+  127.0.0.1:8090      scan/timeline/search    precision/recall/date acc
 ```
 
 Only `pipeline/llm.py` talks to the model. The UI and the MCP server go through `pipeline.*`. Contracts are frozen in `pipeline/contracts.py`, and module signatures are in `INTERFACES.md`.
 
 ## Security model
 
-- The UI binds to `127.0.0.1:8080`. vLLM binds to the docker0 bridge, `172.17.0.1:8000`, so the NemoClaw sandbox can reach it; it is not reachable from Wi-Fi or Tailscale. Nothing binds to `0.0.0.0`. `make ports` fails if any listener other than sshd:22 and vLLM on the bridge uses a non-loopback address.
-- For remote access, use an SSH tunnel: `ssh -L 8080:127.0.0.1:8080 dell@<gb10>`, then open http://127.0.0.1:8080.
+- The UI binds to `127.0.0.1:8090` (8080 belongs to the NemoClaw/OpenShell gateway; 8081-8084 are reserved for teammates). vLLM binds to the docker0 bridge, `172.17.0.1:8000`, so the NemoClaw sandbox can reach it; it is not reachable from Wi-Fi or Tailscale. Nothing binds to `0.0.0.0`. `make ports` fails if any listener other than sshd:22 and vLLM on the bridge uses a non-loopback address.
+- For remote access, use an SSH tunnel: `ssh -L 8090:127.0.0.1:8090 dell@<gb10>`, then open http://127.0.0.1:8090.
 - The evidence folder is read-only to the pipeline. Uploads go to `data/inbox`.
 - Alerts carry no case content, only the case name, the alert type, and a local dashboard link. That makes them safe to relay through messaging. `daily_digest` returns counts only.
 - The MCP server uses stdio only and never writes to stdout outside the protocol.

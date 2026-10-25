@@ -36,7 +36,7 @@ Tools (OpenClaw may show them prefixed with the server name, e.g. `case-timeline
 
 1. **Evidence is read-only.** Never claim to edit, move, rename, or delete evidence or events.
    If asked, say the system cannot do that and point to the local dashboard
-   (http://127.0.0.1:8080) where a human reviewer accepts or rejects items.
+   (http://127.0.0.1:8090) where a human reviewer accepts or rejects items.
 2. **Cite or abstain.** Every factual statement about the case must cite its source as
    *document + page + verbatim quote*, taken from an event's `source` or from `get_source`.
    If no source supports an answer, say plainly: "No source in the case file supports this."
@@ -47,7 +47,7 @@ Tools (OpenClaw may show them prefixed with the server name, e.g. `case-timeline
    legal deadline yourself.
 4. **No case content in messages.** Alerts and digests sent to messaging channels (Telegram,
    Slack, WhatsApp, email, etc.) contain ONLY: the case name, the alert type(s) / counts, and the
-   local dashboard link `http://127.0.0.1:8080/alerts`. Never include names, quotes, dates,
+   local dashboard link `http://127.0.0.1:8090/alerts`. Never include names, quotes, dates,
    descriptions, document names, or explanations in a message. Details stay on the dashboard.
 5. **Status matters.** `proposed` = not yet reviewed by a human; `unverified` = the quote could
    not be found in the source (treat as unreliable and say so); contradictions are flags for
@@ -58,13 +58,13 @@ Tools (OpenClaw may show them prefixed with the server name, e.g. `case-timeline
 1. Call `scan_case` and keep the returned `job_id`.
 2. Poll `job_status(job_id)` every ~5 seconds until `state` is `done` or `failed`
    (give up after ~10 minutes). On `failed`, send at most one message:
-   `Case <case name>: scan failed — see http://127.0.0.1:8080/alerts`.
+   `Case <case name>: scan failed — see http://127.0.0.1:8090/alerts`.
 3. Call `get_changes` (consumer `openclaw`). Call it once per run; it advances the cursor.
 4. If there are alerts, send ONE message per run using only allowed content, for example:
 
    ```
    Case demo: 2 new contradictions, 1 flagged witness, 1 deadline-relevant date (needs attorney review).
-   Review: http://127.0.0.1:8080/alerts
+   Review: http://127.0.0.1:8090/alerts
    ```
 
    Alert types to report: `new_contradiction`, `flagged_witness`, `deadline_date`
@@ -74,7 +74,7 @@ Tools (OpenClaw may show them prefixed with the server name, e.g. `case-timeline
 ## Daily digest (08:00)
 
 Call `daily_digest` and send only its counts with the case name and
-`http://127.0.0.1:8080/alerts`. No case content.
+`http://127.0.0.1:8090/alerts`. No case content.
 
 ## Answering questions (direct chat with the user on this machine)
 

@@ -10,6 +10,9 @@ import re
 import socket
 import threading
 import time
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any
 from urllib.parse import urlsplit
@@ -79,6 +82,95 @@ def _client() -> OpenAI:
     )
 
 
+# --- concurrency ------------------------------------------------------------------------------
+# vLLM batches concurrent requests, so callers fan work out over threads (``map_ordered``) and
+# every chat request takes one slot of a single process-wide limiter sized by
+# ``settings.llm_concurrency``. Nested fan-out (documents x chunks) therefore never puts more
+# than that many requests in flight.
+
+
+class _Limiter:
+    """A resizable counting semaphore that also records in-flight statistics."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._in_flight = 0
+        self._peak = 0
+        self._total = 0
+
+    def acquire(self) -> None:
+        with self._cond:
+            while self._in_flight >= concurrency():
+                self._cond.wait(timeout=1.0)  # re-reads the limit, so a resize takes effect
+            self._in_flight += 1
+            self._total += 1
+            self._peak = max(self._peak, self._in_flight)
+
+    def release(self) -> None:
+        with self._cond:
+            self._in_flight -= 1
+            self._cond.notify()
+
+    def stats(self) -> dict[str, int]:
+        with self._cond:
+            return {"in_flight": self._in_flight, "peak": self._peak, "total": self._total}
+
+    def reset_stats(self) -> None:
+        with self._cond:
+            self._peak = self._in_flight
+            self._total = 0
+
+
+_limiter = _Limiter()
+
+
+def concurrency() -> int:
+    """Configured maximum number of model requests in flight (``CT_LLM_CONCURRENCY``)."""
+    return max(1, int(get_settings().llm_concurrency))
+
+
+@contextmanager
+def request_slot() -> Iterator[None]:
+    """Hold one slot of the shared model-request limiter for the duration of the block."""
+    _limiter.acquire()
+    try:
+        yield
+    finally:
+        _limiter.release()
+
+
+def limiter_stats() -> dict[str, int]:
+    """``{"in_flight", "peak", "total"}`` for model requests since the last reset."""
+    return _limiter.stats()
+
+
+def reset_limiter_stats() -> None:
+    _limiter.reset_stats()
+
+
+def map_ordered[T, R](
+    fn: Callable[[T], R], items: Sequence[T], *, workers: int | None = None
+) -> list[R | Exception]:
+    """Apply ``fn`` to every item on up to ``workers`` threads (default: ``concurrency()``).
+
+    Results come back in input order; an exception raised for one item is returned in its
+    place instead of propagating, so one failure never discards the other results. With one
+    worker or one item everything runs inline on the calling thread.
+    """
+
+    def call(item: T) -> R | Exception:
+        try:
+            return fn(item)
+        except Exception as exc:  # noqa: BLE001 - handed back to the caller per item
+            return exc
+
+    n = min(len(items), workers if workers is not None else concurrency())
+    if n <= 1:
+        return [call(item) for item in items]
+    with ThreadPoolExecutor(max_workers=n, thread_name_prefix="llm") as pool:
+        return list(pool.map(call, items))
+
+
 def _merge_extra_body(extra: dict[str, Any] | None) -> dict[str, Any]:
     body: dict[str, Any] = {k: dict(v) for k, v in _NO_THINK.items()}
     for key, value in (extra or {}).items():
@@ -94,8 +186,10 @@ def chat(messages: list[dict], **kw: Any) -> str:
     kw.setdefault("model", get_settings().llm_model)
     kw.setdefault("temperature", 0.0)
     kw["extra_body"] = _merge_extra_body(kw.get("extra_body"))
-    t0 = time.monotonic()
-    resp = _client().chat.completions.create(messages=messages, **kw)
+    client = _client()
+    with request_slot():
+        t0 = time.monotonic()
+        resp = client.chat.completions.create(messages=messages, **kw)
     content = resp.choices[0].message.content or ""
     log.debug(
         "chat: %d messages -> %d chars in %.1fs",

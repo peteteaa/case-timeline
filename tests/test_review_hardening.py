@@ -167,7 +167,7 @@ def test_ui_escapes_case_content(tmp_path: Path) -> None:
     app = create_app(settings)
     deps = app.state.deps
     deps.store, deps.llm, deps.chat_backend = store, FakeLLM(), "local"
-    client = TestClient(app, base_url="http://127.0.0.1:8080")
+    client = TestClient(app, base_url="http://127.0.0.1:8090")
     pages = [
         client.get("/timeline"),
         client.get("/source/d1", params={"start": start, "end": start + len(XSS), "event": "e1"}),

@@ -38,7 +38,11 @@ Fields:
 no ellipses, no paraphrase), under about 300 characters, that contains or supports the event.
 2. "date_text": this event's time reference copied character for character from the \
 excerpt ("June 5, 2021", "late spring 2021", "three weeks later", "that evening"). Never \
-compute or complete a date: "three weeks later" stays "three weeks later". If no time reference \
+compute or complete a date: "three weeks later" stays "three weeks later". A bare clock time \
+is a valid time reference: copy it as written ("At 0942:15", "1405 local time", "around 3:40 \
+p.m."). An account tied only to the occurrence the document is about uses that phrase \
+("at the time of the collision"). Never use the date a statement, letter, or report was \
+written, sent, or signed as the date of the occurrences it describes. If no time reference \
 applies to the event, leave it out.
 3. "actors": named people and organizations involved, full names as written; no pronouns.
 4. "description": ONE short neutral sentence (about 8 to 25 words): who did what to whom, \

@@ -11,7 +11,7 @@ All data types live in `pipeline/contracts.py`, and they are frozen. Only `pipel
 - `llm_base_url`: `http://172.17.0.1:8000/v1` (docker0 bridge, so the NemoClaw sandbox can reach it). `llm_allowed_hosts` lists hosts trusted to be this machine; `llm.py` refuses anything else.
 - `llm_model`: `qwen3.6-35b-a3b`.
 - `embed_model`: `BAAI/bge-m3`.
-- `ui_host`: `127.0.0.1`. `ui_port`: `8080`.
+- `ui_host`: `127.0.0.1`. `ui_port`: `8090`.
 
 Get the settings with `get_settings()`.
 
@@ -54,7 +54,7 @@ Get the settings with `get_settings()`.
 The tools are `scan_case`, `job_status`, `get_changes`, `get_timeline`, `search_events`, `get_source`, `list_contradictions`, and `daily_digest`. They are thin wrappers over `pipeline.runner` and `pipeline.store`.
 
 ## `ui/app.py`: FastAPI + HTMX + vis-timeline (vendored)
-Routes are `/`, `/upload`, `/timeline`, `/source/{doc_id}?start=&end=` (highlights the quote), `/contradictions`, `/alerts`, `/chat`, and `POST /process`. The app binds to 127.0.0.1:8080.
+Routes are `/`, `/upload`, `/timeline`, `/source/{doc_id}?start=&end=` (highlights the quote), `/contradictions`, `/alerts`, `/chat`, and `POST /process`. The app binds to 127.0.0.1:8090.
 
 `/upload` copies files into a separate `data_dir/inbox` that `discover` also scans, because the evidence folder is read-only.
 

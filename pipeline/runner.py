@@ -4,6 +4,10 @@ Only new or changed documents are processed (a changed file has a new sha256, he
 document id). Evidence files are only read; everything is written to ``data_dir``.
 ``scan_case`` returns immediately and runs in a background thread; ``scan_case_sync`` runs
 inline. A file lock in ``data_dir`` ensures only one scan runs at a time across processes.
+
+Documents are parsed one at a time, and up to ``settings.llm_concurrency`` of them are
+extracted concurrently (the model requests share one limiter in ``pipeline.llm``); verify,
+dates, merge and every store write stay on the scan thread, in document order.
 """
 
 from __future__ import annotations
@@ -12,6 +16,8 @@ import argparse
 import logging
 import sys
 import threading
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,6 +34,7 @@ from pipeline.contracts import (
     EventStatus,
     Job,
     JobState,
+    ParsedDocument,
 )
 from pipeline.store import Store
 
@@ -69,15 +76,27 @@ def _lock_path(settings: Settings) -> Path:
 # --------------------------------------------------------------------------- per-document
 
 
-def _process_document(store: Store, doc: Document, state: _ScanState) -> int:
-    """Run one document through the pipeline and store its events; returns events inserted."""
+def _parse_document(store: Store, doc: Document) -> ParsedDocument:
+    """Register and parse one document (scan thread; parsing stays sequential)."""
     store.upsert_document(doc.model_copy(update={"ingested_at": doc.ingested_at or _now()}))
     parsed = parse.parse(doc)
     if parsed.doc.num_pages != doc.num_pages:
         store.upsert_document(parsed.doc)
-    events = extract.extract_events(parsed)
+    return parsed
+
+
+def _store_document(
+    store: Store, parsed: ParsedDocument, events: list[Event], state: _ScanState
+) -> int:
+    """Verify, date, merge and store one document's extracted events; returns events inserted.
+
+    Runs on the scan thread, in document order, so merging against ``state.existing`` and all
+    store writes stay serialized and the result does not depend on which extraction finished
+    first.
+    """
+    doc = parsed.doc
     events = verify.verify_events(parsed, events)
-    events = dates.resolve_dates(events, parse.doc_date(parsed))
+    events = dates.resolve_dates(events, parse.doc_date(parsed), parsed=parsed)
     to_insert, pairs = merge.merge_events_linked(events, state.existing)
     duplicates = [dup for dup, _ in pairs]
     store.add_events(to_insert + duplicates)
@@ -97,6 +116,65 @@ def _process_document(store: Store, doc: Document, state: _ScanState) -> int:
         len(duplicates),
     )
     return len(to_insert)
+
+
+@dataclass
+class _Pending:
+    """A parsed document whose extraction is running (or a document that failed to parse)."""
+
+    doc: Document
+    parsed: ParsedDocument | None = None
+    extraction: Future[list[Event]] | None = None
+    error: Exception | None = None
+
+
+def _process_documents(
+    store: Store, job: Job, todo: list[Document], state: _ScanState, workers: int
+) -> Job:
+    """Parse documents one by one while up to ``workers`` of them are extracted concurrently.
+
+    Extraction (the LLM-bound step) runs on a thread pool; its model requests share the
+    process-wide limiter in ``pipeline.llm``. Everything else (verify, dates, merge, store
+    writes, job progress) happens on this thread in document order, so the stored result is
+    the same as a sequential scan. A document that fails is recorded and the scan goes on.
+    """
+    workers = max(1, workers)
+    pending: deque[_Pending] = deque()
+    queue = iter(todo)
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="extract")
+
+    def refill() -> None:
+        while len(pending) < workers:
+            doc = next(queue, None)
+            if doc is None:
+                return
+            item = _Pending(doc)
+            try:
+                item.parsed = _parse_document(store, doc)
+                item.extraction = pool.submit(extract.extract_events, item.parsed)
+            except Exception as exc:  # recorded when this document's turn comes
+                item.error = exc
+            pending.append(item)
+
+    try:
+        refill()
+        while pending:
+            item = pending.popleft()
+            try:
+                if item.error is not None:
+                    raise item.error
+                assert item.parsed is not None and item.extraction is not None
+                events = item.extraction.result()
+                state.events_added += _store_document(store, item.parsed, events, state)
+            except Exception as exc:  # one bad document must not kill the scan
+                log.exception("document %s (%s) failed", item.doc.id, item.doc.filename)
+                state.failures.append(f"{item.doc.filename}: {type(exc).__name__}: {exc}")
+            state.docs_done += 1
+            job = store.update_job(job, docs_done=state.docs_done, events_added=state.events_added)
+            refill()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return job
 
 
 def _contradictions_and_alerts(
@@ -131,14 +209,7 @@ def _run_scan(store: Store, job: Job, settings: Settings) -> Job:
         )
         log.info("scan %s case=%s: %d documents, %d new", job.id, case_id, len(docs), len(todo))
         state = _ScanState(existing=store.list_events(case_id))
-        for doc in todo:
-            try:
-                state.events_added += _process_document(store, doc, state)
-            except Exception as exc:  # one bad document must not kill the scan
-                log.exception("document %s (%s) failed", doc.id, doc.filename)
-                state.failures.append(f"{doc.filename}: {type(exc).__name__}: {exc}")
-            state.docs_done += 1
-            job = store.update_job(job, docs_done=state.docs_done, events_added=state.events_added)
+        job = _process_documents(store, job, todo, state, settings.llm_concurrency)
 
         added = 0
         if state.new_ids:

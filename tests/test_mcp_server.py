@@ -122,7 +122,7 @@ def test_scan_and_job_status(calls: dict[str, Any]) -> None:
 def test_get_changes_advances_cursor_per_consumer(calls: dict[str, Any]) -> None:
     c1, c2 = calls["changes1"], calls["changes2"]
     assert c1["counts"]["events"] == 4 and c1["counts"]["needs_attorney_review"] == 1
-    assert c1["new_alerts"][0]["dashboard_url"] == "http://127.0.0.1:8080/alerts"
+    assert c1["new_alerts"][0]["dashboard_url"] == "http://127.0.0.1:8090/alerts"
     assert c2["counts"] == {
         "events": 0,
         "contradictions": 0,
@@ -139,7 +139,7 @@ def test_timeline(calls: dict[str, Any]) -> None:
     assert ids == ["e1", "e2", "e3", "e4"]  # sorted by date, undated last
     first = calls["timeline"]["events"][0]
     assert first["source"]["quote"].startswith("On March 3")
-    assert first["source"]["link"].startswith("http://127.0.0.1:8080/source/doc1?")
+    assert first["source"]["link"].startswith("http://127.0.0.1:8090/source/doc1?")
     assert [e["id"] for e in calls["window"]["events"]] == ["e2", "e3"]
     assert [e["id"] for e in calls["accepted"]["events"]] == ["e1"]
     e3 = next(e for e in calls["timeline"]["events"] if e["id"] == "e3")
@@ -162,7 +162,7 @@ def test_contradictions_and_digest(calls: dict[str, Any]) -> None:
     assert {e["id"] for e in c["contradictions"][0]["events"]} == {"e1", "e2"}
     assert calls["dismissed"]["count"] == 0
     assert calls["digest"]["new_events"] == 4
-    assert calls["digest"]["dashboard_url"] == "http://127.0.0.1:8080/alerts"
+    assert calls["digest"]["dashboard_url"] == "http://127.0.0.1:8090/alerts"
 
 
 def test_logs_go_to_data_dir_not_stdout(calls: dict[str, Any]) -> None:

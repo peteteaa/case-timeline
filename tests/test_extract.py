@@ -5,6 +5,7 @@ import types
 import pytest
 
 from pipeline import extract
+from pipeline.config import get_settings
 from pipeline.contracts import Document, EventStatus, Page, ParsedDocument
 from pipeline.extract import (
     ExtractedEvent,
@@ -31,6 +32,16 @@ def make_parsed(text: str = TEXT, pages: list[Page] | None = None) -> ParsedDocu
         sha256="0" * 64,
     )
     return ParsedDocument(doc=doc, text=text, pages=pages or [])
+
+
+@pytest.fixture(autouse=True)
+def _sequential_llm(monkeypatch: pytest.MonkeyPatch):
+    """The fakes below answer in call order, so chunks are sent one at a time here.
+    Concurrent extraction is covered by tests/test_concurrency.py."""
+    monkeypatch.setenv("CT_LLM_CONCURRENCY", "1")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture

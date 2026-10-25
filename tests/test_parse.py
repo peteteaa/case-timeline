@@ -459,3 +459,87 @@ def test_vertical_margin_text_does_not_break_row_merge(tmp_path: Path) -> None:
     text = _parse_path(path).text
     assert text.startswith("Label: value one")
     assert "MARGIN STAMP 0001" in text
+
+
+# --------------------------------------------------------------------------- incident date
+
+
+def _parsed_text(text: str, filename: str = "x.pdf"):
+    from pipeline.contracts import ParsedDocument
+
+    doc = Document(id="d1", case_id="c", path="/x", filename=filename, mime="x", sha256="x")
+    return ParsedDocument(doc=doc, text=text)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # explicit form labels
+        ("CLAIM FORM\nDate of Loss: 03/14/2024\nDate of Report: 03/20/2024", date(2024, 3, 14)),
+        ("Incident Date: June 5, 2021\nPrepared: June 30, 2021", date(2021, 6, 5)),
+        (
+            "4. LOCATION OF ACCIDENT 5. DATE/TIMEOF ACCIDENT/INCIDENT (UTC) 6. UNIT\n"
+            "Springfield depot June 6, 2021,0410 UTC",
+            date(2021, 6, 6),
+        ),
+        ("Occurred On: 6/5/21 Report No. 7", date(2021, 6, 5)),
+        # a where/when block under the report's own date
+        (
+            "Regional Safety Office\nSeptember 9, 2022\nFACTUAL REPORT\n"
+            "Location: Springfield Date: June 5, 2021 Time: 0940 local\n",
+            date(2021, 6, 5),
+        ),
+        ("March 1, 2022\nB. VEHICLE ACCIDENT\nDate: June 5, 2021\nUnit: 12", date(2021, 6, 5)),
+        # an opening sentence
+        (
+            "September 2, 2021\nDear Ms. Ortiz:\nThis concerns the collision involving my\n"
+            "truck on Saturday, June 5, 2021. I was driving north.",
+            date(2021, 6, 5),
+        ),
+        ("Statement\nIncident occurred Saturday, June 5, 2021 near the depot.", date(2021, 6, 5)),
+    ],
+)
+def test_incident_date_found(text: str, expected: date) -> None:
+    assert parse_mod.incident_date(_parsed_text(text)) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "MEMORANDUM\nDate: April 8, 2024\nRe: attendance\nOn March 12, 2024 we met.",
+        "INCIDENT REPORT\nDate: March 18, 2024\nThe officer responded.",  # the report's date
+        "Date of Report: March 18, 2024\nReporting Officer: J. Ortiz",
+        "Inc Occurred End:\nReported Date/Time: 07/27/2021 18:17",
+        "No dates at all here.",
+    ],
+)
+def test_incident_date_not_found(text: str) -> None:
+    assert parse_mod.incident_date(_parsed_text(text)) is None
+
+
+def test_doc_date_skips_the_incident_date_field() -> None:
+    text = (
+        "Regional Safety Office\nSeptember 9, 2022\nFACTUAL REPORT\nB. VEHICLE ACCIDENT\n"
+        "Location: Springfield\nDate: June 5, 2021\nTime: 0940 local\n"
+    )
+    parsed = _parsed_text(text)
+    assert doc_date(parsed) == date(2022, 9, 9)
+    assert parse_mod.incident_date(parsed) == date(2021, 6, 5)
+
+
+def test_doc_date_accepts_dates_without_space_after_comma() -> None:
+    assert doc_date(_parsed_text("Letter\nJune 5,2021\nDear Sir")) == date(2021, 6, 5)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("incident_report.pdf", date(2024, 3, 14)),  # "Incident Type: ... On March 14, 2024"
+        ("witness_statement_becker.docx", None),
+        ("email_thread.eml", None),
+        ("deposition_excerpt_ellison.txt", None),
+        ("hr_memo.md", None),
+    ],
+)
+def test_incident_date_fixtures(name: str, expected: date | None) -> None:
+    assert parse_mod.incident_date(parse(_docs()[name])) == expected

@@ -199,18 +199,18 @@ def test_alerts_have_no_case_content():
             status=ContradictionStatus.DISMISSED,
         ),
     ]
-    alerts = conflicts.alerts_for(cs, events, "demo", "http://127.0.0.1:8080/", now=now)
+    alerts = conflicts.alerts_for(cs, events, "demo", "http://127.0.0.1:8090/", now=now)
     kinds = [a.type for a in alerts]
     assert kinds.count(AlertType.NEW_CONTRADICTION) == 2
     assert kinds.count(AlertType.DEADLINE_DATE) == 1
     witness = [a for a in alerts if a.type == AlertType.FLAGGED_WITNESS]
     assert len(witness) == 1 and witness[0].ref_ids == ["c1", "c2"]
     for a in alerts:
-        assert a.dashboard_url == "http://127.0.0.1:8080/alerts"
+        assert a.dashboard_url == "http://127.0.0.1:8090/alerts"
         assert a.created_at == now
         dumped = a.model_dump_json().lower()
         assert "secret" not in dumped and "zelda" not in dumped
-    again = conflicts.alerts_for(cs, events, "demo", "http://127.0.0.1:8080", now=now)
+    again = conflicts.alerts_for(cs, events, "demo", "http://127.0.0.1:8090", now=now)
     assert [a.id for a in again] == [a.id for a in alerts]
 
 
@@ -297,9 +297,10 @@ def test_context_and_doc_names_reach_the_prompt(fake_llm):
 
 
 def test_multi_field_verdict_and_same_subject_gate(fake_llm):
-    a = ev("e1", "Smith signed the lease", doc="d1")
+    a = ev("e1", "Smith signed the lease", actors=["John Smith", "Ann Lee"], doc="d1")
     b = ev("e2", "Smith signed the lease", d=date(2024, 3, 9), doc="d2")
     fake_llm["extra"] = {"other_fields": ["actor", "fact"]}
+    # d2 names only Smith and excludes everyone else, so Lee's presence (d1) is disputed.
     texts = {"d1": "", "d2": "Nobody else was there."}
     out = conflicts.find_contradictions([a, b], "demo", source_text=texts.get)
     # "fact" as a secondary field restates the primary disagreement and is dropped.
@@ -411,3 +412,276 @@ def test_knowledge_timing_conflict_is_fact_not_date(fake_llm):
     assert conflicts._final_fields(verdict, a, b) == [ConflictField.FACT]
     out = conflicts.find_contradictions([a, b], "demo", source_text=lambda _d: None)
     assert [c.field for c in out] == [ConflictField.FACT]
+
+
+# --------------------------------------------------------------------------- precision rules
+
+
+def dated(e: Event, start: date, end: date | None = None, **kw) -> Event:
+    """Copy of ``e`` with another resolved date (a range when ``end`` differs)."""
+    end = end or start
+    certainty = kw.pop("certainty", Certainty.EXACT if end == start else Certainty.APPROXIMATE)
+    return e.model_copy(update={"date_start": start, "date_end": end, "certainty": certainty, **kw})
+
+
+def test_range_containment_and_granularity_are_not_date_conflicts(fake_llm):
+    # "early March" (an approximate period) vs exact dates inside it or just past its edge.
+    early = dated(
+        ev("e1", "Lee signed the supply contract", actors=["Ann Lee"], doc="d1"),
+        date(2024, 3, 1),
+        date(2024, 3, 10),
+        date_text="early March 2024",
+    )
+    inside = ev("e2", "Lee signed the supply contract", d=date(2024, 3, 5), actors=["Lee"])
+    edge = ev("e3", "Lee signed the supply contract", d=date(2024, 3, 12), actors=["Lee"])
+    far = ev("e4", "Lee signed the supply contract", d=date(2024, 3, 25), actors=["Lee"])
+    inside, edge, far = (
+        x.model_copy(update={"source": x.source.model_copy(update={"doc_id": "d2"})})
+        for x in (inside, edge, far)
+    )
+    assert conflicts.date_relation(early, inside).compatible
+    assert conflicts.date_relation(early, edge).compatible
+    assert not conflicts.date_relation(early, far).compatible
+    fields = {(c.a.id, c.b.id): c.field for c in conflicts.candidate_pairs([early, inside])}
+    assert ConflictField.DATE not in fields.values()
+    assert conflicts.candidate_pairs([early, edge]) == []
+    assert [c.field for c in conflicts.candidate_pairs([early, far])] == [ConflictField.DATE]
+    # Even if the model calls it a date conflict, a contained date is dropped.
+    verdict = conflicts.ConflictVerdict(is_contradiction=True, field=ConflictField.DATE)
+    assert conflicts._final_fields(verdict, early, inside) == []
+    assert conflicts._final_fields(verdict, early, edge) == []
+
+
+def test_contained_date_is_no_evidence_of_one_occurrence(fake_llm):
+    # A period that merely contains a meeting's date does not make the events one occurrence,
+    # so "different people named" is not an actor candidate.
+    period = dated(
+        ev("e1", "Lee reviewed the budget with Chan", actors=["Ann Lee", "Bo Chan"], doc="d1"),
+        date(2024, 3, 11),
+        date(2024, 3, 20),
+    )
+    meeting = ev("e2", "Lee held a budget meeting with Diaz", d=date(2024, 3, 12), doc="d2")
+    meeting = meeting.model_copy(update={"actors": ["Ann Lee", "Cy Diaz"]})
+    cands = conflicts.candidate_pairs([period, meeting])
+    assert all(c.field == ConflictField.FACT for c in cands)  # never ACTOR or DATE
+
+
+def test_knowledge_event_is_never_an_actor_conflict(fake_llm):
+    learned = ev("e1", "Lee first learned about the pump defect", actors=["Ann Lee"], doc="d1")
+    meeting = ev(
+        "e2", "Lee discussed the pump defect with Ono", actors=["Ann Lee", "Ray Ono"], doc="d2"
+    )
+    assert all(
+        c.field != ConflictField.ACTOR for c in conflicts.candidate_pairs([learned, meeting])
+    )
+    verdict = conflicts.ConflictVerdict(is_contradiction=True, field=ConflictField.ACTOR)
+    local = ("Nobody else knew.", "Only Lee and Ono were present.")
+    assert conflicts._final_fields(verdict, learned, meeting, local=local) == []
+
+
+def test_plan_versus_outcome_is_no_conflict_of_any_kind(fake_llm):
+    plan = ev(
+        "e1", "Review meeting scheduled with Lee and Chan", actors=["Ann Lee", "Bo Chan"], doc="d1"
+    )
+    held = ev(
+        "e2", "Review meeting held with Lee and Diaz", actors=["Ann Lee", "Cy Diaz"], doc="d2"
+    )
+    assert conflicts.candidate_pairs([plan, held]) == []
+    verdict = conflicts.ConflictVerdict(is_contradiction=True, field=ConflictField.ACTOR)
+    assert conflicts._final_fields(verdict, plan, held, local=("only them", "only them")) == []
+    # Two plans for the same review on different dates are still compared.
+    plan2 = ev("e3", "Review meeting with Lee set for March 9", d=date(2024, 3, 9), doc="d3")
+    plan2 = plan2.model_copy(update={"actors": ["Ann Lee"]})
+    assert [c.field for c in conflicts.candidate_pairs([plan, plan2])] == [ConflictField.DATE]
+
+
+def test_message_date_is_not_the_date_of_the_reported_occurrence(fake_llm):
+    # An email dated by its header (March 14) reports a meeting on March 12; another document
+    # dates the meeting March 12. The header date must not be compared with the meeting date.
+    email = ev(
+        "e1",
+        "Lee called Ortiz into her office about the audit",
+        d=date(2024, 3, 14),
+        actors=["Ann Lee", "Jo Ortiz"],
+        doc="d1",
+        quote="On March 12, 2024 she called me into her office about the audit.",
+    ).model_copy(update={"date_text": "Thursday, March 14, 2024 9:02 AM"})
+    report = ev(
+        "e2",
+        "Lee met Ortiz in her office about the audit",
+        d=date(2024, 3, 12),
+        actors=["Ann Lee", "Jo Ortiz"],
+        doc="d2",
+    )
+    assert conflicts.carrier_dates(email) == [date(2024, 3, 12)]
+    rel = conflicts.date_relation(email, report)
+    assert rel.carrier and rel.gap == 0 and rel.compatible
+    assert all(c.field != ConflictField.DATE for c in conflicts.candidate_pairs([email, report]))
+    # The quoted date is what gets compared when it disagrees with the other source.
+    early = dated(report, date(2024, 3, 9), id="e3")
+    rel = conflicts.date_relation(email, early)
+    assert rel.carrier and rel.gap == 3
+    assert [c.field for c in conflicts.candidate_pairs([email, early])] == [ConflictField.DATE]
+    # A quote that states the event's own date is not a message date.
+    assert conflicts.carrier_dates(dated(email, date(2024, 3, 12))) == []
+
+
+def test_actor_exclusion_must_come_from_the_side_missing_the_person(fake_llm):
+    both = ev("e1", "meeting in Lee's office", actors=["Ann Lee", "Bo Chan"], doc="d1")
+    lee_only = ev("e2", "Lee held a meeting", actors=["Ann Lee"], doc="d2")
+    verdict = conflicts.ConflictVerdict(is_contradiction=True, field=ConflictField.ACTOR)
+    # Only the side naming everyone has an exclusion cue: d2 merely omits Chan.
+    local = ("Lee and Chan met. Nobody else came.", "Lee held a meeting.")
+    assert conflicts._final_fields(verdict, both, lee_only, local=local) == []
+    # d2 itself says no one else was there: a real disagreement about Chan.
+    local = ("Lee and Chan met.", "Lee held a meeting. No one else was present.")
+    assert conflicts._final_fields(verdict, both, lee_only, local=local) == [ConflictField.ACTOR]
+
+
+def test_local_context_ignores_exclusions_about_earlier_occurrences():
+    text = (
+        "On May 1 Lee met Chan. No one else was present.\n"
+        "On May 3 Lee was suspended.\n"
+        "Q. Who attended? A. Lee and Ortiz. Nobody else."
+    )
+    suspended = ev("e1", "Lee was suspended", quote="On May 3 Lee was suspended.")
+    suspended = suspended.model_copy(
+        update={"source": suspended.source.model_copy(update={"char_start": 48, "char_end": 75})}
+    )
+    assert text[48:75] == "On May 3 Lee was suspended."
+    local = conflicts.local_context(text, suspended)
+    assert "No one else" not in local and local.startswith("On May 3")
+    answer = ev("e2", "Lee and Ortiz attended", quote="Q. Who attended?")
+    assert "Nobody else" in conflicts.local_context(text, answer)
+
+
+def test_time_zone_shift_and_clock_precision_are_not_conflicts(fake_llm):
+    local_day = ev("e1", "The aircraft crashed on landing", actors=["Lee"], doc="d1")
+    utc_next = ev("e2", "The aircraft crashed on landing", d=date(2024, 3, 4), doc="d2")
+    utc_next = utc_next.model_copy(
+        update={"actors": ["Lee"], "date_text": "March 4, 2024 0216 UTC"}
+    )
+    assert conflicts.date_relation(local_day, utc_next).compatible
+    assert conflicts.candidate_pairs([local_day, utc_next]) == []
+    # Two transcripts timing one radio call a second apart.
+    a = ev("e3", "Tower cleared Lee to land", d=None, actors=["Lee"], doc="d1")
+    b = ev("e4", "Tower cleared Lee to land", d=None, actors=["Lee"], doc="d2")
+    a = a.model_copy(update={"date_text": "1815:23"})
+    b = b.model_copy(update={"date_text": "at about 6:15:22 PM"})
+    rel = conflicts.date_relation(a, b)
+    assert rel.clock_gap == 1 and rel.same_moment and rel.compatible
+    verdict = conflicts.ConflictVerdict(is_contradiction=True, field=ConflictField.DATE)
+    assert conflicts._final_fields(verdict, a, b) == []
+    assert conflicts.clock_seconds("June 5, 2021") is None
+
+
+def test_inferred_year_or_inherited_day_is_not_a_soft_date(fake_llm):
+    # The date resolver marks a date APPROXIMATE when only its year was inferred ("March 9")
+    # or when a bare clock time inherits its day ("6:15 PM"). Both are one definite day, so a
+    # few days' gap is still a date conflict; only a hedged day ("around March 9") is soft.
+    exact = ev("e1", "Lee met Chan about the safety audit", d=date(2024, 3, 12), doc="d1")
+    exact = exact.model_copy(
+        update={"actors": ["Ann Lee", "Bo Chan"], "date_text": "March 12, 2024"}
+    )
+
+    def other(eid: str, text: str, d: date) -> Event:
+        e = ev(eid, "Lee met Chan about the safety audit", d=d, doc="d2")
+        return e.model_copy(
+            update={
+                "actors": ["Ann Lee", "Bo Chan"],
+                "date_text": text,
+                "certainty": Certainty.APPROXIMATE,
+            }
+        )
+
+    for text, d in (("March 9", date(2024, 3, 9)), ("6:15 PM", date(2024, 3, 15))):
+        o = other("e2", text, d)
+        assert not conflicts.date_relation(exact, o).compatible, text
+        assert [c.field for c in conflicts.candidate_pairs([exact, o])] == [ConflictField.DATE]
+    for text in ("around March 9", "early March", "a few days before"):
+        o = other("e2", text, date(2024, 3, 9))
+        assert conflicts.date_relation(exact, o).compatible, text
+        assert conflicts.candidate_pairs([exact, o]) == []
+
+
+def test_distinct_timed_moments_are_not_one_occurrence(fake_llm):
+    # Same day, but timestamps given to the second minutes apart: two radio calls, not one
+    # occurrence told two ways, so "different people named" is no actor candidate.
+    a = ev("e1", "Tower told Lee and Diaz to go around", actors=["Ann Lee", "Cy Diaz"], doc="d1")
+    b = ev("e2", "Tower told Lee and Ono to go around", actors=["Ann Lee", "Ray Ono"], doc="d2")
+    a = a.model_copy(update={"date_text": "1813:31"})
+    b = b.model_copy(update={"date_text": "18:16:22"})
+    assert conflicts.distinct_moments(a, b)
+    assert conflicts.candidate_pairs([a, b]) == []
+    # Close timestamps are one moment, so the same pair is still worth an LLM check.
+    b_close = b.model_copy(update={"date_text": "18:13:50"})
+    assert not conflicts.distinct_moments(a, b_close)
+    assert [c.field for c in conflicts.candidate_pairs([a, b_close])] == [ConflictField.ACTOR]
+    # Loose times from two witnesses ("about 2:30" vs "2:47") may still be one occurrence.
+    w1 = a.model_copy(update={"date_text": "about 2:30 PM"})
+    w2 = b.model_copy(update={"date_text": "2:47 PM"})
+    assert not conflicts.distinct_moments(w1, w2)
+    assert [c.field for c in conflicts.candidate_pairs([w1, w2])] == [ConflictField.ACTOR]
+    # One source's own timeline lists distinct moments, whatever the precision.
+    s1 = w1.model_copy(update={"source": w2.source})
+    assert conflicts.distinct_moments(s1, w2)
+
+
+def test_confirm_prompt_carries_rules_and_computed_date_notes(fake_llm):
+    email = ev(
+        "e1",
+        "Lee met Ortiz about the audit",
+        d=date(2024, 3, 14),
+        actors=["Ann Lee"],
+        doc="d1",
+        quote="On March 6, 2024 Lee met Ortiz about the audit.",
+    )
+    report = ev("e2", "Lee met Ortiz about the audit", d=date(2024, 3, 12), doc="d2")
+    report = report.model_copy(update={"actors": ["Ann Lee"]})
+    conflicts.find_contradictions([email, report], "demo", source_text=lambda _d: None)
+    system, user = fake_llm["calls"][0]
+    assert system.endswith(conflicts.CONFIRM_RULES) and "Plan vs outcome" in system
+    assert "Notes from the date rules" in user and "2024-03-06" in user
+
+
+def test_concurrent_confirmations_match_sequential_order(fake_llm, monkeypatch):
+    import threading
+    import time
+
+    from pipeline.config import get_settings
+
+    lock = threading.Lock()
+    flight = {"now": 0, "max": 0}
+
+    def slow_chat_json(system, user, schema, **kw):
+        with lock:
+            flight["now"] += 1
+            flight["max"] = max(flight["max"], flight["now"])
+        time.sleep(0.05)
+        with lock:
+            flight["now"] -= 1
+        return schema(is_contradiction=True, field="date", explanation=user[-40:])
+
+    pipeline.llm.chat_json = slow_chat_json
+    events = [
+        ev(f"e{i}", "Smith signed the lease", d=date(2024, 3, 3 + 2 * i), doc=f"d{i}")
+        for i in range(6)
+    ]
+
+    def run(n: int) -> tuple[list[Contradiction], float]:
+        monkeypatch.setenv("CT_LLM_CONCURRENCY", str(n))
+        get_settings.cache_clear()
+        flight["max"] = 0
+        t0 = time.monotonic()
+        out = conflicts.find_contradictions(events, "demo", source_text=lambda _d: None)
+        return out, time.monotonic() - t0
+
+    try:
+        seq, t_seq = run(1)
+        assert flight["max"] == 1
+        par, t_par = run(8)
+        assert flight["max"] > 1
+    finally:
+        get_settings.cache_clear()
+    assert [c.model_dump() for c in par] == [c.model_dump() for c in seq]
+    assert len(seq) > 3 and t_par < t_seq / 2
